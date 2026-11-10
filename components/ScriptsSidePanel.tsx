@@ -10,6 +10,7 @@
 import {
   CheckSquare,
   ChevronRight,
+  Copy,
   Edit2,
   Expand,
   FolderPlus,
@@ -54,12 +55,12 @@ import { SnippetCommandTooltipContent } from './snippets/SnippetCommandTooltipCo
 import { TERMINAL_SIDE_PANEL_INNER_HEADER_CLASS } from './terminalLayer/terminalSidePanelChrome';
 import { isNonPrimaryPointer, primaryOnlyDragHandlers } from './ui/primaryOnlyDrag';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip';
+import { toast } from './ui/toast';
 
 const toolbarIconButtonClass =
   'h-7 w-7 shrink-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors disabled:opacity-40 disabled:pointer-events-none';
 
 const SCRIPT_ROW_HEIGHT = 34;
-
 const isRootPackagePath = (path: string): boolean => {
   const body = path.startsWith('/') ? path.slice(1) : path;
   return body.length > 0 && !body.includes('/');
@@ -225,6 +226,11 @@ export function buildScriptsSidePanelRows({
   const snippetsIn = (pkg: string | null): Snippet[] =>
     sortByVaultOrder(snippetsByPackage.get(pkg ?? '') ?? []);
 
+  const emitSnippets = (localSnippets: Snippet[], pkg: string, depth: number) =>
+    localSnippets.forEach((snippet) =>
+      rows.push({ type: 'snippet', id: snippet.id, depth: depth + 1, snippet, packagePath: pkg }),
+    );
+
   const rows: TreeRow[] = [];
   const walk = (pkg: string, depth: number) => {
     const children = childPackagesOf(pkg);
@@ -245,9 +251,7 @@ export function buildScriptsSidePanelRows({
 
     if (!isExpanded) return;
     children.forEach((child) => walk(child, depth + 1));
-    localSnippets.forEach((snippet) =>
-      rows.push({ type: 'snippet', id: snippet.id, depth: depth + 1, snippet, packagePath: pkg }),
-    );
+    emitSnippets(localSnippets, pkg, depth);
   };
 
   snippetsIn(null).forEach((snippet) =>
@@ -479,7 +483,11 @@ const ScriptsSidePanelInner: React.FC<ScriptsSidePanelProps> = ({
     if (!isVisible) return [];
     if (searchMatches !== null) return [];
 
-    return buildScriptsSidePanelRows({ snippets, packages, expandedPaths });
+    return buildScriptsSidePanelRows({
+      snippets,
+      packages,
+      expandedPaths,
+    });
   }, [snippets, packages, expandedPaths, searchMatches, isVisible]);
 
   type ScriptsListItem =
@@ -889,6 +897,20 @@ const ScriptsSidePanelInner: React.FC<ScriptsSidePanelProps> = ({
     );
   }, []);
 
+  const handleCopySnippetCommand = useCallback((snippet: Snippet) => {
+    if (!snippet.command) return;
+    navigator.clipboard.writeText(snippet.command).then(
+      () => {
+        toast.success(t('scripts.actions.copyCommand.copied'), {
+          title: snippet.label,
+        });
+      },
+      () => {
+        toast.error(t('scripts.actions.copyCommand.failed'));
+      },
+    );
+  }, [t]);
+
   if (!isVisible) return null;
 
   const hasAnyContent = snippets.length > 0 || packages.length > 0;
@@ -1129,6 +1151,8 @@ const ScriptsSidePanelInner: React.FC<ScriptsSidePanelProps> = ({
                     onClick={() => handleSnippetClick(item.snippet)}
                     onEdit={() => handleEditSnippet(item.snippet)}
                     onDelete={() => handleDeleteSnippet(item.snippet.id)}
+                    onCopyCommand={() => handleCopySnippetCommand(item.snippet)}
+                    copyCommandLabel={t('scripts.actions.copyCommand')}
                     onRunParallel={onRunScriptOnWorkspace
                       ? () => onRunScriptOnWorkspace(item.snippet, 'parallel')
                       : undefined}
@@ -1182,6 +1206,8 @@ const ScriptsSidePanelInner: React.FC<ScriptsSidePanelProps> = ({
                     onClick={() => handleSnippetClick(item.row.snippet)}
                     onEdit={() => handleEditSnippet(item.row.snippet)}
                     onDelete={() => handleDeleteSnippet(item.row.snippet.id)}
+                    onCopyCommand={() => handleCopySnippetCommand(item.row.snippet)}
+                    copyCommandLabel={t('scripts.actions.copyCommand')}
                     onRunParallel={onRunScriptOnWorkspace
                       ? () => onRunScriptOnWorkspace(item.row.snippet, 'parallel')
                       : undefined}
@@ -1505,6 +1531,8 @@ interface SnippetRowProps {
   onDelete: () => void;
   onRunParallel?: () => void;
   onRunSequential?: () => void;
+  onCopyCommand?: () => void;
+  copyCommandLabel?: string;
   runParallelLabel?: string;
   runSequentialLabel?: string;
   editLabel: string;
@@ -1527,6 +1555,8 @@ const SnippetRow = memo<SnippetRowProps>(({
   onDelete,
   onRunParallel,
   onRunSequential,
+  onCopyCommand,
+  copyCommandLabel,
   runParallelLabel,
   runSequentialLabel,
   editLabel,
@@ -1602,6 +1632,11 @@ const SnippetRow = memo<SnippetRowProps>(({
       {onRunSequential ? (
         <ContextMenuItem onClick={onRunSequential}>
           <Layers className="mr-2 h-4 w-4" /> {runSequentialLabel}
+        </ContextMenuItem>
+      ) : null}
+      {onCopyCommand ? (
+        <ContextMenuItem onClick={onCopyCommand}>
+          <Copy className="mr-2 h-4 w-4" /> {copyCommandLabel}
         </ContextMenuItem>
       ) : null}
       <ContextMenuItem onClick={onEdit}>

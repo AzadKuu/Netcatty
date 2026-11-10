@@ -1,4 +1,5 @@
 import { getHostOsSelection, HOST_OS_SELECTIONS, resolveHostOs } from '../domain/host';
+import { applyGroupDefaults } from "../domain/groupConfig";
 import React from "react";
 import { AlertTriangle, ChevronDown, ChevronUp, Forward, Globe, HeartPulse, KeyRound, Link2, Palette, Plus, Router, ShieldAlert, TerminalSquare, Timer, Wifi, X, Variable } from "lucide-react";
 import { customThemeStore } from "../application/state/customThemeStore";
@@ -48,11 +49,13 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
   showAlgorithmOverrides,
   setShowAlgorithmOverrides,
   chainedHosts,
+  hostChainInherited = false,
   setActiveSubPanel,
   clearHostChain,
   proxySummaryType,
   proxySummaryLabel,
   proxySummaryTooltip,
+  proxyInherited = false,
   clearProxyConfig,
 }) => {
   const inheritedDeviceType = effectiveGroupDefaults?.deviceType;
@@ -63,6 +66,15 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
   const systemSshAgentEnabled = effectiveAuthMethod === "auto"
     ? form.useSshAgent !== false
     : effectiveAuthMethod === "key" && form.useSshAgent === true;
+  // Match the connection: inherited X11 is dropped when the effective transport
+  // is Mosh, Eternal Terminal, or anything other than plain SSH.
+  const effectiveConnectionHost = effectiveGroupDefaults
+    ? applyGroupDefaults(form, effectiveGroupDefaults)
+    : form;
+  const showX11Forwarding = (!effectiveConnectionHost.protocol || effectiveConnectionHost.protocol === "ssh")
+    && !effectiveConnectionHost.moshEnabled
+    && !effectiveConnectionHost.etEnabled;
+  const effectiveX11Forwarding = !!effectiveConnectionHost.x11Forwarding;
 
   return (
   <>
@@ -337,7 +349,7 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
         </HostDetailsSection>
 
         {/* X11 Forwarding */}
-        {(!form.protocol || form.protocol === "ssh") && !form.moshEnabled && !form.etEnabled && (
+        {showX11Forwarding && (
           <HostDetailsSection
             icon={<TerminalSquare size={14} className="text-muted-foreground" />}
             title={t("hostDetails.section.x11Forwarding")}
@@ -345,8 +357,8 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
             <ToggleRow
               label={t("hostDetails.x11Forwarding")}
               hint={t("hostDetails.x11Forwarding.desc")}
-              enabled={!!form.x11Forwarding}
-              onToggle={() => update("x11Forwarding", !form.x11Forwarding)}
+              enabled={effectiveX11Forwarding}
+              onToggle={() => update("x11Forwarding", !effectiveX11Forwarding)}
             />
           </HostDetailsSection>
         )}
@@ -493,6 +505,19 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
             enabled={!!form.showLineTimestamps}
             onToggle={() => update("showLineTimestamps", !form.showLineTimestamps)}
           />
+          {(form.protocol === undefined || form.protocol === "ssh") && !form.moshEnabled && !form.etEnabled && (
+            <>
+              <ToggleRow
+                label={t("hostDetails.sshInputCompatibility")}
+                hint={t("hostDetails.sshInputCompatibility.desc")}
+                enabled={form.sshInputCompatibility ?? true}
+                onToggle={() => update("sshInputCompatibility", !(form.sshInputCompatibility ?? true))}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("hostDetails.sshInputCompatibility.reconnect")}
+              </p>
+            </>
+          )}
           <HostDetailsSettingRow label={t("hostDetails.backspaceBehavior")}>
             <Select
               value={form.backspaceBehavior ?? "default"}
@@ -618,9 +643,16 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
           title={t("hostDetails.jumpHosts")}
           action={
             chainedHosts.length > 0 ? (
-              <Badge variant="secondary" className="text-xs">
-                {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
-              </Badge>
+              <div className="flex items-center gap-1">
+                {hostChainInherited && (
+                  <Badge variant="outline" className="text-xs text-muted-foreground">
+                    {t("vault.groups.details.inherited")}
+                  </Badge>
+                )}
+                <Badge variant="secondary" className="text-xs">
+                  {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
+                </Badge>
+              </div>
             ) : (
               <Badge variant="outline" className="text-xs text-muted-foreground">
                 {t("hostDetails.jumpHosts.direct")}
@@ -641,8 +673,10 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
                   />
                   <span className="text-xs text-muted-foreground">
                     {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
+                    {hostChainInherited ? ` · ${t("vault.groups.details.inherited")}` : ""}
                   </span>
                 </div>
+                {!hostChainInherited && (
                 <X
                   size={14}
                   className="text-muted-foreground hover:text-destructive flex-shrink-0"
@@ -651,6 +685,7 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
                     clearHostChain();
                   }}
                 />
+                )}
               </div>
               <div className="w-full space-y-1 pl-5">
                 {chainedHosts.slice(0, 5).map((h, idx) => (
@@ -687,7 +722,32 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
           title={t("hostDetails.proxy")}
           className="overflow-hidden"
         >
-          {form.proxyConfig?.host || form.proxyConfig?.command || form.proxyProfileId ? (
+          {form.directProxy ? (
+            <div className="w-full min-w-0 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
+              <button
+                type="button"
+                className="min-w-0 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-2 p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer overflow-hidden"
+                onClick={() => setActiveSubPanel("proxy")}
+              >
+                <Badge variant="secondary" className="text-xs shrink-0">
+                  {t("hostDetails.proxy.direct")}
+                </Badge>
+                <span className="block min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-sm">
+                  {t("hostDetails.proxy.directHint")}
+                </span>
+              </button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-9 w-9 text-muted-foreground hover:text-destructive shrink-0"
+                aria-label={t("hostDetails.proxyPanel.remove")}
+                onClick={clearProxyConfig}
+              >
+                <X size={14} />
+              </Button>
+            </div>
+          ) : form.proxyConfig?.host || form.proxyConfig?.command || form.proxyProfileId || proxyInherited ? (
             <div className="w-full min-w-0 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
               <button
                 type="button"
@@ -702,6 +762,7 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
                     <TooltipTrigger asChild>
                       <span className="block min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-sm">
                         {proxySummaryLabel}
+                        {proxyInherited ? ` · ${t("vault.groups.details.inherited")}` : ""}
                       </span>
                     </TooltipTrigger>
                     <TooltipContent side="bottom" align="start" className="max-w-xs break-all">
@@ -710,6 +771,7 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
                   </Tooltip>
                 </TooltipProvider>
               </button>
+              {!proxyInherited && (
               <Button
                 type="button"
                 variant="ghost"
@@ -720,6 +782,7 @@ export const HostDetailsAdvancedSections: React.FC<HostDetailsAdvancedSectionsPr
               >
                 <X size={14} />
               </Button>
+              )}
             </div>
           ) : (
             <Button

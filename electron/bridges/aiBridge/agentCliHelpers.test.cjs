@@ -10,6 +10,7 @@ const {
   CODEX_AUTH_VALIDATION_TIMEOUT_MS,
   DEFAULT_CODEX_CLI_TIMEOUT_MS,
   MAX_AGENT_CLI_BUFFER_CHARS,
+  VERSION_PROBE_TIMEOUT_MS,
 } = require("./agentCliHelpers.cjs");
 
 function createHungChild() {
@@ -53,6 +54,37 @@ test("runCodexCli applies a default timeout to short status commands", async () 
   }
   assert.equal(scheduled[0], DEFAULT_CODEX_CLI_TIMEOUT_MS);
   assert.deepEqual(child.kills, ["SIGTERM", "SIGKILL"]);
+});
+
+test("probeCliVersion allows slow-starting CLIs beyond the old 5s probe limit", async () => {
+  const child = createHungChild();
+  const scheduled = [];
+  const helpers = createAgentCliHelpers({
+    prepareCommandForSpawn: (command, args) => ({ command, args, shell: false }),
+    spawn: () => {
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from("0.1.15\n"));
+        child.emit("close", 0);
+      });
+      return child;
+    },
+    stripAnsi: (value) => value,
+    getShellEnv: async () => ({}),
+    normalizeCliPathForPlatform: (value) => value,
+    resolveCliFromPathAsync: async () => "/fake/mimo",
+    setTimeout: (callback, delay) => {
+      scheduled.push(delay);
+      return { unref() {} };
+    },
+    clearTimeout() {},
+  });
+
+  const result = await helpers.probeCliVersion("/fake/mimo", ["--version"], {});
+  assert.equal(result.launched, true);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.version, "0.1.15");
+  assert.equal(scheduled[0], VERSION_PROBE_TIMEOUT_MS);
+  assert.ok(scheduled[0] > 5000, "version probe timeout must exceed 5s for bun-compiled OpenCode-family CLIs");
 });
 
 test("runCodexCli slices a single oversized output chunk to the hard limit", async () => {
@@ -125,7 +157,7 @@ test("runCodexCli omits an incomplete UTF-8 suffix at its byte limit", async () 
   assert.doesNotMatch(result.stdout, /�/u);
 });
 
-function createValidationHelpers({ loadCodexSdk, setTimeout, clearTimeout }) {
+function createValidationHelpers({ loadCodexSdk, setTimeout, clearTimeout, ...overrides }) {
   return createAgentCliHelpers({
     getCodexValidationCache: () => null,
     setCodexValidationCache() {},
@@ -138,6 +170,147 @@ function createValidationHelpers({ loadCodexSdk, setTimeout, clearTimeout }) {
     loadCodexSdk,
     ...(setTimeout ? { setTimeout } : {}),
     ...(clearTimeout ? { clearTimeout } : {}),
+    ...overrides,
+  });
+}
+
+test("agent auth validation does not reuse results from a different environment", async () => {
+  const defaultEnv = { HOME: "/default-home" };
+  const agentEnv = { HOME: "/agent-home", CODEX_HOME: "/agent-codex", CUSTOM_KEY: "test-value" };
+  const defaultFailure = { ok: false, checkedAt: Date.now(), codexPath: "/fake/codex", error: "default login expired" };
+  let cached = defaultFailure;
+  const receivedEnvs = [];
+  const helpers = createValidationHelpers({
+    getShellEnv: async () => defaultEnv,
+    getCodexValidationCache: () => cached,
+    setCodexValidationCache: (result) => { cached = result; },
+    loadCodexSdk: async () => ({
+      Codex: class {
+        constructor(options) { receivedEnvs.push(options.env); }
+        startThread() {
+          return { async runStreamed() {
+            return { events: (async function* () { yield { type: "turn.completed" }; })() };
+          } };
+        }
+      },
+    }),
+  });
+
+  const agentResult = await helpers.validateCodexChatGptAuth({ codexPath: "/fake/codex", env: agentEnv });
+  assert.equal(agentResult.ok, true);
+  assert.deepEqual(receivedEnvs, [agentEnv]);
+  assert.equal(cached, agentResult);
+  const defaultResult = await helpers.validateCodexChatGptAuth({ codexPath: "/fake/codex" });
+  assert.equal(defaultResult.ok, true);
+  assert.deepEqual(receivedEnvs, [agentEnv, defaultEnv]);
+  assert.equal(cached, defaultResult);
+});
+
+test("agent auth failure cannot become the default environment's cached result", async () => {
+  let cached = null;
+  const receivedHomes = [];
+  const helpers = createValidationHelpers({
+    getShellEnv: async () => ({ HOME: "/default-home" }),
+    getCodexValidationCache: () => cached,
+    setCodexValidationCache: (result) => { cached = result; },
+    loadCodexSdk: async () => ({
+      Codex: class {
+        constructor(options) { this.home = options.env.HOME; receivedHomes.push(this.home); }
+        startThread() {
+          const home = this.home;
+          return { async runStreamed() {
+            if (home === "/agent-home") throw new Error("agent login expired");
+            return { events: (async function* () { yield { type: "turn.completed" }; })() };
+          } };
+        }
+      },
+    }),
+  });
+
+  const agentResult = await helpers.validateCodexChatGptAuth({ codexPath: "/fake/codex", env: { HOME: "/agent-home" } });
+  assert.equal(agentResult.ok, false);
+  assert.equal(cached, agentResult);
+  const defaultResult = await helpers.validateCodexChatGptAuth({ codexPath: "/fake/codex" });
+  assert.equal(defaultResult.ok, true);
+  assert.deepEqual(receivedHomes, ["/agent-home", "/default-home"]);
+  assert.equal(cached, defaultResult);
+});
+
+test("an invalid explicit CLI path does not poison automatic discovery auth validation", async () => {
+  let cached = null;
+  let probeCount = 0;
+  const helpers = createValidationHelpers({
+    getShellEnv: async () => ({ HOME: "/agent-home" }),
+    normalizeCliPathForPlatform: () => null,
+    getCodexValidationCache: () => cached,
+    setCodexValidationCache: (result) => { cached = result; },
+    loadCodexSdk: async () => ({
+      Codex: class {
+        startThread() {
+          probeCount += 1;
+          return { async runStreamed() {
+            return { events: (async function* () { yield { type: "turn.completed" }; })() };
+          } };
+        }
+      },
+    }),
+  });
+  const invalid = await helpers.validateCodexChatGptAuth({ codexPath: "/missing/codex" });
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.code, "ENOENT");
+  assert.equal(cached, null);
+  assert.equal(probeCount, 0);
+  const discovered = await helpers.validateCodexChatGptAuth({});
+  assert.equal(discovered.ok, true);
+  assert.equal(discovered.codexPath, "/fake/codex");
+  assert.equal(probeCount, 1);
+  assert.equal(await helpers.validateCodexChatGptAuth({}), discovered);
+  assert.equal(probeCount, 1);
+});
+
+for (const codexPath of ["/fake/codex", undefined]) {
+  test(`equivalent auth environments coalesce and cache with ${codexPath ? "explicit" : "discovered"} CLI path; credential rotation probes again`, async () => {
+    const defaultEnv = { HOME: "/agent-home", CUSTOM_KEY: "old-test-key" };
+    let cached = null;
+    let runCount = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const helpers = createValidationHelpers({
+      getShellEnv: async () => ({ ...defaultEnv }),
+      getCodexValidationCache: () => cached,
+      setCodexValidationCache: (result) => { cached = result; },
+      loadCodexSdk: async () => ({
+        Codex: class {
+          startThread() {
+            return { async runStreamed() {
+              runCount += 1;
+              return { events: (async function* () {
+                await gate;
+                yield { type: "turn.completed" };
+              })() };
+            } };
+          }
+        },
+      }),
+    });
+    const options = { codexPath };
+    const first = helpers.validateCodexChatGptAuth({ ...options, env: defaultEnv });
+    const second = helpers.validateCodexChatGptAuth({ ...options, env: { CUSTOM_KEY: "old-test-key", HOME: "/agent-home" } });
+    const third = helpers.validateCodexChatGptAuth(options);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runCount, 1);
+    release();
+    const results = await Promise.all([first, second, third]);
+    assert.equal(results[0].ok, true);
+    assert.equal(results[0], results[1]);
+    assert.equal(results[0], results[2]);
+    assert.equal(await helpers.validateCodexChatGptAuth(options), results[0]);
+    assert.equal(await helpers.validateCodexChatGptAuth({ ...options, env: { CUSTOM_KEY: "old-test-key", HOME: "/agent-home" } }), results[0]);
+    assert.equal(runCount, 1);
+    const rotated = await helpers.validateCodexChatGptAuth({ ...options, env: { ...defaultEnv, CUSTOM_KEY: "new-test-key" } });
+    assert.equal(rotated.ok, true);
+    assert.notEqual(rotated, results[0]);
+    assert.equal(runCount, 2);
   });
 }
 

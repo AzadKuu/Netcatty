@@ -3,6 +3,7 @@ import { useCallback, useRef } from "react";
 import type { GroupConfig, Host, ManagedSource } from "../../domain/models";
 import { removeSnippetTargetGroupPaths } from "../../domain/hostGroupPathMutations";
 import { buildVaultGroupDeletion } from "../../domain/vaultGroupDeletion";
+import { pruneVaultJumpHostReferences } from "../../domain/vaultJumpGraph";
 import type {
   VaultGroupMutationResult,
   VaultGroupMutationState,
@@ -13,6 +14,17 @@ import {
 } from "./vaultManagedImportLock";
 
 const RETRY_VAULT_GROUP_DELETION = Symbol("retry-vault-group-deletion");
+
+export class VaultGroupDeletionConfirmationChangedError extends Error {
+  constructor() {
+    super("The managed files affected by this deletion have changed. Review the files and confirm again.");
+    this.name = "VaultGroupDeletionConfirmationChangedError";
+  }
+}
+
+const managedSourceDeletionIdentity = (source: ManagedSource): string => (
+  JSON.stringify([source.id, source.type, source.filePath, source.groupName])
+);
 
 const managedSourceSnapshotsMatch = (
   left: ManagedSource[],
@@ -59,6 +71,14 @@ export function useVaultGroupDeletion({
     additionallyDeletedHostIds: ReadonlySet<string> = new Set(),
   ) => {
     const selectedPaths = [...paths];
+    // Bind confirmation to the sources rendered with this callback, not the
+    // latest persisted snapshot (which reads and retries update independently).
+    const confirmedFiles = new Set(buildVaultGroupDeletion({
+      ...latestRef.current,
+      selectedPaths,
+      deleteHosts,
+      managedSources,
+    }).sourcesToRemove.map(managedSourceDeletionIdentity));
     let deletedRoots: string[] = [];
     while (true) {
       let restoreManagedFiles: (() => Promise<void>) | undefined;
@@ -80,6 +100,12 @@ export function useVaultGroupDeletion({
           });
           if (deletion.selectedRoots.length === 0) {
             return { status: "empty" as const };
+          }
+
+          if (deletion.sourcesToRemove.some((source) => (
+            !confirmedFiles.has(managedSourceDeletionIdentity(source))
+          ))) {
+            throw new VaultGroupDeletionConfirmationChangedError();
           }
 
           if (deletion.sourcesToRemove.length > 0) {
@@ -130,14 +156,30 @@ export function useVaultGroupDeletion({
               )) {
                 throw RETRY_VAULT_GROUP_DELETION;
               }
+              const nextTransactionHosts = currentDeletion.hosts.filter(
+                (host) => !additionallyDeletedHostIds.has(host.id),
+              );
+              // Hosts removed by this transaction must stop being referenced
+              // from other hosts' jump chains (and group config chains), or
+              // those targets keep failing with "A configured jump host is
+              // missing".
+              const retainedHostIds = new Set(
+                nextTransactionHosts.map((host) => host.id),
+              );
+              const removedHostIds = current.hosts
+                .filter((host) => !retainedHostIds.has(host.id))
+                .map((host) => host.id);
+              const prunedReferences = pruneVaultJumpHostReferences({
+                hosts: nextTransactionHosts,
+                groupConfigs: currentDeletion.groupConfigs,
+                removedHostIds,
+              });
               return {
                 ok: true,
                 state: {
                   groups: currentDeletion.customGroups,
-                  hosts: currentDeletion.hosts.filter(
-                    (host) => !additionallyDeletedHostIds.has(host.id),
-                  ),
-                  configs: currentDeletion.groupConfigs,
+                  hosts: prunedReferences.hosts,
+                  configs: prunedReferences.groupConfigs,
                   managedSources: current.managedSources.filter(
                     (source) => !currentDeletion.sourcesToRemove.some(
                       (removed) => removed.id === source.id,
@@ -194,6 +236,7 @@ export function useVaultGroupDeletion({
     }
     onDeletedPaths?.(deletedRoots);
   }, [
+    managedSources,
     onClearAndRemoveManagedSource,
     onClearAndRemoveManagedSources,
     onCommitVaultGroupMutation,

@@ -91,6 +91,21 @@ test("listMcpTools includes host_open for external MCP clients", () => {
   assert.equal(hostOpen.publicRpcMethod, "public/vault/hosts/open");
 });
 
+test("core MCP descriptions strongly route live terminal work through Netcatty", () => {
+  const tools = listMcpTools();
+  const environment = tools.find((tool) => tool.mcpTool === "get_environment");
+  const execute = tools.find((tool) => tool.mcpTool === "terminal_execute");
+  const start = tools.find((tool) => tool.mcpTool === "terminal_start");
+  const vaultHosts = tools.find((tool) => tool.mcpTool === "vault_hosts_list");
+
+  assert.match(environment?.description || "", /Call this first/i);
+  assert.match(environment?.description || "", /label or hostname/i);
+  assert.match(execute?.description || "", /instead of the local shell/i);
+  assert.match(execute?.description || "", /get_environment first/i);
+  assert.match(start?.description || "", /instead of the local shell/i);
+  assert.match(vaultHosts?.description || "", /host_open/i);
+});
+
 test("session_close is exposed to agents and external MCP clients", () => {
   const mcpTool = listMcpTools().find((tool) => tool.mcpTool === "session_close");
   assert.ok(mcpTool);
@@ -102,6 +117,20 @@ test("session_close is exposed to agents and external MCP clients", () => {
   assert.equal(cattyTool.rpcMethod, "session/close");
 });
 
+test('session reconnect is exposed to both agents without cleanup permission bypasses', () => {
+  const spec = listCattyToolSpecs().find(tool => tool.toolName === 'session_reconnect');
+  assert.equal(spec?.rpcMethod, 'session/reconnect');
+  const mcp = listMcpTools().find(tool => tool.mcpTool === 'session_reconnect');
+  assert.equal(mcp?.publicRpcMethod, 'public/session/reconnect');
+  assert.equal(mcp?.policy.bypassesApproval, false);
+  assert.equal(mcp?.policy.bypassesObserverBlock, false);
+  assert.equal(mcp?.policy.bypassesChatCancel, false);
+  const recover = listCattyToolSpecs().find(tool => tool.toolName === 'session_recover');
+  assert.equal(recover?.rpcMethod, 'session/recover');
+  const recoverMcp = listMcpTools().find(tool => tool.mcpTool === 'session_recover');
+  assert.equal(recoverMcp?.policy.bypassesApproval, false);
+});
+
 test("host_open tells agents to close sessions after use", () => {
   const hostOpen = listMcpTools().find((tool) => tool.mcpTool === "host_open");
   assert.match(hostOpen?.description || "", /session_close/i);
@@ -111,6 +140,7 @@ test("vault host import tool description routes unknown attached host text to ho
   const importSpec = listCattyToolSpecs().find((spec) => spec.capabilityId === "vault.host.import");
   assert.ok(importSpec);
   assert.match(importSpec.description, /known export formats/i);
+  assert.match(importSpec.description, /FinalShell/);
   assert.match(importSpec.description, /unknown/i);
   assert.match(importSpec.description, /read_attachment/i);
   assert.match(importSpec.description, /vault_hosts_create/i);
@@ -159,14 +189,15 @@ test("listAgentToolSpecs splits sidebar harness tools from shared RPC tools", ()
   assert.ok(globalIds.every((id) => sidebarIds.includes(id) || id.startsWith("harness.") === false));
 });
 
-test("listCattyToolSpecs includes harness catty-only tools with local execution", () => {
+test("listCattyToolSpecs includes renderer harness tools and the shared terminal read entry", () => {
   const specs = listCattyToolSpecs();
   assert.ok(specs.length >= 40);
   const harness = specs.filter((spec) => spec.capabilityId.startsWith("harness."));
   assert.equal(harness.length, 6);
   for (const spec of harness) {
-    assert.equal(spec.localExecution, true);
-    assert.equal(spec.rpcMethod, null);
+    const screenRead = spec.capabilityId === "harness.terminal.read_context";
+    assert.equal(spec.localExecution, !screenRead);
+    assert.equal(spec.rpcMethod, screenRead ? "netcatty/readContext" : null);
   }
   const harnessIds = harness.map((spec) => spec.capabilityId);
   assert.ok(harnessIds.includes("harness.tool_output.read"));
@@ -174,10 +205,11 @@ test("listCattyToolSpecs includes harness catty-only tools with local execution"
   assert.ok(harnessIds.includes("harness.terminal.read_context"));
 });
 
-test("harness capabilities are not exposed on MCP", () => {
+test("only terminal reading is exposed from harness on MCP", () => {
   const mcpCapabilityIds = listMcpTools().map((tool) => tool.capabilityId);
+  assert.ok(mcpCapabilityIds.includes("harness.terminal.read_context"));
   for (const capabilityId of mcpCapabilityIds) {
-    assert.ok(!capabilityId.startsWith("harness."));
+    assert.ok(!capabilityId.startsWith("harness.") || capabilityId === "harness.terminal.read_context");
   }
 });
 

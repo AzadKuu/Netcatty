@@ -50,8 +50,6 @@
 # traverse ignored directories, so both steps are required.
 !.github/
 !.github/**
-!.vscode/
-!.vscode/**
 !application/
 !application/**
 !build/
@@ -124,8 +122,7 @@ coverage
 /public/monaco
 
 # Editor directories and files
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea
 *.suo
 *.ntvs*
@@ -177,6 +174,7 @@ build_with_vs2022.bat
 /resources/et/*/*.dll
 
 
+
 # HarmonyOS: build outputs, oh_modules and the packaged Electron payload are
 # covered by harmony/.gitignore. Only guard the local signing material here, which
 # lives in ~/.ohos/config on the build machine and must never be committed.
@@ -184,3 +182,6 @@ build_with_vs2022.bat
 /harmony/**/*.p7b
 /harmony/**/*.cer
 /harmony/**/*.csr
+# Local plugin example staging and bundles
+/examples/plugins/*/.package/
+

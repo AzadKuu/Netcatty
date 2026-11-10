@@ -13,10 +13,18 @@ import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 import App from './App';
 import { AppLockGate } from './components/AppLockGate';
+import { loadLocaleMessages } from './application/i18n/messages';
+import { DEFAULT_UI_LOCALE, resolveSupportedLocale } from './infrastructure/config/i18n';
+import { STORAGE_KEY_UI_LANGUAGE } from './infrastructure/config/storageKeys';
+import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
+
+// Startup timeline marks (see electron/perfTrace.cjs); visible in DevTools too.
+performance.mark('netcatty:renderer:entry-evaluated');
 
 const LazySettingsPage = lazy(() => import('./components/SettingsPage'));
 const LazyTrayPanel = lazy(() => import('./components/TrayPanel'));
 const LazyTerminalPopupPage = lazy(() => import('./components/TerminalPopupPage'));
+const LazyEditorWindowPage = lazy(() => import('./components/editor/EditorWindowPage'));
 
 function SettingsWindowFallback() {
   return (
@@ -144,6 +152,9 @@ const getRoute = () => {
   if (hash === '#/terminal-popup' || hash.startsWith('#/terminal-popup')) {
     return 'terminal-popup';
   }
+  if (hash === '#/editor-window' || hash.startsWith('#/editor-window')) {
+    return 'editor-window';
+  }
   if (hash === '#/session-window' || hash.startsWith('#/session-window')) {
     return 'main';
   }
@@ -165,12 +176,14 @@ const syncTrayWindowClass = (route: string) => {
 const renderApp = () => {
   const route = getRoute();
   const isPeerSessionWindow = window.location.hash.startsWith('#/session-window');
+  const isEditorWindow = route === 'editor-window';
   // Peer session windows must not drive the main window's settings IPC sync
   // and must not re-apply OS-level system settings effects (tray, global
   // shortcuts, …) — they follow the main window through the chrome stores.
+  // Editors consume their own settings instance, so keep IPC/storage sync on.
   const settingsOptions = isPeerSessionWindow
     ? { enableSettingsSync: false, enableSystemEffects: false }
-    : undefined;
+    : isEditorWindow ? { enableSystemEffects: false } : undefined;
 
   syncTrayWindowClass(route);
   if (route === 'settings') {
@@ -222,6 +235,25 @@ const renderApp = () => {
         </AppLockGate>
       </StrictMode>
     );
+  } else if (route === 'editor-window') {
+    root.render(
+      <StrictMode>
+        <AppLockGate
+          notifyRendererReady={false}
+          forceRenderChildren
+          settingsOptions={settingsOptions}
+        >
+          {({ settings, appLock }) => (
+            <Suspense fallback={<TerminalPopupWindowFallback />}>
+              <LazyEditorWindowPage
+                settings={settings}
+                allowEdit={appLock.initialized && !appLock.locked}
+              />
+            </Suspense>
+          )}
+        </AppLockGate>
+      </StrictMode>
+    );
   } else {
     root.render(
       <StrictMode>
@@ -233,8 +265,15 @@ const renderApp = () => {
   }
 };
 
-// Initial render
-renderApp();
-
-// Listen for hash changes
-window.addEventListener('hashchange', renderApp);
+// Load the saved UI language before the first render (only English ships in
+// the startup chunk), so no window flashes English first. Render regardless
+// if the dictionary fails to load; I18nProvider retries and falls back to en.
+void loadLocaleMessages(
+  resolveSupportedLocale(localStorageAdapter.readString(STORAGE_KEY_UI_LANGUAGE) || DEFAULT_UI_LOCALE),
+)
+  .catch(() => {})
+  .finally(() => {
+    renderApp();
+    // Listen for hash changes
+    window.addEventListener('hashchange', renderApp);
+  });

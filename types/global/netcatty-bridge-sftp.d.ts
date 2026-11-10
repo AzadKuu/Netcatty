@@ -28,6 +28,18 @@ declare global {
     chmodSftp?(sftpId: string, path: string, mode: string, encoding?: SftpFilenameEncoding): Promise<void>;
     /** Extract a remote archive into its parent directory via SSH exec. */
     extractSftpArchive?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<{ success: boolean }>;
+    /** Create an archive in directory; source paths are relative to it. */
+    createSftpArchive?(
+      sftpId: string,
+      options: {
+        directory: string;
+        paths: string[];
+        archiveName: string;
+        format: "tar.gz" | "zip";
+        overwrite?: boolean;
+      },
+      encoding?: SftpFilenameEncoding,
+    ): Promise<{ success: boolean; error?: string; code?: string }>;
     getSftpHomeDir?(sftpId: string, encoding?: SftpFilenameEncoding): Promise<{ success: boolean; homeDir?: string; error?: string }>;
 
     // Transfer with progress
@@ -47,7 +59,7 @@ declare global {
         totalBytes: number;
       }
     ): Promise<{ compressionId: string; success?: boolean; error?: string }>;
-    cancelCompressedUpload?(compressionId: string): Promise<{ success: boolean }>;
+    cancelCompressedUpload?(compressionId: string): Promise<{ success: boolean; inactive?: boolean }>;
     pauseCompressedUpload?(compressionId: string): Promise<{ success: boolean; deferred?: boolean; lifecycleEpoch?: number; reason?: string }>;
     resumeCompressedUpload?(compressionId: string): Promise<{ success: boolean; lifecycleEpoch?: number; reason?: string }>;
     checkCompressedUploadSupport?(sftpId: string): Promise<{
@@ -89,7 +101,7 @@ declare global {
         /** When true, skip main-process admission (renderer already scheduled). */
         skipAdmission?: boolean;
       }
-    ): Promise<{ transferId: string; totalBytes?: number; error?: string; cancelled?: boolean }>;
+    ): Promise<{ transferId: string; totalBytes?: number; error?: string; cancelled?: boolean; warning?: string }>;
     pauseTransfer?(transferId: string): Promise<{
       success: boolean;
       superseded?: boolean;
@@ -123,6 +135,7 @@ declare global {
       startedAt?: number;
       endedAt?: number;
       error?: string;
+      warning?: string;
       transferred?: number;
       totalBytes?: number;
       speed?: number;
@@ -157,6 +170,8 @@ declare global {
     statLocal?(path: string): Promise<SftpStatResult>;
     /** No-follow local metadata for conflict detection (symlink vs target). */
     lstatLocal?(path: string): Promise<SftpStatResult>;
+    /** Canonical absolute local path with all symlink components resolved. */
+    realpathLocal?(path: string): Promise<string>;
     listLocalTree?(
       path: string,
       options?: {

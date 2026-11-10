@@ -271,6 +271,32 @@ test("withSyncReliabilityMeta carries old deletion records until the entity is r
   assert.deepEqual(recreated.syncMeta?.deletions, []);
 });
 
+test("withSyncReliabilityMeta inherits deletion records from the stored base", () => {
+  const deletedHost = {
+    id: "host-1",
+    label: "Old",
+    hostname: "old.example.com",
+    username: "root",
+    tags: [],
+    os: "linux" as const,
+  };
+  const base = withSyncReliabilityMeta(
+    payload(),
+    payload({ hosts: [deletedHost] }),
+    { deviceId: "device-a", now: 100 },
+  );
+
+  const next = withSyncReliabilityMeta(payload(), base, { deviceId: "device-b", now: 200 });
+  assert.deepEqual(next.syncMeta?.deletions, base.syncMeta?.deletions);
+
+  const recreated = withSyncReliabilityMeta(
+    payload({ hosts: [deletedHost] }),
+    base,
+    { deviceId: "device-b", now: 300 },
+  );
+  assert.deepEqual(recreated.syncMeta?.deletions, []);
+});
+
 test("withSyncReliabilityMeta attaches change summary and deletion records", () => {
   const base = payload({
     snippets: [{ id: "snippet-1", label: "Old", command: "ls" }],
@@ -290,4 +316,19 @@ test("withSyncReliabilityMeta attaches change summary and deletion records", () 
     deletedAt: 456,
     deviceId: "device-a",
   }]);
+});
+
+
+test("omitted AI sessions are unsupported data, while an explicit empty list records deletion", () => {
+  const sessions = [{ id: "chat-1", messages: [], updatedAt: 1 }] as SyncPayload["aiSessions"];
+  const base = payload({ aiSessions: sessions });
+  const omitted = payload();
+  const cleared = payload({ aiSessions: [] });
+  assert.deepEqual(collectSyncDeletions(base, omitted, { deletedAt: 2 }), []);
+  assert.equal(summarizeSyncChanges(base, omitted, base).hasLocalChanges, false);
+  assert.equal(summarizeSyncChanges(base, base, omitted).hasRemoteChanges, false);
+  assert.deepEqual(collectSyncDeletions(base, cleared, { deletedAt: 2 }), [
+    { entityType: "aiSessions", id: "chat-1", deletedAt: 2 },
+  ]);
+  assert.equal(summarizeSyncChanges(base, cleared).byEntity.aiSessions?.deleted.local, 1);
 });

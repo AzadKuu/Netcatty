@@ -3,6 +3,9 @@ import type { CodebuddyAdvancedOptions } from '../../infrastructure/ai/types';
 declare global {
   interface NetcattyBridge {
     // AI / external agents
+    aiPrivacyStatus?(): Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
+    aiPrivacyTransform?(request: { chatSessionId: string; operation: 'redact' | 'restore'; value: unknown }): Promise<{ ok: boolean; value?: unknown; error?: string }>;
+    aiPrivacyClearSession?(chatSessionId: string): Promise<{ ok: boolean; error?: string }>;
     aiSyncProviders?(providers: Array<{ id: string; providerId: string; apiKey?: string; baseURL?: string; enabled: boolean }>): Promise<{ ok: boolean }>;
     aiChatStream?(requestId: string, url: string, headers?: Record<string, string>, body?: string, providerId?: string, idleTimeoutMs?: number): Promise<{ ok: boolean; statusCode?: number; statusText?: string; error?: string; aborted?: boolean }>;
     aiChatCancel?(requestId: string): Promise<boolean>;
@@ -29,7 +32,7 @@ declare global {
       acpArgs?: string[];
     }>>;
     aiPrewarmShellEnv?(): Promise<{ ok: boolean; error?: string }>;
-    aiCodexGetIntegration?(options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string }): Promise<{
+    aiCodexGetIntegration?(options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       state: 'connected_chatgpt' | 'connected_api_key' | 'connected_custom_config' | 'not_logged_in' | 'unknown';
       isConnected: boolean;
       rawOutput: string;
@@ -45,7 +48,7 @@ declare global {
         authHash: string | null;
       } | null;
     }>;
-    aiCodexStartLogin?(options?: { codexPath?: string }): Promise<{
+    aiCodexStartLogin?(options?: { codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       ok: boolean;
       session?: {
         sessionId: string;
@@ -85,7 +88,7 @@ declare global {
       };
       error?: string;
     }>;
-    aiCodexLogout?(options?: { codexPath?: string }): Promise<{
+    aiCodexLogout?(options?: { codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       ok: boolean;
       state?: 'connected_chatgpt' | 'connected_api_key' | 'connected_custom_config' | 'not_logged_in' | 'unknown';
       isConnected?: boolean;
@@ -197,7 +200,7 @@ declare global {
       message?: string;
       turnKind?: 'review' | 'compact';
     }>;
-    aiSdkAgentListModels?(sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server'): Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; warning?: string; error?: string }>;
+    aiSdkAgentListModels?(sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server', force?: boolean): Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; warning?: string; source?: 'live' | 'last-known-good'; fetchedAt?: string; error?: string }>;
     codexAppServerGetStatus?(agentCommand?: string, agentEnv?: Record<string, string>): Promise<{ ok: boolean; available: boolean; error?: string }>;
     onCodexAppServerInteractionRequest?(cb: (payload: Record<string, unknown>) => void): () => void;
     onCodexAppServerInteractionCleared?(cb: (payload: { interactionIds: string[]; chatSessionId?: string }) => void): () => void;
@@ -230,7 +233,13 @@ declare global {
       mode?: 'temporary' | 'persistent';
       idleTimeoutMinutes?: number;
       sessionIdleTimeoutMinutes?: number;
+      redaction?: import("../../application/state/useExternalMcpToggleState").ExternalMcpRedactionSettings;
     }): Promise<Record<string, unknown>>;
+    externalMcpGetUniversalSetupPrompt?(): Promise<{
+      ok: boolean;
+      prompt?: string;
+      error?: string | null;
+    }>;
     externalMcpCodexGetStatus?(): Promise<Record<string, unknown>>;
     externalMcpCodexAdd?(): Promise<Record<string, unknown>>;
     externalMcpClaudeGetStatus?(): Promise<Record<string, unknown>>;

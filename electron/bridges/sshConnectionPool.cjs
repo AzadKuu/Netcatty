@@ -54,6 +54,7 @@ const LEASE_KINDS = Object.freeze({
   sftp: "sftp",
   transfer: "transfer",
   forward: "forward",
+  monitor: "monitor",
 });
 
 /** @type {Map<string, object>} transportId -> transport */
@@ -98,6 +99,11 @@ function endpointAllowsIdlePark(endpointOrKey, remoteSshVersion) {
 
 function applyIdleParkPolicy(transport, remoteSshVersion) {
   if (!transport) return false;
+  if (transport.endpoint?.singleChannelSsh) {
+    transport.allowIdlePark = false;
+    if (transport.endpointKey) noIdleParkEndpointKeys.add(transport.endpointKey);
+    return false;
+  }
   const remoteVer = remoteSshVersion
     || (typeof transport.conn?._remoteVer === "string" ? transport.conn._remoteVer : "");
   const allowed = endpointAllowsIdlePark(transport.endpointKey || transport.endpoint, remoteVer);
@@ -364,7 +370,13 @@ function parseKnownHostTarget(value) {
  * text or the full known-hosts vault.
  */
 function fingerprintKnownHostTrust(endpoint) {
-  if (!endpoint || endpoint.verifyHostKeys === false) return "disabled";
+  if (!endpoint) return "disabled";
+  const jumps = Array.isArray(endpoint.jumpHosts) ? endpoint.jumpHosts : [];
+  // A jump host can force verification while the target turns it off. The
+  // target flag alone must not drop that hop's pin from the digest.
+  const anyVerification = endpoint.verifyHostKeys !== false
+    || jumps.some((hop) => (hop?.verifyHostKeys ?? endpoint.verifyHostKeys) !== false);
+  if (!anyVerification) return "disabled";
   const targets = [];
   const addTarget = (hostname, port, verifyHostKeys = true) => {
     if (verifyHostKeys === false) return;
@@ -373,7 +385,7 @@ function fingerprintKnownHostTrust(endpoint) {
     targets.push(`${normalizedHostname}|${Number(port) || 22}`);
   };
   addTarget(endpoint.hostname, endpoint.port, endpoint.verifyHostKeys);
-  for (const hop of Array.isArray(endpoint.jumpHosts) ? endpoint.jumpHosts : []) {
+  for (const hop of jumps) {
     addTarget(
       hop?.hostname,
       hop?.port,
@@ -476,7 +488,12 @@ function fingerprintAuth(endpoint) {
     certificate: endpoint.certificate ? secureDigest(endpoint.certificate) : "none",
     requiresMfa: Boolean(endpoint.requiresMfa),
     verifyHostKeys: endpoint.verifyHostKeys !== false,
-    knownHostTrust: fingerprintKnownHostTrust(endpoint),
+    // Channel adoption may compare a sibling key that ignores this digest, then
+    // checks the connection's accepted host key against the caller's records.
+    // Parked transport reuse still uses the full key.
+    knownHostTrust: endpoint.ignoreKnownHostTrustForReuse
+      ? "ignored"
+      : fingerprintKnownHostTrust(endpoint),
     authPolicyVersion: endpoint.authPolicyVersion ?? null,
     useSshAgent: endpoint.useSshAgent ?? null,
     identityAgent: endpoint.identityAgent ?? null,
@@ -553,6 +570,7 @@ function buildConnectionReuseEndpoint(options = {}, overrides = {}) {
     legacyAlgorithms: options.legacyAlgorithms,
     skipEcdsaHostKey: options.skipEcdsaHostKey,
     algorithmOverrides: options.algorithmOverrides,
+    singleChannelSsh: Boolean(options.singleChannelSsh),
   };
 }
 
@@ -579,6 +597,7 @@ function normalizeEndpoint(endpoint) {
     username: endpoint.username || "root",
     protocol: endpoint.protocol || "ssh",
     sftpSudo: Boolean(endpoint.sftpSudo),
+    singleChannelSsh: Boolean(endpoint.singleChannelSsh),
     jumpFingerprint: endpoint.jumpFingerprint
       ? String(endpoint.jumpFingerprint)
       : fingerprintJumpHosts(endpoint.jumpHosts),
@@ -619,6 +638,16 @@ function buildEndpointKey(endpoint) {
     auth,
     `keepalive:${ep.keepaliveIntervalMs}:${ep.keepaliveCountMax}`,
   ].join("|");
+}
+
+/**
+ * Same route as buildEndpointKey, but the known-host trust digest is ignored.
+ * Used only to find an already-authenticated SFTP channel after the renderer
+ * known-host list changes (trust during this app session).
+ */
+function buildChannelAdoptionKey(endpoint) {
+  if (!endpoint || typeof endpoint !== "object") return null;
+  return buildEndpointKey({ ...endpoint, ignoreKnownHostTrustForReuse: true });
 }
 
 function sameEndpoint(a, b) {
@@ -680,6 +709,9 @@ function endpointAllowsReuse(requested, existing, kind = "channel") {
   const req = normalizeEndpoint(requested);
   const have = normalizeEndpoint(existing);
   if (!req || !have) return false;
+  // A bastion that allows one session channel must not lend that transport
+  // to another shell, SFTP, or port forward.
+  if (req.singleChannelSsh || have.singleChannelSsh) return false;
   if (kind === "shell") {
     return req.agentForwarding === have.agentForwarding
       && (!req.agentForwarding
@@ -1345,6 +1377,7 @@ function createConnectionRef(session, conn, chainConnections) {
       keepaliveIntervalMs: session._reuseEndpoint.keepaliveIntervalMs,
       keepaliveCountMax: session._reuseEndpoint.keepaliveCountMax,
       authFingerprint: session._reuseEndpoint.authFingerprint,
+      singleChannelSsh: session._reuseEndpoint.singleChannelSsh,
     }
     : null;
 
@@ -1456,6 +1489,13 @@ function findReusableSession(sessions, sourceSessionId, requestedTarget) {
   // transport live; refuse so start() dials fresh instead of opening a
   // channel that will exit 0 immediately.
   if (source.connRef.allowShellReuse === false) return null;
+  if (
+    source.singleChannelSsh === true
+    || source._reuseEndpoint?.singleChannelSsh === true
+    || source.connRef?.endpoint?.singleChannelSsh === true
+  ) {
+    return null;
+  }
   // ssh2 Client exposes no public "is connected" flag; rely on the descriptor
   // still being attached (it is nulled out on teardown) plus a non-destroyed
   // underlying socket when ssh2 exposes one.
@@ -1526,6 +1566,7 @@ module.exports = {
   setDefaultTransportIdleTtlMs,
   getDefaultTransportIdleTtlMs,
   buildEndpointKey,
+  buildChannelAdoptionKey,
   buildConnectionReuseEndpoint,
   resolveConnectionKeepalivePolicy,
   normalizeEndpoint,

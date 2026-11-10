@@ -1,7 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { EventEmitter } = require("node:events");
+const { mkdtempSync, writeFileSync, rmSync } = require("node:fs");
+const { join } = require("node:path");
+const { getTempFilePath } = require("../tempDirBridge.cjs");
 
 const { createSessionOpsApi } = require("./sessionOps.cjs");
 
@@ -59,7 +62,7 @@ const LINUX_STATS =
 const MACOS_STATS =
   "NC_LATENCY_MARK|CPU:27|CORES:10|MEMINFO:32768 4096 0 8192 2048 1536|PROCS:123;1.2;Finder|DISKS:/:120:460:26:apfs:/dev/disk3|NET:en0:1000:3000";
 
-function makeSessionOps(sessions) {
+function makeSessionOps(sessions, extra = {}) {
   return createSessionOpsApi({
     get sessions() {
       return sessions;
@@ -68,8 +71,9 @@ function makeSessionOps(sessions) {
     clearTimeout,
     Buffer,
     quoteShellArg,
-    measureTcpConnectLatency: async () => 3,
+    measureSshPingLatency: async () => 3,
     // The rest of the sessionOps surface isn't exercised by getServerStats.
+    ...extra,
   });
 }
 
@@ -556,7 +560,7 @@ test("getServerStats opens a Mosh stats companion connection when session.conn i
       s.moshStatsConn = fakeConn(LINUX_STATS);
       return s.moshStatsConn;
     },
-    measureTcpConnectLatency: async () => 3,
+    measureSshPingLatency: async () => 3,
   });
 
   const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
@@ -618,25 +622,170 @@ test("getServerStats does not touch the companion path for a normal SSH session"
   assert.equal(result.success, true);
 });
 
-test("getServerStats measures TCP connectivity instead of SSH protocol latency", async () => {
+test("getServerStats reports null GPU fields when the host has no nvidia-smi data", async () => {
+  const sessions = new Map();
+  sessions.set("sid", { type: "ssh", conn: fakeConn(LINUX_STATS) });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, true);
+  assert.equal(result.stats.gpu, null);
+  assert.equal(result.stats.gpuName, null);
+  assert.equal(result.stats.gpuMemUsed, null);
+  assert.equal(result.stats.gpuMemTotal, null);
+  assert.deepEqual(result.stats.gpus, []);
+});
+
+test("getServerStats parses NVIDIA GPU utilization and VRAM from the stats line", async () => {
+  // Mirrors the remote line: nvidia-smi CSV is space-squeezed to
+  // "<avgUtil> <sumMemUsed> <sumMemTotal> <first GPU name>".
+  const sessions = new Map();
+  sessions.set("sid", {
+    type: "ssh",
+    conn: fakeConn(`${LINUX_STATS}|GPU:73 2048 24576 NVIDIA GeForce RTX 4090`),
+  });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, true);
+  assert.equal(result.stats.gpu, 73);
+  assert.equal(result.stats.gpuName, "NVIDIA GeForce RTX 4090");
+  assert.equal(result.stats.gpuMemUsed, 2048);
+  assert.equal(result.stats.gpuMemTotal, 24576);
+  assert.deepEqual(result.stats.gpus, []);
+});
+
+test("getServerStats tolerates a malformed GPU section", async () => {
+  const sessions = new Map();
+  sessions.set("sid", {
+    type: "ssh",
+    conn: fakeConn(`${LINUX_STATS}|GPU:[Not Supported]`),
+  });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, true);
+  assert.equal(result.stats.gpu, null);
+  assert.equal(result.stats.gpuName, null);
+  assert.deepEqual(result.stats.gpus, []);
+});
+
+for (const scenario of [
+  { name: "multiple GPUs", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 73, 2048, 24576' '1, NVIDIA RTX 4090, 71, 1024, 24576'", gpu: 72, used: 3072, total: 49152, gpus: [
+    { index: 0, name: "NVIDIA RTX 4090", utilization: 73, memoryUsed: 2048, memoryTotal: 24576 },
+    { index: 1, name: "NVIDIA RTX 4090", utilization: 71, memoryUsed: 1024, memoryTotal: 24576 },
+  ] },
+  { name: "idle GPU", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 0, 0, 24576'", gpu: 0, used: 0, total: 24576, gpus: [
+    { index: 0, name: "NVIDIA RTX 4090", utilization: 0, memoryUsed: 0, memoryTotal: 24576 },
+  ] },
+  { name: "mixed utilization availability", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 73, 2048, 24576' '1, NVIDIA A100 MIG, [N/A], 1024, 8192'", gpu: 73, used: 3072, total: 32768, gpus: [
+    { index: 0, name: "NVIDIA RTX 4090", utilization: 73, memoryUsed: 2048, memoryTotal: 24576 },
+    { index: 1, name: "NVIDIA A100 MIG", utilization: null, memoryUsed: 1024, memoryTotal: 8192 },
+  ] },
+  { name: "unavailable memory usage", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 73, [N/A], 24576'", gpu: 73, total: 24576, gpus: [
+    { index: 0, name: "NVIDIA RTX 4090", utilization: 73, memoryUsed: null, memoryTotal: 24576 },
+  ] },
+  { name: "partial memory totals", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 73, 2048, 24576' '1, NVIDIA RTX 4090, 71, 1024, [N/A]'", gpu: 72, used: 3072, gpus: [
+    { index: 0, name: "NVIDIA RTX 4090", utilization: 73, memoryUsed: 2048, memoryTotal: 24576 },
+    { index: 1, name: "NVIDIA RTX 4090", utilization: 71, memoryUsed: 1024, memoryTotal: null },
+  ] },
+  { name: "comma in GPU name", script: "printf '%s\\n' '0, NVIDIA Foo, 80GB, 41, 2048, 24576'", gpu: 41, used: 2048, total: 24576, gpus: [
+    { index: 0, name: "NVIDIA Foo, 80GB", utilization: 41, memoryUsed: 2048, memoryTotal: 24576 },
+  ] },
+  { name: "eight GPUs", script: `printf '%s\\n' ${Array.from({ length: 8 }, (_, index) => `'${index}, NVIDIA A100 ${index}, ${10 + index * 2}, ${1024 * (index + 1)}, 81920'`).join(" ")}`, gpu: 17, used: 36864, total: 655360, gpus: Array.from({ length: 8 }, (_, index) => ({
+    index,
+    name: `NVIDIA A100 ${index}`,
+    utilization: 10 + index * 2,
+    memoryUsed: 1024 * (index + 1),
+    memoryTotal: 81920,
+  })) },
+  { name: "unsupported utilization", script: "printf '%s\\n' '0, NVIDIA RTX 4090, [N/A], 2048, 24576'", gpu: null },
+  { name: "failed query with partial output", script: "printf '%s\\n' '0, NVIDIA RTX 4090, 73, 2048, 24576'; exit 1", gpu: null },
+  { name: "missing query tool", script: "exit 127", gpu: null },
+  { name: "missing timeout tool", script: "exec sleep 20", gpu: null, noTimeout: true },
+  { name: "blocked GPU query", script: "trap '' TERM; exec sleep 20", gpu: null },
+]) {
+  for (const monitorOnly of [false, true]) {
+  test(`real stats shell preserves other metrics with ${scenario.name} (${monitorOnly ? "monitor-only" : "terminal"})`, async (t) => {
+    if (spawnSync("timeout", ["-s", "KILL", "2", "true"]).status !== 0) {
+      t.skip("GNU/BusyBox-compatible timeout is unavailable on this test host");
+      return;
+    }
+    const dir = mkdtempSync(getTempFilePath("gpu-stats-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    writeFileSync(join(dir, "nvidia-smi"), `#!/bin/sh\n${scenario.script}\n`, { mode: 0o755 });
+    let finishGpu;
+    const gpuDone = new Promise(resolve => {finishGpu = resolve;});
+    let gpuCalls = 0;
+    const sessions = new Map([["sid", {
+      type: "ssh",
+      _monitorStats: monitorOnly,
+      conn: {
+        exec(command, cb) {
+          const gpuOnly = !command.includes("NC_LATENCY_MARK") && command.includes("nvidia-smi");
+          if(gpuOnly) gpuCalls++;
+          const child = spawn("sh", ["-c", [
+            "uname() { printf '%s\\n' Linux; }",
+            "nproc() { printf '%s\\n' 4; }",
+            "top() { return 1; }",
+            "df() { return 1; }",
+            scenario.noTimeout
+              ? unwrapExecShC(command).replace("timeout -s KILL 2 nvidia-smi", "nc_missing_timeout -s KILL 2 nvidia-smi")
+              : unwrapExecShC(command),
+          ].join("\n")], {
+            env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+          });
+          let stdout="", stderr="";
+          child.stdout.on("data", data => {stdout+=data;});
+          child.stderr.on("data", data => {stderr+=data;});
+          child.on("error", cb);
+          child.on("close", code => {
+            assert.equal(code,0,stderr);
+            cb(null,fakeStream(stdout));
+            if(gpuOnly)finishGpu();
+          });
+        },
+      },
+    }]]);
+    const api=makeSessionOps(sessions);
+    const sampleStarted=Date.now();
+    let result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+    if(monitorOnly){
+      if(scenario.name === "blocked GPU query")assert.ok(Date.now()-sampleStarted<1500,"a hung GPU must not add its two-second timeout to CPU samples");
+      // Main readings arrive independently, before the optional GPU query ends.
+      assert.equal(result.stats.gpu,null);
+      await gpuDone;
+      await new Promise(resolve=>setImmediate(()=>setImmediate(resolve)));
+      result=await api.getServerStats({sender:{}},{sessionId:"sid"});
+      assert.equal(gpuCalls,1,"cached GPU fields must not open another probe");
+    }
+    assert.equal(result.success, true);
+    assert.equal(result.stats.cpuCores, 4);
+    assert.equal(result.stats.gpu, scenario.gpu);
+    assert.equal(result.stats.gpuMemUsed, scenario.used ?? null);
+    assert.equal(result.stats.gpuMemTotal, scenario.total ?? null);
+    assert.deepEqual(result.stats.gpus, scenario.gpus ?? []);
+  });
+  }
+}
+
+test("getServerStats measures latency by pinging the stats connection", async () => {
   const sessions = new Map();
   const session = {
     type: "mosh",
     hostname: "vm.example.test",
     moshStatsAuth: { hostname: "vm.example.test", port: 2222 },
-    moshStatsConn: fakeConn(LINUX_STATS),
+    moshStatsConn: Object.assign(fakeConn(LINUX_STATS), { config: { keepaliveInterval: 0 } }),
   };
   sessions.set("sid", session);
 
-  const probes = [];
-  const api = createSessionOpsApi({
-    sessions,
-    setTimeout,
-    clearTimeout,
-    Buffer,
-    quoteShellArg,
-    measureTcpConnectLatency: async (target) => {
-      probes.push(target);
+  const pingedConns = [];
+  const api = makeSessionOps(sessions, {
+    measureSshPingLatency: async (conn) => {
+      pingedConns.push(conn);
       return 2;
     },
   });
@@ -645,24 +794,59 @@ test("getServerStats measures TCP connectivity instead of SSH protocol latency",
 
   assert.equal(result.success, true);
   assert.equal(result.stats.latencyMs, 2);
-  assert.deepEqual(probes, [{ hostname: "vm.example.test", port: 2222 }]);
+  assert.deepEqual(pingedConns, [session.moshStatsConn]);
 });
 
-test("getServerStats skips a misleading direct probe for jump-host sessions", async () => {
+test("getServerStats does not open an unauthenticated SSH handshake (#3630)", async (t) => {
+  const net = require("node:net");
+  const { createSshPingLatencyProbe } = require("./sshPingLatency.cjs");
+  let accepted = 0;
+  const server = net.createServer((socket) => {
+    accepted += 1;
+    socket.destroy();
+  });
+  t.after(() => new Promise((resolve) => server.close(() => resolve())));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+
+  const conn = Object.assign(fakeConn(LINUX_STATS), {
+    config: { keepaliveInterval: 30000 },
+  });
+  const sessions = new Map([["sid", {
+    type: "ssh",
+    conn,
+    hostname: "127.0.0.1",
+    port,
+    _reuseEndpoint: { hostname: "127.0.0.1", port },
+  }]]);
+  let pingTarget = null;
+  const measureSshPingLatency = createSshPingLatencyProbe();
+  const api = makeSessionOps(sessions, {
+    measureSshPingLatency: (target, timeoutMs) => {
+      pingTarget = target;
+      return measureSshPingLatency(target, timeoutMs);
+    },
+  });
+
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(result.success, true);
+  assert.equal(pingTarget, conn);
+  assert.equal(result.stats.latencyMs, null);
+  assert.equal(accepted, 0);
+});
+
+test("getServerStats pings the companion connection for jump-host sessions", async () => {
   const sessions = new Map([["sid", {
     type: "mosh",
     moshStatsAuth: { hostname: "private.example.test", port: 22, hasJumpHost: true },
     moshStatsConn: fakeConn(LINUX_STATS),
   }]]);
-  let probeCalls = 0;
-  const api = createSessionOpsApi({
-    sessions,
-    setTimeout,
-    clearTimeout,
-    Buffer,
-    quoteShellArg,
-    measureTcpConnectLatency: async () => {
-      probeCalls += 1;
+  let pingCalls = 0;
+  const api = makeSessionOps(sessions, {
+    measureSshPingLatency: async () => {
+      pingCalls += 1;
       return 2;
     },
   });
@@ -670,8 +854,37 @@ test("getServerStats skips a misleading direct probe for jump-host sessions", as
   const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
 
   assert.equal(result.success, true);
+  assert.equal(result.stats.latencyMs, 2);
+  assert.equal(pingCalls, 1);
+});
+
+test("getServerStats reports no latency when only an exec fallback is available", async () => {
+  const sessions = new Map([["sid", {
+    type: "et",
+    sshUserHost: "alice@example.test",
+    sshOptions: [],
+    sshEnv: {},
+    etStatsAuth: { hostname: "private.example.test", hasJumpHost: true },
+  }]]);
+  let pingCalls = 0;
+  const api = makeSessionOps(sessions, {
+    execOnEtSession: async (_session, command) => ({
+      success: true,
+      stdout: command.includes('echo "DISKS:$disks"') ? "DISKS:" : LINUX_STATS,
+      stderr: "",
+    }),
+    measureSshPingLatency: async () => {
+      pingCalls += 1;
+      return 2;
+    },
+  });
+
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, true);
+  assert.equal(result.stats.memTotal, 8000);
   assert.equal(result.stats.latencyMs, null);
-  assert.equal(probeCalls, 0);
+  assert.equal(pingCalls, 0);
 });
 
 test("getServerStats closes a blocked probe channel when stats time out", async () => {
@@ -733,7 +946,7 @@ test("getServerStats closes a stats stream delivered after timeout", async () =>
   assert.equal(closeCalls, 1);
 });
 
-test("three stats retries on an unresponsive exec open leave no pooled transport or channel callbacks", async () => {
+test("stats open timeout preserves shared transport and fences repeated probes", async () => {
   resetSshTransportRegistryForTests({ defaultIdleTtlMs: 0 });
   const endpoint = { hostId: "stats-host", hostname: "wedged.example", username: "root" };
   const conn = new EventEmitter();
@@ -776,9 +989,16 @@ test("three stats retries on an unresponsive exec open leave no pooled transport
   results.push(await api.getServerStats({ sender: {} }, { sessionId: "sid" }));
 
   assert.ok(results.every((result) => result.success === false));
-  assert.equal(conn.pendingChannelCallbacks.length, 0);
-  assert.equal(getTransportStats().transports, 0);
-  assert.equal(findTransportByEndpoint(endpoint), null);
+  assert.equal(conn.pendingChannelCallbacks.length, 1, "retries must not accumulate opens");
+  assert.equal(getTransportStats().transports, 1);
+  assert.equal(findTransportByEndpoint(endpoint), transport);
+  assert.equal(conn._sock.destroyed, false);
+  const lateStream = fakeStream("");
+  let lateClosed = 0;
+  lateStream.close = () => { lateClosed++; };
+  conn.pendingChannelCallbacks.shift()(null, lateStream);
+  assert.equal(lateClosed, 1);
+  conn.destroy();
 
   const replacement = new EventEmitter();
   replacement._sock = { destroyed: false };
@@ -1067,6 +1287,72 @@ test("getServerStats wraps probes in a remote watchdog matching the client timeo
   assert.ok(commands[1].includes('echo "DISKS:$disks"'));
 });
 
+test("getServerStats skips extra exec when singleChannelSsh is set", async () => {
+  let execCalls = 0;
+  const sessions = new Map();
+  sessions.set("sid", {
+    type: "ssh",
+    singleChannelSsh: true,
+    conn: {
+      exec() {
+        execCalls += 1;
+        throw new Error("must not exec on single-channel SSH");
+      },
+    },
+  });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /extra exec channels/);
+  assert.equal(execCalls, 0);
+});
+
+test("readRemoteHistory skips extra exec when singleChannelSsh is set", async () => {
+  let execCalls = 0;
+  const sessions = new Map();
+  sessions.set("sid", {
+    type: "ssh",
+    singleChannelSsh: true,
+    conn: {
+      exec() {
+        execCalls += 1;
+        throw new Error("must not exec on single-channel SSH");
+      },
+    },
+  });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.readRemoteHistory({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /extra exec channels/);
+  assert.equal(execCalls, 0);
+});
+
+test("getSessionDistroInfo skips extra exec when singleChannelSsh is set", async () => {
+  let execCalls = 0;
+  const sessions = new Map();
+  sessions.set("sid", {
+    type: "ssh",
+    singleChannelSsh: true, remoteSshVersion: "CLOUDBILITY-4.14",
+    conn: {
+      exec() {
+        execCalls += 1;
+        throw new Error("must not exec on Cloudbility");
+      },
+    },
+  });
+
+  const api = makeSessionOps(sessions);
+  const result = await api.getSessionDistroInfo({ sender: {} }, { sessionId: "sid" });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /extra exec channels/);
+  assert.equal(execCalls, 0);
+});
+
 test("getSessionDistroInfo wraps the os-release probe in a remote watchdog", async () => {
   const commands = [];
   const sessions = new Map();
@@ -1164,3 +1450,132 @@ for (const blocked of [false, true]) {
     }
   });
 }
+
+for (const keepaliveInterval of [0, 10000]) {
+  test(`getServerStats honors shared SSH keepalive policy (${keepaliveInterval})`, async () => {
+    const conn = fakeConn(LINUX_STATS);
+    conn.config = { keepaliveInterval };
+    const sessions = new Map([["sid", { type: "ssh", conn }]]);
+    let pingCalls = 0;
+    const api = makeSessionOps(sessions, {
+      measureSshPingLatency: async () => { pingCalls++; return 2; },
+    });
+    const result = await api.getServerStats({ sender: {} }, { sessionId: "sid" });
+    assert.equal(result.success, true);
+    assert.equal(pingCalls, keepaliveInterval === 0 ? 0 : 1);
+    assert.equal(result.stats.latencyMs, keepaliveInterval === 0 ? null : 2);
+    assert.equal(Number.isFinite(result.stats.responseLatencyMs), true);
+  });
+}
+
+test("zmodem remote exec helpers do nothing on single-channel SSH", async () => {
+  let execCalls = 0;
+  const session = {
+    singleChannelSsh: true,
+    conn: { exec() { execCalls += 1; } },
+  };
+  const api = makeSessionOps(new Map([["s1", session]]));
+  assert.equal(await api.probeReceiveConflicts(session, ["file.txt"]), null);
+  await api.removeRemoteFiles(session, ["/tmp/file.txt"]);
+  await api.restoreRemoteModes(session, [{ path: "/tmp/file.txt", mode: "644" }]);
+  assert.equal(execCalls, 0);
+});
+
+
+test("real macOS stats shell parses the root disk without broken awk escaping", async () => {
+  const sessions = new Map([["mac", { type: "ssh", conn: {
+    exec(command, cb) {
+      const script = [
+        'uname() { printf "%s\\n" Darwin; }',
+        'sysctl() { case "$*" in *hw.logicalcpu*) echo 4;; *hw.pagesize*) echo 4096;; *hw.memsize*) echo 8589934592;; *kern.boottime*) echo "{ sec = 1700000000, usec = 0 }";; *vm.loadavg*) echo "{ 1.0 0.5 0.2 }";; esac; }',
+        'vm_stat() { printf "%s\\n" "Pages free: 10000." "Pages inactive: 20000."; }',
+        'ps() { case "$*" in *%cpu*) echo 25;; *%mem*) :;; *) command ps "$@";; esac; }',
+        'mount() { echo "/dev/disk3s1s1 on / (apfs, sealed, local, read-only)"; }',
+        'df() { printf "%s\\n" "Filesystem 1024-blocks Used Available Capacity Mounted on" "/dev/disk3s1s1 1000000 100000 500000 20% /"; }',
+        'netstat() { :; }',
+        'sw_vers() { echo macOS; }',
+        unwrapExecShC(command),
+      ].join("\n");
+      const execution = spawnSync("sh", ["-c", script], { encoding: "utf8", timeout: 5000 });
+      assert.equal(execution.status, 0, execution.stderr);
+      assert.doesNotMatch(execution.stderr, /awk:.*(syntax|regular expression)/);
+      cb(null, fakeStream(execution.stdout));
+    },
+  } }]]);
+  const result = await makeSessionOps(sessions).getServerStats({ sender: {} }, { sessionId: "mac" });
+  assert.equal(result.success, true);
+  assert.equal(result.stats.disks[0].mountPoint, "/");
+  assert.equal(result.stats.disks[0].capacityKey, "apfs:/dev/disk3");
+  assert.equal(result.stats.diskPercent, 50);
+});
+
+test("monitor CPU samples return while an optional GPU driver is still blocked", async () => {
+  let finishGpu, gpuCalls = 0, result;
+  const c = {exec(command, callback) {
+    if (command.includes('nvidia-smi')) {
+      gpuCalls++;
+      finishGpu = () => callback(null, fakeStream('GPU:50 1024 8192 NVIDIA test'));
+    } else callback(null, fakeStream(selectServerStatsFixtureOutput(command, LINUX_STATS)));
+  }};
+  const api = makeSessionOps(new Map());
+  const pending=api.getStatsForContext({conn:c,_monitorStats:true,_monitorIntervalMs:1}).then(value=>{result=value;});
+  try {
+    for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));
+    assert.ok(result?.success, 'CPU and memory must not wait for the GPU probe');
+    assert.equal(result.stats.memTotal,8000);
+    assert.equal(gpuCalls,1);
+  } finally {
+    finishGpu?.();
+    require("./sharedStats.cjs").cancelSharedStats(c);
+    await pending;
+  }
+});
+
+test("shared server stats parse Linux disk I/O across samples and leave macOS unavailable", async (t) => {
+  let now = 100000;
+  t.mock.method(Date, "now", () => now);
+  let payload = `${LINUX_STATS}|DISKIO:10.5;sda:100:200,`;
+  const conn = { exec(command, cb) { cb(null, fakeStream(selectServerStatsFixtureOutput(command, payload))); } };
+  const session = { conn, type: "ssh", _monitorStats: true, _monitorIntervalMs: 1000 };
+  const api = makeSessionOps(new Map([["diskio", session]]));
+  const get = () => api.getServerStats({ sender: {} }, { sessionId: "diskio" });
+  let result = await get();
+  assert.equal(result.success, true);
+  assert.equal(result.stats.diskReadSpeed, null);
+  assert.equal(result.stats.diskWriteSpeed, null);
+  now += 1000;
+  payload = `${LINUX_STATS}|DISKIO:11.5;sda:120:240,`;
+  result = await get();
+  assert.equal(result.stats.diskReadSpeed, 10240);
+  assert.equal(result.stats.diskWriteSpeed, 20480);
+  now += 1000;
+  payload = `${LINUX_STATS}|DISKIO:12.5;sda:120:240,`;
+  result = await get();
+  assert.equal(result.stats.diskReadSpeed, 0);
+  assert.equal(result.stats.diskWriteSpeed, 0);
+  now += 1000;
+  payload = MACOS_STATS;
+  result = await get();
+  assert.equal(result.success, true);
+  assert.equal(result.stats.diskReadSpeed, null);
+  assert.equal(result.stats.diskWriteSpeed, null);
+});
+
+test("shared server stats attach independent block rates to mounted partitions", async (t) => {
+  let now = 100000;
+  t.mock.method(Date, "now", () => now);
+  const base = LINUX_STATS.replace("DISKS:", "DISKS:/:1:10:10:/dev/root,/data:2:20:10:/dev/mapper/data");
+  let payload = `${base}|PARTITIONIO:10;8-1:100:200,253-0:10:20,|DISKMOUNTS:/:8-1,/data:253-0,`;
+  const session = { conn: { exec(command, cb) { cb(null, fakeStream(selectServerStatsFixtureOutput(command, payload))); } }, type: "ssh", _monitorStats: true, _monitorIntervalMs: 1000 };
+  const api = makeSessionOps(new Map([["partition-io", session]]));
+  const get = () => api.getServerStats({ sender: {} }, { sessionId: "partition-io" });
+  let result = await get();
+  assert.equal(result.success, true);
+  assert.equal(result.stats.disks[0].diskReadSpeed, undefined);
+  assert.equal(Object.hasOwn(result.stats.disks[0], "diskReadSpeed"), false);
+  now += 1000;
+  payload = `${base}|PARTITIONIO:11;8-1:102:204,253-0:20:40,|DISKMOUNTS:/:8-1,/data:253-0,`;
+  result = await get();
+  assert.equal(result.success, true);
+  assert.deepEqual(result.stats.disks.map(disk => [disk.diskReadSpeed, disk.diskWriteSpeed]), [[1024, 2048], [5120, 10240]]);
+});

@@ -23,6 +23,10 @@
 "use strict";
 
 const { executeBoundedSshCommand } = require("../boundedSshExec.cjs");
+const {
+  remoteDisallowsChunkedChannelWrite,
+  remoteSoftwareRequiresSingleChannel,
+} = require("../../../domain/singleChannelSshBanner.shared.cjs");
 
 const crypto = require("node:crypto");
 const { classifyLocalShellType } = require("../../../lib/localShell.cjs");
@@ -58,6 +62,23 @@ function quoteShellArg(value) {
  */
 function isWindowsOpenSshRemote(remoteSshVersion) {
   return /openssh_for_windows/i.test(String(remoteSshVersion || ""));
+}
+
+// The host flag and a recognized one-channel software token both mean a second
+// session channel can drop the interactive shell. Keystroke pacing is separate.
+function sessionDisallowsExtraSshChannel(session) {
+  return session?.singleChannelSsh === true
+    || remoteSoftwareRequiresSingleChannel(session?.remoteSshVersion);
+}
+
+/**
+ * Banners whose channel writes must be paced one chunk at a time (BHostSSH,
+ * TERM-SSHD, issue #3146). The exec-channel login-shell probe is skipped for
+ * these too. CLOUDBILITY is one-channel but has no paced-write evidence; that
+ * case is covered by sessionDisallowsExtraSshChannel, not by this helper.
+ */
+function remoteDisallowsExecChannelProbe(remoteSshVersion) {
+  return remoteDisallowsChunkedChannelWrite(remoteSshVersion);
 }
 
 /**
@@ -156,15 +177,21 @@ function parseRemoteWindowsLoginShellProbeOutput(stdout) {
 /**
  * Build an execProbe(command, timeoutMs) => Promise<string|null> from an
  * ssh2-like connection (conn.exec(command, cb)).
+ *
+ * `invalidateOnOpenTimeout` defaults to true so a stuck open on a dedicated
+ * Mosh/ET helper connection still tears that helper down. Pass false when
+ * `conn` is the terminal's own SSH client (#1181).
  */
-function createSshConnExecProbe(conn) {
+function createSshConnExecProbe(conn, options = {}) {
   if (!conn || typeof conn.exec !== "function") return null;
+  const invalidateOnOpenTimeout = options.invalidateOnOpenTimeout !== false;
   return async function execProbe(command, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS) {
     try {
       const result = await executeBoundedSshCommand(conn, command, {
         openingTimeoutMs: timeoutMs,
         runTimeoutMs: timeoutMs,
         maxOutputBytes: 64 * 1024,
+        invalidateOnOpenTimeout,
       });
       // Include stderr so Windows `reg query` missing-value diagnostics
       // (and any probe that only prints errors) still reach the parser.
@@ -181,12 +208,21 @@ function createSshConnExecProbe(conn) {
  */
 function createSessionExecProbe(session) {
   if (!session || typeof session !== "object") return null;
+  // A session-level probe (mosh/et companion stats connection) is independent
+  // of the interactive transport, so it is safe even on bastions.
   if (typeof session._shellKindExecProbe === "function") {
     return (command, timeoutMs) => session._shellKindExecProbe(command, timeoutMs);
   }
+  // Bastions bind the interactive transport to the first session and tear it
+  // down when a second SSH channel opens. Our exec-channel login-shell probe
+  // would disconnect them before the command ever runs, so skip it and let the
+  // PTY live shell probe (probeLiveShell) determine the wrapper (#3146).
+  if (sessionDisallowsExtraSshChannel(session)) return null;
+  // A slow login-shell probe must not Client.end() the interactive transport.
+  // Dedicated Mosh/ET companions keep timeout teardown so recovery can reconnect.
   return (
-    createSshConnExecProbe(session.conn)
-    || createSshConnExecProbe(session.sshClient)
+    createSshConnExecProbe(session.conn, { invalidateOnOpenTimeout: false })
+    || createSshConnExecProbe(session.sshClient, { invalidateOnOpenTimeout: false })
     || createSshConnExecProbe(session.moshStatsConn)
     || createSshConnExecProbe(session.etStatsConn)
     || null
@@ -447,6 +483,8 @@ module.exports = {
   WINDOWS_NO_DEFAULT_SHELL_MARKER,
   isConfirmedShellKind,
   isWindowsOpenSshRemote,
+  remoteDisallowsExecChannelProbe,
+  sessionDisallowsExtraSshChannel,
   classifyShellKindFromRemotePath,
   buildRemoteLoginShellProbeCommand,
   buildRemoteWindowsLoginShellProbeCommand,

@@ -1,6 +1,11 @@
 import type { S3Config, SyncedFile, WebDAVConfig } from "../../domain/sync";
 import type { AppLockSettings } from "../../domain/appLock";
 
+export interface HostBrowserPanelSnapshotLayer {
+  image: string;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
 type AppLockRuntimeReason = 'startup' | 'idle' | 'manual' | 'background' | null;
 
 interface AppLockRuntimeState {
@@ -42,6 +47,7 @@ declare global {
     setTheme?(theme: 'light' | 'dark' | 'system'): Promise<boolean>;
     setBackgroundColor?(color: string): Promise<boolean>;
     setWindowOpacity?(opacity: number): Promise<boolean>;
+    setWindowBackgroundBlur?(enabled: boolean): Promise<boolean>;
     setAppIconVariant?(variant: import('../../domain/appIconVariant').AppIconVariant): Promise<boolean>;
     setLanguage?(language: string): Promise<boolean>;
     // Window controls for custom title bar (Windows/Linux)
@@ -58,6 +64,37 @@ declare global {
       sourceSession: import("../../domain/models").TerminalSession;
       localShellType?: import("../../domain/models").TerminalSession['shellType'];
     }): Promise<{ success: boolean; error?: string }>;
+    openEditorWindow?(payload: import("../../application/state/editorWindowTypes").EditorWindowTabSnapshot): Promise<{ success: boolean; reused?: boolean; error?: string }>;
+    focusEditorWindow?(editorId: string): Promise<{ success: boolean; error?: string }>;
+    closeEditorWindowTabs?(payload: { editorIds: string[]; force?: boolean }): Promise<{
+      success: boolean;
+      cancelled?: boolean;
+      closedIds?: string[];
+      error?: string;
+    }>;
+    saveEditorWindowTab?(payload: {
+      editorId: string;
+      sessionId: string;
+      sftpTabId: string;
+      hostId: string;
+      remotePath: string;
+      content: string;
+    }): Promise<{ ok: boolean; liveConnectionId?: string; error?: string }>;
+    dockEditorWindowTab?(payload: import("../../application/state/editorWindowTypes").EditorWindowTabSnapshot): Promise<{ success: boolean; error?: string }>;
+    reportEditorWindowDirty?(payload: { editorId: string; dirty: boolean }): void;
+    reportEditorWindowTabsClosed?(payload: { editorIds?: string[]; editorId?: string }): void;
+    remapEditorWindowSession?(payload: { fromSessionId: string; toSessionId: string }): void;
+    onEditorWindowOpenTab?(cb: (payload: import("../../application/state/editorWindowTypes").EditorWindowTabSnapshot) => void): () => void;
+    onEditorWindowActivateTab?(cb: (payload: { editorId: string }) => void): () => void;
+    onEditorWindowCloseTabs?(cb: (payload: import("../../application/state/editorWindowTypes").EditorWindowCloseTabsRequest) => void): () => void;
+    reportEditorWindowCloseTabsResult?(payload: import("../../application/state/editorWindowTypes").EditorWindowCloseTabsResult): void;
+    onEditorWindowRemapSession?(cb: (payload: { fromSessionId: string; toSessionId: string }) => void): () => void;
+    onEditorWindowSaveRequest?(cb: (payload: import("../../application/state/editorWindowTypes").EditorWindowSaveRequest) => void): () => void;
+    reportEditorWindowSaveResult?(payload: import("../../application/state/editorWindowTypes").EditorWindowSaveResult): void;
+    onEditorWindowDockRequest?(cb: (payload: import("../../application/state/editorWindowTypes").EditorWindowTabSnapshot & { requestId: string }) => void): () => void;
+    reportEditorWindowDockResult?(payload: { requestId: string; ok: boolean; error?: string }): void;
+    onEditorWindowDirtyChanged?(cb: (payload: { editorId: string; dirty: boolean }) => void): () => void;
+    onEditorWindowTabsClosed?(cb: (payload: { editorIds: string[] }) => void): () => void;
     onOpenSessionInNewWindow?(cb: (payload: {
       title: string;
       sourceSession: import("../../domain/models").TerminalSession;
@@ -71,11 +108,31 @@ declare global {
 
     // Settings window
     openSettingsWindow?(): Promise<boolean>;
+    setHostBrowserPanelLayout?(options: { browserId: string; visible: boolean; occluded?: boolean; theme?: 'dark' | 'light'; themeTokens?: Record<string, string>; bounds?: { x: number; y: number; width: number; height: number } }): Promise<boolean | { layers: HostBrowserPanelSnapshotLayer[] }>;
+    closeHostBrowserPanel?(browserId: string): Promise<boolean>;
+    getHostBrowserPanelState?(browserId: string): Promise<import('../../domain/hostBrowser').HostBrowserState>;
+    commandHostBrowserPanel?(browserId: string, command: import('../../domain/hostBrowser').HostBrowserCommand): Promise<import('../../domain/hostBrowser').HostBrowserState>;
+    listHostBrowserPanelBookmarks?(browserId: string): Promise<import('../../domain/hostBrowser').HostBrowserBookmark[]>;
+    saveHostBrowserPanelBookmark?(browserId: string, bookmark: Partial<import('../../domain/browserBookmark').BrowserBookmark>): Promise<import('../../domain/browserBookmark').BrowserBookmark>;
+    removeHostBrowserPanelBookmark?(browserId: string, id: string): Promise<boolean>;
+    listHostBrowserPanelDownloads?(browserId: string): Promise<import('../../domain/hostBrowser').HostBrowserDownload[]>;
+    commandHostBrowserPanelDownload?(browserId: string, command: { type: 'open-folder' | 'clear' | 'cancel' | 'remove' | 'open' | 'reveal' | 'save-as'; id?: string }): Promise<boolean>;
+    onHostBrowserPanelEvent?(callback: (event: import('../../domain/hostBrowser').HostBrowserPanelEvent) => void): () => void;
+
+    openHostBrowserUrl?(options: { browserId: string; url: string }): Promise<boolean>;
+    requestHostBrowserPanel?(request: { host: import('../../domain/models').Host; sessionId?: string; url?: string }): Promise<boolean>;
+    onHostBrowserPanelRequest?(callback: (request: { host: import('../../domain/models').Host; sessionId?: string; url?: string }) => void): () => void;
+    focusHostBrowser?(hostId: string): Promise<boolean>;
+    openHostBrowser?(options: { browserId?: string; embedded?: boolean; local?: boolean; hostId: string; label: string; theme: 'dark' | 'light'; themeTokens?: Record<string, string>; connectionOptions?: PortForwardOptions }): Promise<{ reused: boolean }>;
+    getHostBrowserBookmarks?(): Promise<import('../../domain/browserBookmark').BrowserBookmark[]>;
+    applyHostBrowserBookmarks?(items: import('../../domain/browserBookmark').BrowserBookmark[]): Promise<boolean>;
+    onHostBrowserBookmarksChanged?(callback: () => void): () => void;
     closeSettingsWindow?(): Promise<void>;
 
     // Cross-window settings sync
     notifySettingsChanged?(payload: { key: string; value: unknown }): void;
     onSettingsChanged?(cb: (payload: { key: string; value: unknown }) => void): () => void;
+    onSystemThemeChanged?(cb: (payload: { isDark: boolean }) => void): () => void;
     getAppLockRuntimeState?(): Promise<AppLockRuntimeState>;
     getAppLockSettings?(): Promise<AppLockSettings>;
     setAppLockTimeoutMinutes?(timeoutMinutes: number): Promise<AppLockSettings>;
@@ -227,6 +284,7 @@ declare global {
       payload: import('./domain/sync').SyncPayload;
     }>;
     trimVaultBackups?(payload: { maxCount: number }): Promise<{ deletedCount: number; keptCount: number }>;
+    clearVaultBackups?(): Promise<{ deletedCount: number }>;
     openVaultBackupDir?(): Promise<{ success: boolean; path: string }>;
     // Subscribe to main-process-driven "vault backups changed" events.
     // Returns an unsubscribe callback. Undefined in non-Electron builds.
@@ -239,10 +297,10 @@ declare global {
     onAppLockReopen?(listener: () => void): () => void;
 
     // Quit guard: subscribe to main-process quit requests that query for dirty editors.
-    // Listener is called with no arguments; return value is an unsubscribe function.
-    onCheckDirtyEditors?(listener: () => void): () => void;
+    // Each response must echo the request ID, including pending-transfer acknowledgements.
+    onCheckDirtyEditors?(listener: (request: { requestId: string; deadline: number }) => void): () => void;
     // Report the dirty-check result back to the main process.
-    reportDirtyEditorsResult?(hasDirty: boolean): void;
+    reportDirtyEditorsResult?(hasDirty: boolean, reason?: "editors" | "transfers", options?: { requestId?: string; pending?: boolean }): void;
 
     onLanguageChanged?(cb: (language: string) => void): () => void;
 

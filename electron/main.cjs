@@ -18,6 +18,10 @@ if (process.env.ELECTRON_RUN_AS_NODE) {
   delete process.env.ELECTRON_RUN_AS_NODE;
 }
 
+// Opt-in startup timeline (NETCATTY_PERF_TRACE=1); a no-op otherwise.
+const perfTrace = require("./perfTrace.cjs");
+perfTrace.mark("main:entry");
+
 // Early file-based debug log. HarmonyOS does not forward main-process console
 // output to hilog, so diagnostics must be written to a file instead.
 const _earlyFs = require("node:fs");
@@ -56,9 +60,30 @@ function _earlyDbgLog(...args) {
 // Load crash log bridge early so process-level error handlers can use it
 const crashLogBridge = require("./bridges/crashLogBridge.cjs");
 const {
+  createDiagnosticLogger,
   createProcessErrorController,
   installProcessErrorHandlers,
 } = require("./bridges/processErrorGuards.cjs");
+// Diagnostics must stay writable-safe: logging a broken stdout/stderr delivers
+// a new process-level error straight back into these handlers (see
+// createDiagnosticLogger). Errors themselves are still captured above.
+const logProcessDiagnostic = createDiagnosticLogger(
+  (...args) => console.error(...args),
+  {
+    streams: [process.stdout, process.stderr],
+    // The logger consumes the stream `error` event, so forward the first sink
+    // failure explicitly or it would never reach the crash log. Only this
+    // logger reports: both share the same streams, so reporting in both would
+    // record every failure twice.
+    onError(err) {
+      try { crashLogBridge.captureError('stdio', err); } catch {}
+    },
+  },
+);
+const logProcessWarning = createDiagnosticLogger(
+  (...args) => console.warn(...args),
+  { streams: [process.stdout, process.stderr] },
+);
 const processErrorController = createProcessErrorController({
   captureError(source, err) {
     try { crashLogBridge.captureError(source, err); } catch {}
@@ -66,17 +91,17 @@ const processErrorController = createProcessErrorController({
   onFatalError(err, context) {
     uninstallProcessErrorHandlers();
     if (context?.origin === 'unhandledRejection') {
-      console.error('Unhandled rejection:', context.reason);
+      logProcessDiagnostic('Unhandled rejection:', context.reason);
     } else {
-      console.error('Uncaught exception:', err);
+      logProcessDiagnostic('Uncaught exception:', err);
     }
     throw err;
   },
   logError(...args) {
-    console.error(...args);
+    logProcessDiagnostic(...args);
   },
   logWarn(...args) {
-    console.warn(...args);
+    logProcessWarning(...args);
   },
 });
 let uninstallProcessErrorHandlers = installProcessErrorHandlers(process, processErrorController);
@@ -112,6 +137,7 @@ const {
   collectSshDeepLinkQueueItems,
   getSshDeepLinkRendererReadyTimeoutMs,
   redactPuttyCommandLinePasswords,
+  redactSecureCrtCommandLinePasswords,
   isJmsDeepLinkUrl,
   isSshDeepLinkUrl,
   isTelnetDeepLinkUrl,
@@ -132,9 +158,9 @@ const { PLUGIN_PROTOCOL_SCHEME } = require("./plugins/constants.cjs");
 const { runPluginShutdown } = require("./plugins/shutdownCoordinator.cjs");
 const {
   OPEN_TERMINAL_PATH_CHANNEL,
-  collectOpenTerminalPathArgs,
+  hasOpenTerminalLaunchArgs,
   resolveOpenTerminalPath,
-  resolveOpenTerminalPathsFromArgs,
+  resolveOpenTerminalRequestsFromArgs,
 } = require("./openTerminalPath.cjs");
 const {
   applyExplorerContextMenuPreference,
@@ -159,6 +185,10 @@ try {
         supportFetchAPI: true,
         corsEnabled: true,
         stream: true,
+        // Let V8 reuse compiled code for the renderer bundles across launches
+        // and windows (requires `standard`). Without it every window
+        // recompiles the multi-megabyte entry chunk from scratch.
+        codeCache: true,
       },
     },
     {
@@ -261,6 +291,12 @@ if (process.env.NETCATTY_COMPAT_GPU !== "1") {
   app.commandLine.appendSwitch("enable-gpu-rasterization");
   app.commandLine.appendSwitch("enable-zero-copy");
 }
+
+// Linux: Chromium only auto-selects gnome-libsecret / kwallet from
+// GNOME/KDE desktop names. Other compositors (niri/sway/Hyprland) fall
+// through to BASIC_TEXT even when Secret Service is running (#4189).
+const { applyLinuxPasswordStore } = require("./linuxPasswordStore.cjs");
+applyLinuxPasswordStore(app);
 
 // Silence noisy DevTools Autofill CDP errors (Electron's backend doesn't expose this domain)
 app.on("web-contents-created", (_event, contents) => {
@@ -787,8 +823,10 @@ const pendingTelnetDeepLinkUrls = [...initialDeepLinkQueueItems.telnet];
 // redacted copy would make warm PuTTY-style launches authenticate with the
 // masked password.
 const rawLaunchArgvForHandoff = [...process.argv];
+// SecureCRT operands may contain PuTTY switch names; scrub them first.
+redactSecureCrtCommandLinePasswords(process.argv);
 redactPuttyCommandLinePasswords(process.argv);
-const pendingOpenTerminalPaths = resolveOpenTerminalPathsFromArgs(process.argv);
+const pendingOpenTerminalPaths = resolveOpenTerminalRequestsFromArgs(process.argv);
 let flushingSshDeepLinks = false;
 let flushingTelnetDeepLinks = false;
 let flushingOpenTerminalPaths = false;
@@ -802,19 +840,19 @@ let jmsDeepLinkDeliveryGeneration = 0;
 
 let explorerContextMenuEnabled = resolveExplorerContextMenuEnabled({ app }).enabled === true;
 
-function queueSshDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+function queueSshDeepLink(rawUrl, { viaCommandLine = false, tabName } = {}) {
   if (!viaCommandLine && !sshDeepLinkEnabled) return;
   if (!isSshDeepLinkUrl(rawUrl)) return;
-  pendingSshDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  pendingSshDeepLinkUrls.push({ rawUrl, viaCommandLine, ...(tabName ? { tabName } : {}) });
   if (app.isReady?.()) {
     void flushPendingSshDeepLinks();
   }
 }
 
-function queueTelnetDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+function queueTelnetDeepLink(rawUrl, { viaCommandLine = false, tabName } = {}) {
   if (!viaCommandLine && !sshDeepLinkEnabled) return;
   if (!isTelnetDeepLinkUrl(rawUrl)) return;
-  pendingTelnetDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  pendingTelnetDeepLinkUrls.push({ rawUrl, viaCommandLine, ...(tabName ? { tabName } : {}) });
   if (app.isReady?.()) {
     void flushPendingTelnetDeepLinks();
   }
@@ -823,7 +861,7 @@ function queueTelnetDeepLink(rawUrl, { viaCommandLine = false } = {}) {
 function queueOpenTerminalPath(rawPath, options = {}) {
   const resolvedPath = resolveOpenTerminalPath(rawPath, options);
   if (!resolvedPath) return;
-  pendingOpenTerminalPaths.push(resolvedPath);
+  pendingOpenTerminalPaths.push({ path: resolvedPath });
   if (app.isReady?.()) {
     void flushPendingOpenTerminalPaths();
   }
@@ -1014,7 +1052,7 @@ async function flushPendingJmsDeepLinks() {
   }
 }
 
-async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false, tabName } = {}) {
   // The ssh:// preference can flip while a delivery is waiting for the
   // renderer, so re-check it at every gate instead of reusing the queue-time
   // snapshot. Command-line (PuTTY-style) launches bypass the preference.
@@ -1037,7 +1075,7 @@ async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDelivery
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     SSH_DEEP_LINK_CHANNEL,
-    { url: rawUrl },
+    { url: rawUrl, ...(tabName ? { tabName } : {}) },
     {
       timeoutMs: getSshDeepLinkRendererReadyTimeoutMs({ isDev }),
       shouldSend: shouldDeliver,
@@ -1050,7 +1088,7 @@ async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDelivery
   return result || { success: true };
 }
 
-async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false, tabName } = {}) {
   // Mirror deliverSshDeepLink: gate on the live preference so disabling
   // protocol handling cancels in-flight scheme deliveries, while
   // command-line launches stay deliverable.
@@ -1067,7 +1105,7 @@ async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliv
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     TELNET_DEEP_LINK_CHANNEL,
-    { url: rawUrl },
+    { url: rawUrl, ...(tabName ? { tabName } : {}) },
     {
       timeoutMs: 0,
       shouldSend: shouldDeliver,
@@ -1094,6 +1132,7 @@ async function flushPendingSshDeepLinks() {
       const expectedGeneration = sshSchemeDeliveryGeneration;
       const result = await deliverSshDeepLink(item.rawUrl, expectedGeneration, {
         viaCommandLine: item.viaCommandLine === true,
+        tabName: item.tabName,
       });
       if (shouldRequeueFailedSshDeepLinkDelivery({
         enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
@@ -1139,6 +1178,7 @@ async function flushPendingTelnetDeepLinks() {
       const expectedGeneration = sshSchemeDeliveryGeneration;
       const result = await deliverTelnetDeepLink(item.rawUrl, expectedGeneration, {
         viaCommandLine: item.viaCommandLine === true,
+        tabName: item.tabName,
       });
       if (shouldRequeueFailedSshDeepLinkDelivery({
         enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
@@ -1169,13 +1209,17 @@ async function flushPendingTelnetDeepLinks() {
 }
 
 async function deliverOpenTerminalPath(targetPath) {
+  const request = typeof targetPath === "string" ? { path: targetPath } : (targetPath || {});
+  const payload = {};
+  if (typeof request.path === "string" && request.path) payload.path = request.path;
+  if (typeof request.shell === "string" && request.shell) payload.shell = request.shell;
   const win = await createAndShowMainWindow();
   focusMainWindow();
   const windowManager = getWindowManager();
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     OPEN_TERMINAL_PATH_CHANNEL,
-    { path: targetPath },
+    payload,
     { timeoutMs: 0 },
   );
   if (result && result.success === false) {
@@ -1325,6 +1369,7 @@ if (!gotLock) {
     const deepLinkQueueItems = collectSshDeepLinkQueueItems(secondInstanceArgv, {
       includeSchemeUrls: sshDeepLinkEnabled,
     });
+    redactSecureCrtCommandLinePasswords(secondInstanceArgv);
     redactPuttyCommandLinePasswords(secondInstanceArgv);
     if (rawLaunchArgv) {
       // Parsing and subsequent routing use the independent ordered copy.
@@ -1341,25 +1386,25 @@ if (!gotLock) {
     }
     if (deepLinkQueueItems.telnet.length > 0) {
       deepLinkQueueItems.telnet.forEach((item) => {
-        queueTelnetDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+        queueTelnetDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine, tabName: item.tabName });
       });
       return;
     }
     if (deepLinkQueueItems.ssh.length > 0) {
       deepLinkQueueItems.ssh.forEach((item) => {
-        queueSshDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+        queueSshDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine, tabName: item.tabName });
       });
       return;
     }
-    if (collectOpenTerminalPathArgs(secondInstanceArgv).length > 0) {
+    if (hasOpenTerminalLaunchArgs(secondInstanceArgv)) {
       const baseDirectory = typeof workingDirectory === "string" ? workingDirectory : undefined;
-      const openTerminalPaths = resolveOpenTerminalPathsFromArgs(secondInstanceArgv, { baseDirectory });
+      const openTerminalPaths = resolveOpenTerminalRequestsFromArgs(secondInstanceArgv, { baseDirectory });
       if (openTerminalPaths.length > 0) {
         queueResolvedOpenTerminalPaths(openTerminalPaths);
       } else {
         // Still bring the app forward when Explorer launched us but the path
         // failed validation — silent no-op feels like a broken menu item.
-        console.warn("[Main] Open-terminal-path args present but no valid path resolved:", secondInstanceArgv);
+        console.warn("[Main] Open-terminal args present but no valid request resolved:", secondInstanceArgv);
         if (!focusMainWindow()) {
           // Explicit foreground request (a second instance launch): if a
           // still-pending hidden auto-launch cold start races ahead of the
@@ -1393,8 +1438,10 @@ if (!gotLock) {
   });
 
   // Application lifecycle
+  perfTrace.mark("main:modules-loaded");
   app.whenReady().then(async () => {
     setSshAuthHelperAppRef(app);
+    perfTrace.mark("main:when-ready");
     registerAppProtocol();
     const initialSshDeepLinkPreference = applyInitialSshDeepLinkPreference({
       enabled: sshDeepLinkEnabled,

@@ -1,20 +1,22 @@
 import { streamText, isStepCount, type ModelMessage } from 'ai';
-import { classifyError } from '../../errorClassifier';
-import { isRequestTooLargeError } from '../../errorClassifier';
+import type { LanguageModelV4 } from '@ai-sdk/provider';
+import { classifyError, isInvalidAnthropicThinkingSignatureError, isRequestTooLargeError } from '../../errorClassifier';
 import { isSdkStreamStateError } from '../../shared/streamStateErrors';
 import {
+  createCattyAnthropicSignatureRetryError,
   createCattyRequestTooLargeRetryError,
   hadToolProgressBeforeRequestTooLarge,
 } from '../../cattyRequestTooLargeRetry';
 import { mapCattyStreamChunkToAgentEvents } from '../agentEventAdapter';
 import type { AgentEvent } from '../types';
-import type { ProviderAdvancedParams } from '../../types';
+import { resolveProviderStyle, type ProviderAdvancedParams } from '../../types';
 import type { CattyReasoningProviderOptions } from '../../cattyReasoning';
-import { createModelFromConfig } from '../../sdk/providers';
+import { resolveProviderEndpoint } from '../../sdk/providers';
 import type { CattyToolsBundle } from '../capabilityTools';
 import { buildCattyToolApproval } from '../cattyToolApproval';
 import type { CattyRuntimeContext } from '../cattyRuntimeContext';
 import { buildCattyStreamTimeouts } from '../streamTimeouts';
+import { createCattyPromptCache } from '../cattyPromptCache';
 import {
   extractProviderContinuationFromRawChunk,
   mergeProviderContinuation,
@@ -39,9 +41,9 @@ import {
   type ToolOutputDeniedChunk,
   type ToolResultChunk,
 } from '../../aiChatStreamingSupport';
-import type { ChatMessage } from '../../types';
+import type { ChatMessage, ProviderConfig } from '../../types';
 
-export type CattyModel = ReturnType<typeof createModelFromConfig>;
+export type CattyModel = LanguageModelV4;
 
 export interface CattyStreamUiSink {
   addMessageToSession: (sessionId: string, message: ChatMessage) => void;
@@ -51,6 +53,7 @@ export interface CattyStreamUiSink {
 export interface ProcessCattyStreamInput {
   streamSessionId: string;
   model: CattyModel;
+  providerConfig?: ProviderConfig;
   systemPrompt: string;
   toolsBundle: CattyToolsBundle;
   sdkMessages: ModelMessage[];
@@ -76,6 +79,7 @@ export interface ProcessCattyStreamInput {
 export interface ProcessCattyStreamResult {
   usage?: {
     promptTokens?: number;
+    cachedPromptTokens?: number;
     completionTokens?: number;
     totalTokens?: number;
   };
@@ -128,16 +132,23 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
   } = input;
 
   let runtimeContext = initialRuntimeContext;
+  if (!Array.isArray(sdkMessages) || sdkMessages.length === 0) {
+    throw new Error('Invalid prompt: Catty refused an empty messages array (#4102).');
+  }
   const { tools, toolsContext } = toolsBundle;
+  const endpoint = input.providerConfig
+    ? resolveProviderEndpoint(input.providerConfig, resolveProviderStyle(input.providerConfig), undefined)
+    : undefined;
+  const promptCache = createCattyPromptCache(systemPrompt, model.provider, endpoint);
 
   const result = streamText({
     model,
-    messages: sdkMessages,
-    instructions: systemPrompt,
+    messages: promptCache.prepareMessages(sdkMessages),
+    instructions: promptCache.instructions,
     tools,
     toolsContext,
     runtimeContext,
-    toolApproval: buildCattyToolApproval({
+    toolApproval: runtimeContext.delegated ? undefined : buildCattyToolApproval({
       permissionMode: runtimeContext.permissionMode,
       chatSessionId: runtimeContext.chatSessionId,
     }),
@@ -186,6 +197,7 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
         modelId: step.model.modelId,
         finishReason: step.finishReason,
         promptTokens: usage.inputTokens ?? 0,
+        cachedPromptTokens: usage.inputTokenDetails?.cacheReadTokens,
         completionTokens: usage.outputTokens ?? 0,
         totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
       } as AgentEvent);
@@ -201,15 +213,17 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
           timestamp: Date.now(),
           turnId,
           promptTokens: usage.inputTokens ?? 0,
+          cachedPromptTokens: usage.inputTokenDetails?.cacheReadTokens,
           completionTokens: usage.outputTokens ?? 0,
+          reasoningTokens: usage.outputTokenDetails?.reasoningTokens,
           totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
           estimated: false,
         } as AgentEvent);
       }
     },
-    ...(prepareStep ? {
+    ...(prepareStep || promptCache.enabled ? {
       prepareStep: async ({ stepNumber, messages, runtimeContext: stepRuntimeContext }) => {
-        const prepared = await prepareStep({
+        const prepared = await prepareStep?.({
           stepNumber,
           messages,
           runtimeContext: stepRuntimeContext as CattyRuntimeContext,
@@ -217,7 +231,7 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
         if (prepared?.runtimeContext) {
           runtimeContext = prepared.runtimeContext;
         }
-        return prepared ?? { messages };
+        return { ...prepared, messages: promptCache.prepareMessages(prepared?.messages ?? messages) };
       },
     } : {}),
     ...(advancedParams?.maxTokens != null && { maxOutputTokens: advancedParams.maxTokens }),
@@ -356,6 +370,9 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
       } catch (readErr) {
         if (isRequestTooLargeError(readErr)) {
           throw createCattyRequestTooLargeRetryError(readErr, hadToolProgress);
+        }
+        if (isInvalidAnthropicThinkingSignatureError(readErr)) {
+          throw createCattyAnthropicSignatureRetryError(readErr, hadToolProgress);
         }
         throw readErr;
       }
@@ -512,13 +529,24 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
         case 'error': {
           const typedChunk = chunk as ErrorChunk;
           if (isSdkStreamStateError(typedChunk.error)) {
-            console.warn('[Catty] suppressed SDK stream state error:', typedChunk.error);
+            if (runtimeContext.delegated) console.warn('[Plugin Agent] SDK stream state unavailable');
+            else console.warn('[Catty] suppressed SDK stream state error:', typedChunk.error);
             break;
           }
           if (isRequestTooLargeError(typedChunk.error)) {
             cancelPendingFlush();
             flushText();
             throw createCattyRequestTooLargeRetryError(
+              typedChunk.error,
+              hadToolProgress,
+            );
+          }
+          if (isInvalidAnthropicThinkingSignatureError(typedChunk.error)) {
+            // Propagate to turn-driver strip-and-retry (#4074 P1); do not consume
+            // as a terminal error message the way other stream errors are.
+            cancelPendingFlush();
+            flushText();
+            throw createCattyAnthropicSignatureRetryError(
               typedChunk.error,
               hadToolProgress,
             );
@@ -552,6 +580,21 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
   const usage = await result.usage;
   const finalStep = await result.finalStep;
   const performance = finalStep?.performance;
+  // onEnd can run before this consumer flushes its final text and creates the
+  // post-tool assistant message. Attach turn totals only after that flush.
+  if (usage) {
+    ui.updateMessageById(streamSessionId, activeMsgId, message => ({
+      ...message,
+      usage: {
+        inputTokens: usage.inputTokens ?? 0,
+        cachedInputTokens: usage.inputTokenDetails?.cacheReadTokens,
+        outputTokens: usage.outputTokens ?? 0,
+        reasoningTokens: usage.outputTokenDetails?.reasoningTokens,
+        totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+        estimated: false,
+      },
+    }));
+  }
 
   if (performance) {
     onAgentEvent?.({
@@ -571,6 +614,7 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
   return {
     usage: usage ? {
       promptTokens: usage.inputTokens,
+      cachedPromptTokens: usage.inputTokenDetails?.cacheReadTokens,
       completionTokens: usage.outputTokens,
       totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
     } : undefined,

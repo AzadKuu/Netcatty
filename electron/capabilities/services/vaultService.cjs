@@ -47,6 +47,8 @@ function createVaultService(ctx = {}) {
       return invokeVaultAgent("host.open", {
         hostId: params.hostId,
         chatSessionId: params.chatSessionId,
+        newTab: params.newTab,
+        workspaceId: params.workspaceId,
       });
     },
     createHosts: async (params = {}) => {
@@ -112,6 +114,11 @@ function createVaultService(ctx = {}) {
       const bridgeErr = requireBridge();
       if (bridgeErr) return bridgeErr;
       return invokeVaultAgent("note.delete", { noteId: params.noteId });
+    },
+    importNotes: async (params = {}) => {
+      const bridgeErr = requireBridge();
+      if (bridgeErr) return bridgeErr;
+      return invokeVaultAgent("note.import", params);
     },
     listIdentities: async () => {
       const bridgeErr = requireBridge();

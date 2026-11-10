@@ -7,6 +7,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 const { safeSend } = require("./ipcUtils.cjs");
+const perfTrace = require("../perfTrace.cjs");
 
 let _wmLogPath = null;
 function _resolveWmLogPath() {
@@ -71,6 +72,10 @@ let settingsWindow = null;
 let currentTheme = "light";
 let currentLanguage = "en";
 let currentWindowOpacity = 1;
+let currentWindowBackgroundBlurRequested = false;
+let currentWindowBackgroundColor = null;
+/** Windows this module switched to a transparent backing, so restore is safe. */
+const transparentChromeWindows = new WeakSet();
 let cachedNativeTheme = null;
 
 let handlersRegistered = false; // Prevent duplicate IPC handler registration
@@ -108,6 +113,9 @@ const DEFAULT_WINDOW_WIDTH = 1400;
 const DEFAULT_WINDOW_HEIGHT = 900;
 // Minimum window size: enough to render the expanded sidebar + a usable
 // host list + the 420px host details / new-host aside panel without overflow.
+// Small displays shrink this fit to their work area at window-creation time
+// (see resolveWindowMinimumSize in windowManager/mainWindow.cjs, #3647);
+// the minimum tracks the display the window currently occupies.
 const MIN_WINDOW_WIDTH = 1100;
 const MIN_WINDOW_HEIGHT = 640;
 
@@ -371,6 +379,12 @@ function getAppContentWindowList() {
   return Array.from(appContentWindows).filter((win) => isWindowUsable(win));
 }
 
+// Settings has its own reusable window lifecycle, outside app-content editors.
+// Enumerate only managed app renderers; remote/pop-up/plugin contents are absent.
+function getManagedAppWindowList() {
+  return [...new Set([...getAppContentWindowList(), getSettingsWindow()])].filter((win) => isWindowUsable(win));
+}
+
 function getDirtyEditorWindowList() {
   pruneAppContentWindows();
   return Array.from(dirtyEditorWindows).filter((win) => isWindowUsable(win));
@@ -386,6 +400,7 @@ function registerAppContentWindow(win, options = {}) {
   if (!win || win.isDestroyed?.()) return;
   appContentWindows.add(win);
   if (options.queryDirtyEditors === true) dirtyEditorWindows.add(win);
+  applyWindowBackgroundChromeToWindow(win, { applyBackgroundColor: true });
 }
 
 function unregisterAppContentWindow(win) {
@@ -435,19 +450,93 @@ function clampWindowOpacity(opacity) {
 function applyWindowOpacityToWindow(win) {
   if (!win || win.isDestroyed?.()) return;
   try {
-    win.setOpacity?.(currentWindowOpacity);
+    win.setOpacity?.(isWindowBackgroundBlurActive() ? 1 : currentWindowOpacity);
   } catch {
     // ignore
   }
+  applyWindowBackgroundChromeToWindow(win, { applyBackgroundColor: true });
 }
 
 function applyWindowOpacity(opacity) {
   currentWindowOpacity = clampWindowOpacity(opacity);
-  forEachMainWindow(applyWindowOpacityToWindow);
+  for (const win of getAppContentWindowList()) {
+    applyWindowOpacityToWindow(win);
+  }
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     applyWindowOpacityToWindow(settingsWindow);
   }
+  applyTrayPanelBackgroundBlur(getGlobalShortcutBridge().getTrayPanelWindow?.());
   return currentWindowOpacity;
+}
+
+function isWindowBackgroundBlurActive() {
+  return process.platform === "darwin"
+    && currentWindowBackgroundBlurRequested
+    && currentWindowOpacity < 1;
+}
+
+function applyTrayPanelBackgroundBlur(win) {
+  if (process.platform !== "darwin" || !win || win.isDestroyed?.()) return;
+  try {
+    win.setVibrancy?.(isWindowBackgroundBlurActive() ? "hud" : null);
+  } catch {
+    // ignore platform-specific chrome failures
+  }
+}
+
+function applyWindowBackgroundChromeToWindow(win, options = {}) {
+  if (!win || win.isDestroyed?.()) return;
+  try {
+    if (isWindowBackgroundBlurActive()) {
+      win.setVibrancy?.("hud");
+      win.setBackgroundColor?.("#00000000");
+      transparentChromeWindows.add(win);
+      return;
+    }
+    if (process.platform === "darwin") win.setVibrancy?.(null);
+    if (options.applyBackgroundColor !== true) return;
+    // An explicit theme/background-color push must always repaint, otherwise
+    // the native backing goes stale after theme changes. Registration-time
+    // chrome setup is different: it must not clobber the color the window was
+    // created with before any theme color has been pushed.
+    const wasTransparent = transparentChromeWindows.delete(win);
+    if (options.forceBackgroundColor === true || wasTransparent) {
+      // A window can be asked to drop vibrancy before any theme color has been
+      // pushed (cold start with blur already saved). Falling back to the active
+      // theme keeps the window from staying transparent.
+      const restoreColor = currentWindowBackgroundColor
+        || THEME_COLORS[currentTheme]?.background;
+      if (restoreColor) win.setBackgroundColor?.(restoreColor);
+    }
+  } catch {
+    // ignore platform-specific chrome failures
+  }
+}
+
+function applyWindowBackgroundColor(color) {
+  const normalized = normalizeBackgroundColor(color);
+  if (!normalized) return false;
+  currentWindowBackgroundColor = normalized;
+  for (const win of getAppContentWindowList()) {
+    applyWindowBackgroundChromeToWindow(win, { applyBackgroundColor: true, forceBackgroundColor: true });
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    applyWindowBackgroundChromeToWindow(settingsWindow, { applyBackgroundColor: true, forceBackgroundColor: true });
+  }
+  return true;
+}
+
+function applyWindowBackgroundBlur(enabled) {
+  const supported = process.platform === "darwin";
+  currentWindowBackgroundBlurRequested = supported && enabled === true;
+  for (const win of getAppContentWindowList()) {
+    applyWindowOpacityToWindow(win);
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    applyWindowOpacityToWindow(settingsWindow);
+  }
+  applyTrayPanelBackgroundBlur(getGlobalShortcutBridge().getTrayPanelWindow?.());
+  return supported;
 }
 
 function getMainWindowCount() {
@@ -717,7 +806,10 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true,
       try { isDestroyedBefore = win.isDestroyed(); } catch (e) { isDestroyedBefore = "err:" + (e?.message || e); }
       try { visibleBefore = win.isVisible?.(); } catch (e) { visibleBefore = "err:" + (e?.message || e); }
       dbgLog("[WindowManager] before win.show() isDestroyed=" + isDestroyedBefore + " isVisible=" + visibleBefore);
-      if (!win.isDestroyed()) win.show();
+      if (!win.isDestroyed()) {
+        win.show();
+        perfTrace.mark("main:window-shown");
+      }
       let visibleAfter = null;
       let isDestroyedAfter = null;
       try { visibleAfter = win.isVisible?.(); } catch (e) { visibleAfter = "err:" + (e?.message || e); }
@@ -1015,6 +1107,8 @@ const mainWindowApi = createMainWindowApi({
   createAppWindowOpenHandler,
   attachOAuthLoadingOverlay,
   queryDirtyEditors: (...args) => require("./dirtyEditorGuard.cjs").queryDirtyEditors(...args),
+  hasEditorTabsForSource: (webContents) => editorWindowApi.hasEditorTabsForSource(webContents),
+  closeEditorTabsForSource: (...args) => editorWindowApi.closeEditorTabsForSource(...args),
   registerWindowHandlers,
   requestWindowCommandClose,
   shouldCloseWindowFromInput,
@@ -1056,7 +1150,12 @@ const { createWindow } = mainWindowApi;
 const { createSettingsWindowApi } = require("./windowManager/settingsWindow.cjs");
 const settingsWindowApi = createSettingsWindowApi({
   get settingsWindow() { return settingsWindow; },
-  set settingsWindow(value) { settingsWindow = value; },
+  set settingsWindow(value) {
+    settingsWindow = value;
+    if (value) {
+      applyWindowBackgroundChromeToWindow(value, { applyBackgroundColor: true });
+    }
+  },
   get mainWindow() { return mainWindow; },
   get currentTheme() { return currentTheme; },
   get isQuitting() { return isQuitting; },
@@ -1107,6 +1206,36 @@ const {
   closeTerminalPopupWindow,
   getTerminalPopupWindows,
 } = terminalPopupWindowApi;
+
+const { createEditorWindowApi } = require("./windowManager/editorWindow.cjs");
+const editorWindowApi = createEditorWindowApi({
+  get mainWindow() { return mainWindow; },
+  get currentTheme() { return currentTheme; },
+  get isQuitting() { return isQuitting; },
+  V8_CACHE_OPTIONS,
+  __dirname,
+  resolveFrontendBackgroundColor,
+  createExternalOnlyWindowOpenHandler,
+  getDevRendererBaseUrl,
+  applyWindowOpacityToWindow,
+  showAndFocusWindow,
+  resolveSettingsWindowBounds,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  notifyAppContentWindowClosed,
+  queryDirtyEditors: (...args) => require("./dirtyEditorGuard.cjs").queryDirtyEditors(...args),
+});
+const {
+  openEditorWindow,
+  focusEditorTab,
+  closeEditorTabs: closeEditorWindowTabs,
+  saveEditorTab: saveEditorWindowTab,
+  dockEditorTab,
+  reportEditorDirty,
+  reportEditorTabsClosed,
+  remapEditorSession,
+  getEditorWindow,
+} = editorWindowApi;
 
 /**
  * Register window control IPC handlers (only once)
@@ -1215,21 +1344,12 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
       ? (nativeTheme?.shouldUseDarkColors ? "dark" : "light")
       : theme;
     const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
-    forEachMainWindow((win) => win.setBackgroundColor(themeConfig.background));
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.setBackgroundColor(themeConfig.background);
-    }
+    applyWindowBackgroundColor(themeConfig.background);
     return true;
   });
 
   ipcMain.handle("netcatty:setBackgroundColor", (_event, color) => {
-    const normalized = normalizeBackgroundColor(color);
-    if (!normalized) return false;
-    forEachMainWindow((win) => win.setBackgroundColor(normalized));
-    if (settingsWindow && !settingsWindow.isDestroyed()) {
-      settingsWindow.setBackgroundColor(normalized);
-    }
-    return true;
+    return applyWindowBackgroundColor(color);
   });
 
   ipcMain.handle("netcatty:setWindowOpacity", (_event, opacity) => {
@@ -1237,16 +1357,28 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     return true;
   });
 
+  ipcMain.handle("netcatty:setWindowBackgroundBlur", (_event, enabled) => {
+    return applyWindowBackgroundBlur(enabled);
+  });
+
   ipcMain.handle("netcatty:setAppIconVariant", (_event, variant) => {
     const { app, BrowserWindow, nativeImage } = require("electron");
     const appIconManager = require("./appIconManager.cjs");
-    return appIconManager.applyAppIconVariant(variant, {
+    const applied = appIconManager.applyAppIconVariant(variant, {
       app,
       BrowserWindow,
       nativeImage,
       appPath: app.getAppPath(),
       isMac: process.platform === "darwin",
     });
+    if (applied && process.platform === "win32") {
+      try {
+        getGlobalShortcutBridge().updateTrayIcon?.();
+      } catch {
+        // The tray is optional; the taskbar icon still updated.
+      }
+    }
+    return applied;
   });
 
   ipcMain.handle("netcatty:setLanguage", (_event, language) => {
@@ -1308,11 +1440,25 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     // Notify all windows except the sender
     // Check both isDestroyed() and webContents.isDestroyed() to handle HMR refresh
     try {
-      forEachMainWindow((win) => {
-        if (!win.webContents.isDestroyed() && win.webContents.id !== senderId) {
-          win.webContents.send("netcatty:settings:changed", payload);
+      const sharedWindowSetting = [
+        "netcatty_window_opacity_v1",
+        "netcatty_window_background_blur_v1",
+        "netcatty_hotkey_scheme_v1",
+        "netcatty_custom_key_bindings_v1",
+        "netcatty_hotkey_recording_v1",
+      ].includes(payload?.key);
+      const windows = sharedWindowSetting
+        ? getAppContentWindowList()
+        : getMainWindowList();
+      for (const win of windows) {
+        try {
+          if (!win.webContents.isDestroyed() && win.webContents.id !== senderId) {
+            win.webContents.send("netcatty:settings:changed", payload);
+          }
+        } catch {
+          // A closing/reloading recipient must not block the remaining windows.
         }
-      });
+      }
       if (settingsWindow && !settingsWindow.isDestroyed() && !settingsWindow.webContents.isDestroyed() && settingsWindow.webContents.id !== senderId) {
         settingsWindow.webContents.send("netcatty:settings:changed", payload);
       }
@@ -1325,6 +1471,9 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   ipcMain.on("netcatty:renderer:ready", (event) => {
     const wcId = event?.sender?.id;
     if (!wcId) return;
+    if (perfTrace.isEnabled()) {
+      perfTrace.noteRendererReady({ app: require("electron").app, webContents: event.sender });
+    }
     resolveRendererReady(wcId);
   });
 }
@@ -1552,6 +1701,15 @@ module.exports = {
   openTerminalPopupWindow,
   closeTerminalPopupWindow,
   getTerminalPopupWindows,
+  openEditorWindow,
+  focusEditorTab,
+  closeEditorWindowTabs,
+  saveEditorWindowTab,
+  dockEditorTab,
+  reportEditorDirty,
+  reportEditorTabsClosed,
+  remapEditorSession,
+  getEditorWindow,
   prewarmSettingsWindow,
   buildAppMenu,
   getCurrentLanguage,
@@ -1559,6 +1717,7 @@ module.exports = {
   getMainWindow,
   getMainWindows: getMainWindowList,
   getAppContentWindows: getAppContentWindowList,
+  getManagedAppWindows: getManagedAppWindowList,
   getDirtyEditorWindows: getDirtyEditorWindowList,
   getMainWindowCount,
   isMainWindow,
@@ -1590,4 +1749,5 @@ module.exports = {
   clampWindowOpacity,
   applyWindowOpacity,
   applyWindowOpacityToWindow,
+  applyTrayPanelBackgroundBlur,
 };

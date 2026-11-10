@@ -23,9 +23,11 @@ import {
 import { useScriptExecution } from '../../application/state/useScriptExecution';
 import { useRemoteHistoryState } from '../../application/state/useRemoteHistoryState';
 import { resolveSystemSidebarSession } from '../../domain/systemManager/resolveSystemSession';
+import { collectSessionIds } from '../../domain/workspace';
 import { shouldKeepTerminalBackgroundWorkActive } from '../../domain/terminalHibernate';
 import { resolveTerminalFontFamilyId } from '../../infrastructure/config/fonts';
 import type { Host, TerminalSession, Workspace } from '../../types';
+import { HostBrowserSidePanel } from '../HostBrowserSidePanel';
 import { SystemManagerSidePanel } from '../systemManager/SystemManagerSidePanel';
 import { resolveSftpFollowTerminalCwdTargetHost } from '../../domain/sftpFollowTerminalCwd';
 import { AI_PANEL_FORCE_HIDE_SHELL } from '../ai/aiPanelDiagnostics';
@@ -45,9 +47,7 @@ const navigatorPlatform = typeof navigator !== 'undefined' ? navigator.platform 
 const EMPTY_VAULT_NOTES: never[] = [];
 const EMPTY_VAULT_HOSTS: never[] = [];
 const EMPTY_VAULT_SNIPPETS: never[] = [];
-const EMPTY_SHELL_HISTORY = Object.freeze([]) as readonly never[];
 const subscribeShellHistoryNoop = () => () => {};
-const getEmptyShellHistorySnapshot = () => EMPTY_SHELL_HISTORY;
 
 function useSidePanelLiveSnapshotForTab(tabId: string, subscribe: boolean) {
   const retainedSnapshot = useRef({ tabId, snapshot: SIDE_PANEL_INACTIVE_LIVE_SNAPSHOT });
@@ -196,6 +196,7 @@ function SidePanelSftpSlotInner({
     <div className={sidePanelHiddenPanelClassName(!isVisible)}>
       <SftpSidePanel
         transferOwnerId={`terminal:${tabId}`}
+        ownerTabId={tabId}
         hosts={effectiveHosts}
         writableHosts={hosts}
         sessions={sessions}
@@ -241,6 +242,57 @@ function SidePanelSftpSlotInner({
 
 export const SidePanelSftpSlot = memo(SidePanelSftpSlotInner);
 SidePanelSftpSlot.displayName = 'SidePanelSftpSlot';
+
+function SidePanelBrowserSlot({ tabId, ctx, isVisible }: {
+  tabId: string;
+  ctx: SidePanelStableContext;
+  isVisible: boolean;
+}) {
+  const live = useSidePanelLiveSnapshotForTab(tabId, isVisible);
+  const sessions = ctx.sessions as TerminalSession[];
+  const workspace = (ctx.workspaceById as Map<string, Workspace>).get(tabId);
+  const current = (isVisible ? live.activeTerminalSessionForSystem : null)
+    ?? resolveSystemSidebarSession(sessions, workspace, workspace?.focusedSessionId,
+      sessions.find((session) => session.id === tabId));
+  const retainedSessionIds = useRef(new Set<string>());
+  if (isVisible && current) retainedSessionIds.current.add(current.id);
+  const workspaceSessionIds = workspace ? new Set(collectSessionIds(workspace.root)) : null;
+  for (const id of retainedSessionIds.current) {
+    if (!sessions.some((session) => session.id === id && (workspaceSessionIds
+      ? workspaceSessionIds.has(id) : session.id === tabId && !session.workspaceId))) retainedSessionIds.current.delete(id);
+  }
+  const sessionHosts = ctx.sessionHostsMap as Map<string, Host>;
+  const authHosts = ctx.sftpAuthHostBySessionId as Map<string, Host>;
+  const currentHost = current ? authHosts.get(current.id) ?? sessionHosts.get(current.id) : null;
+  const supportsBrowser = currentHost && ['ssh', 'mosh', 'local'].includes(currentHost.protocol ?? 'ssh');
+  return (
+    <div className={sidePanelHiddenPanelClassName(!isVisible)} data-section="terminal-browser-panel">
+      {workspace && supportsBrowser && <div className="h-8 shrink-0 border-b border-border/50 px-3 flex items-center text-xs text-muted-foreground truncate">
+        {currentHost.label || currentHost.hostname}
+      </div>}
+      <div className={workspace && supportsBrowser ? 'relative h-[calc(100%-2rem)] min-h-0 overflow-hidden' : 'relative h-full min-h-0 overflow-hidden'}>
+        {!supportsBrowser && <p className="p-4 text-sm text-muted-foreground">{ctx.t('terminal.browser.sshOnly')}</p>}
+        {[...retainedSessionIds.current].map((sessionId) => {
+          const host = authHosts.get(sessionId) ?? sessionHosts.get(sessionId);
+          if (!host || !['ssh', 'mosh', 'local'].includes(host.protocol ?? 'ssh')) return null;
+          const visible = isVisible && current?.id === sessionId;
+          return <div key={sessionId} className={visible ? 'absolute inset-0 overflow-hidden' : 'hidden'}>
+            <HostBrowserSidePanel
+              browserId={`${tabId}:${sessionId}`}
+              host={host}
+              hosts={ctx.effectiveHosts}
+              keys={ctx.keys}
+              identities={ctx.identities}
+              knownHosts={ctx.knownHosts}
+              terminalSettings={ctx.terminalSettings}
+              isVisible={visible}
+            />
+          </div>;
+        })}
+      </div>
+    </div>
+  );
+}
 
 function SidePanelSystemSlotInner({
   tabId,
@@ -479,36 +531,48 @@ function SidePanelHistorySlotInner({
 }) {
   const live = useSidePanelLiveSnapshotForTab(activeTabId ?? '', isVisible);
   // Own remote-history state here so fetch/loading does not re-render TerminalLayer.
+  // One instance for the life of the slot; HistorySidePanel fetches only when
+  // visible and the host cache is still empty.
   const remoteHistory = useRemoteHistoryState();
-  // Gate store subscription while History is hidden so command appends do not
-  // re-render this retained mount (panel still mounts for fast reopen).
+  // Subscribe only while visible so command appends do not re-render the parked
+  // list. Keep reading the live snapshot (same idea as notes) so the hide
+  // render does not swap in an empty list and unmount rows.
   const shellHistory = useSyncExternalStore(
     isVisible ? subscribeShellHistory : subscribeShellHistoryNoop,
-    isVisible ? getShellHistorySnapshot : getEmptyShellHistorySnapshot,
-    isVisible ? getShellHistorySnapshot : getEmptyShellHistorySnapshot,
+    getShellHistorySnapshot,
+    getShellHistorySnapshot,
   );
+  // While hidden the live-store read is the inactive snapshot. Keep the last
+  // real host/session so search, scroll, and the remote-history cache lookup
+  // survive parking. Never retain the inactive sentinel itself: a visible
+  // panel must show `live` (possibly empty) rather than the previous tab.
+  const retainedLiveRef = useRef(live);
+  if (isVisible && live !== SIDE_PANEL_INACTIVE_LIVE_SNAPSHOT) {
+    retainedLiveRef.current = live;
+  }
+  const panelLive = isVisible ? live : retainedLiveRef.current;
 
   const {
     HistorySidePanel,
     handleHistoryPaste,
     handleHistoryDelete,
+    handleHistoryClear,
     handleHistoryRun,
   } = ctx;
 
-  if (!isVisible) return null;
-
   return (
-    <div className="absolute inset-0 z-10">
+    <div className={sidePanelHiddenPanelClassName(!isVisible)}>
       <HistorySidePanel
-        focusedHost={live.focusedHost}
-        focusedSessionId={live.historySessionId}
-        state={remoteHistory.getState(live.focusedHost?.id, live.historySessionId)}
+        focusedHost={panelLive.focusedHost}
+        focusedSessionId={panelLive.historySessionId}
+        state={remoteHistory.getState(panelLive.focusedHost?.id, panelLive.historySessionId)}
         globalEntries={shellHistory as import('../../domain/models').ShellHistoryEntry[]}
         onFetch={remoteHistory.fetch}
         onDeleteGlobalEntry={handleHistoryDelete}
+        onClearGlobalHistory={handleHistoryClear}
         onPasteToTerminal={handleHistoryPaste}
         onRunInTerminal={handleHistoryRun}
-        isVisible
+        isVisible={isVisible}
       />
     </div>
   );
@@ -540,6 +604,7 @@ function SidePanelAiSlotInner({
     onOpenVaultHostFromChat,
     onOpenVaultSectionFromChat,
     onOpenVaultSnippetFromChat,
+    onSetWorkspaceAnchorChat,
     validAIScopeTargetIds,
   } = ctx;
   const workspaces = ctx.workspaces as Workspace[];
@@ -590,6 +655,7 @@ function SidePanelAiSlotInner({
         mountedTabIds={mountedAiTabIds}
         activeTabId={activeTabId}
         activeSidePanelTab={isVisible ? 'ai' : null}
+        liveScopeTargetIds={validAIScopeTargetIds}
         contextsByTabId={aiContextsByTabId}
         resolveExecutorContext={resolveAIExecutorContext}
         pendingTerminalSelection={pendingTerminalSelectionForAI}
@@ -601,6 +667,8 @@ function SidePanelAiSlotInner({
         onOpenVaultHostFromChat={onOpenVaultHostFromChat}
         onOpenVaultSectionFromChat={onOpenVaultSectionFromChat}
         onOpenVaultSnippetFromChat={onOpenVaultSnippetFromChat}
+        onSetWorkspaceAnchorChat={onSetWorkspaceAnchorChat as ((workspaceId: string, chatId: string | null) => void) | undefined}
+        workspaces={workspaces}
       />
     </AISidePanelStateRoot>
   );
@@ -629,7 +697,7 @@ export function movePersistentPortalNode(
   }
 }
 
-function PersistentSidePanelPortal({
+export function PersistentSidePanelPortal({
   portalKey,
   target,
   children,
@@ -687,6 +755,7 @@ export function SidePanelMountedContent({
 }) {
   const {
     mountedSftpTabIds,
+    browserMountedTabIds = [],
     systemMountedTabIds,
     scriptsMountedTabIds,
     themeMountedTabIds,
@@ -720,6 +789,11 @@ export function SidePanelMountedContent({
 
   return (
     <>
+      {browserMountedTabIds.map((tabId: string) => (
+        <PersistentSidePanelPortal key={`browser-${tabId}`} portalKey={`browser-${tabId}`} target={portalTarget(tabId, 'browser')}>
+          <SidePanelBrowserSlot tabId={tabId} ctx={ctx} isVisible={isToolVisible(tabId, 'browser')} />
+        </PersistentSidePanelPortal>
+      ))}
       {mountedSftpTabIds.map((tabId: string) => (
         <PersistentSidePanelPortal
           key={`sftp-${tabId}`}

@@ -65,6 +65,38 @@ const warnOnOutdatedOptimizeDep = (): Plugin => ({
   },
 });
 
+const VENDOR_CHUNK_PACKAGES: Array<[chunk: string, packages: string[]]> = [
+  ['vendor-radix', ['@radix-ui/']],
+  ['vendor-xterm', ['@xterm/']],
+  ['vendor-ai', ['ai', '@ai-sdk/', 'zod']],
+];
+
+/** Group node_modules packages into the vendor chunks; leave everything else to Rollup. */
+function resolveVendorChunk(id: string): string | undefined {
+  // Rollup also moves unassigned dependencies of manual-chunk modules into
+  // that chunk. Vite's dynamic-import preload helper is needed by the startup
+  // entry, so give it its own tiny chunk instead of letting it ride along
+  // with the (lazily used) AI SDK.
+  if (id.includes('vite/preload-helper')) return 'preload-helper';
+  const marker = '/node_modules/';
+  const index = id.lastIndexOf(marker);
+  if (index < 0) return undefined;
+  const packagePath = id.slice(index + marker.length);
+  // @xterm/addon-image must stay in its own lazily imported chunk: it builds a
+  // WebAssembly SIXEL decoder while the module is evaluated, and runtimes
+  // without WebAssembly (HarmonyOS ArkWeb) must never evaluate it at startup.
+  if (packagePath === '@xterm/addon-image' || packagePath.startsWith('@xterm/addon-image/')) {
+    return 'addon-image';
+  }
+  for (const [chunk, packages] of VENDOR_CHUNK_PACKAGES) {
+    const matches = packages.some((name) => (name.endsWith('/')
+      ? packagePath.startsWith(name)
+      : packagePath === name || packagePath.startsWith(`${name}/`)));
+    if (matches) return chunk;
+  }
+  return undefined;
+}
+
 export default defineConfig(() => {
     return {
       base: "./",
@@ -83,49 +115,37 @@ export default defineConfig(() => {
         },
       },
       build: {
+        // The shared runtime is also required by Electron; convert it for browser builds.
+        commonjsOptions: {
+          include: [/node_modules/, /domain\/systemManager\/containerRuntime\.shared\.cjs$/, /domain\/plugin(?:RuntimePolicy|PermissionDescriptions|ThemePack|RemoteTreePolicy|ViewStylePolicy|GitHubRepository)\.cjs$/],
+        },
         chunkSizeWarningLimit: 3000,
         target: 'esnext', // Required for top-level await in WASM modules
         sourcemap: false, // Disable source maps to avoid missing map file warnings
         // Optimize chunk splitting for faster initial load
         rollupOptions: {
           output: {
-            manualChunks: {
-              // Vendor chunks - rarely change, can be cached aggressively
-              'vendor-radix': [
-                '@radix-ui/react-collapsible',
-                '@radix-ui/react-context-menu',
-                '@radix-ui/react-dialog',
-                '@radix-ui/react-popover',
-                '@radix-ui/react-scroll-area',
-                '@radix-ui/react-select',
-                '@radix-ui/react-tabs',
-              ],
-              'vendor-xterm': [
-                '@xterm/xterm',
-                '@xterm/addon-fit',
-                // @xterm/addon-image must NOT be pinned to this eagerly loaded chunk:
-                // the package instantiates a WebAssembly SIXEL decoder while it is
-                // evaluated, so it stays a dynamically imported chunk that runtimes
-                // without WebAssembly (HarmonyOS ArkWeb) never load.
-                '@xterm/addon-search',
-                '@xterm/addon-serialize',
-                '@xterm/addon-web-links',
-                '@xterm/addon-webgl',
-              ],
-              'vendor-ai': [
-                'ai',
-                '@ai-sdk/openai',
-                '@ai-sdk/anthropic',
-                '@ai-sdk/google',
-                'zod',
-              ],
-            },
+            // Vendor chunks - rarely change, can be cached aggressively.
+            // Function form on purpose: the object form also moves every
+            // dependency of the listed packages into the chunk, including
+            // Vite's shared preload helper (the AI SDK uses import()). The
+            // startup entry then imported that helper from vendor-ai and the
+            // whole AI SDK chunk was preloaded and evaluated on every launch.
+            manualChunks: resolveVendorChunk,
           },
         },
       },
       plugins: [suppressMonacoSourcemapWarning(), devContentSecurityPolicyPlugin(), warnOnOutdatedOptimizeDep(), tailwindcss(), react()],
       optimizeDeps: {
         include: [
+          // Keep the renderer alias pre-bundled so dev serves ESM instead of raw CommonJS.
+          '@/domain/systemManager/containerRuntime.shared.cjs',
+          '@/domain/pluginRuntimePolicy.cjs',
+          '@/domain/pluginGitHubRepository.cjs',
+          '@/domain/pluginPermissionDescriptions.cjs',
+          '@/domain/pluginThemePack.cjs',
+          '@/domain/pluginRemoteTreePolicy.cjs',
+          '@/domain/pluginViewStylePolicy.cjs',
           'ai',
           '@ai-sdk/openai',
           '@ai-sdk/anthropic',
@@ -139,6 +159,10 @@ export default defineConfig(() => {
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),
+          // The ligatures addon pulls lru-cache's node:diagnostics_channel import
+          // into the renderer bundle. Stub it; the cache never publishes metrics.
+          'node:diagnostics_channel': path.resolve(__dirname, 'infrastructure/shims/nodeDiagnosticsChannel.ts'),
+          'diagnostics_channel': path.resolve(__dirname, 'infrastructure/shims/nodeDiagnosticsChannel.ts'),
         }
       }
     };

@@ -78,7 +78,7 @@ test('prepareTurnContext applies typed compression before LLM summarize threshol
   assert.ok(prepared.messages.length >= messages.length);
   const serialized = JSON.stringify(prepared.messages);
   assert.match(serialized, /Fix only the upstream timeout issue/);
-  assert.match(serialized, /Permission mode: confirm/);
+  assert.doesNotMatch(serialized, /Netcatty session context/);
   assert.ok(serialized.length < JSON.stringify(messages).length);
 });
 
@@ -163,7 +163,7 @@ test('TraceStore bounds compaction history independently from events', () => {
   assert.equal(store.getCompactions('chat-bounded-compactions').length, 3);
 });
 
-test('prepareStepContext replaces prior step handle notices under v7 carry-forward semantics', async () => {
+test('prepareStepContext preserves prior notices and appends only newly available handles', async () => {
   const store = new ToolOutputStore();
   store.store({
     chatSessionId: 'chat-4',
@@ -194,9 +194,22 @@ test('prepareStepContext replaces prior step handle notices under v7 carry-forwa
       && typeof message.content === 'string'
       && message.content.includes('Tool output handles available'),
   );
-  assert.equal(notices.length, 1);
-  assert.match(String(notices[0]?.content), /\[step 2\]/);
-  assert.doesNotMatch(String(notices[0]?.content), /tool-output-old/);
+  assert.equal(notices.length, 2);
+  assert.deepEqual(prepared.messages.slice(0, 2), [priorNotice, { role: 'user', content: 'continue' }]);
+  assert.equal(notices[0], priorNotice);
+  assert.match(String(notices[1]?.content), /^\[Tool output handles available:/);
+  assert.doesNotMatch(String(notices[1]?.content), /tool-output-old|\[step/);
+  assert.equal(prepared.messages.at(-1), notices[1]);
+
+  const next = await prepareStepContext({
+    messages: prepared.messages,
+    stepNumber: 3,
+    sessionId: 'chat-4',
+    chatSessionId: 'chat-4',
+    toolOutputStore: store,
+    runtimeContext,
+  });
+  assert.deepEqual(next.messages, prepared.messages, 'unchanged handles need no per-step rewrite');
 });
 
 test('prepareStepContext emits step compaction trace when over budget', async () => {
@@ -266,7 +279,8 @@ test('prepareStepContext retains handle notice after step budget guard', async (
       && message.content.includes('Tool output handles available'),
   );
   assert.equal(notices.length, 1);
-  assert.match(String(notices[0]?.content), /\[step 2\]/);
+  assert.match(String(notices[0]?.content), /^\[Tool output handles available:/);
+  assert.equal(prepared.messages.at(-1), notices[0]);
 });
 
 test('prepareStepContext never leaves orphan results from a parallel tool batch', async () => {
@@ -348,4 +362,57 @@ test('prepareTurnContext calls summarize when over dynamic threshold', async () 
   assert.equal(summarizeCalls, 1);
   assert.equal(prepared.trace?.didLlmSummarize, true);
   assert.match(JSON.stringify(prepared.messages), /summary of earlier work/);
+});
+
+test('normal turn and step preparation keep user attachment parts', async () => {
+  const messages: ModelMessage[] = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what does this image say?' },
+        { type: 'file', data: 'QUJD'.repeat(750), mediaType: 'image/png' },
+      ],
+    },
+  ];
+
+  const turn = await prepareTurnContext({
+    messages,
+    backend: 'catty',
+    contextWindow: 1_300_000,
+    trigger: 'pre-turn',
+  });
+  const step = await prepareStepContext({
+    messages: turn.messages,
+    contextWindow: 1_300_000,
+    stepNumber: 0,
+  });
+
+  for (const prepared of [turn, step]) {
+    const content = prepared.messages.find(message => message.role === 'user')?.content;
+    assert.ok(Array.isArray(content));
+    assert.equal(content.some(part => (part as { type?: string }).type === 'file'), true);
+    assert.doesNotMatch(JSON.stringify(prepared.messages), /attachment omitted to keep the AI request small/);
+  }
+});
+
+test('413 retry still trades attachments for a text placeholder', async () => {
+  const messages: ModelMessage[] = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what does this image say?' },
+        { type: 'file', data: 'QUJD'.repeat(750), mediaType: 'image/png' },
+      ],
+    },
+  ];
+
+  const prepared = await prepareTurnContext({
+    messages,
+    backend: 'catty',
+    contextWindow: 1_300_000,
+    trigger: '413-retry',
+    compressForRequestTooLargeRetry: true,
+  });
+
+  assert.match(JSON.stringify(prepared.messages), /attachment omitted to keep the AI request small/);
 });

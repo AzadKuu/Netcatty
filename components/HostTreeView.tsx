@@ -1,3 +1,4 @@
+import { compareHostAddresses } from "../domain/hostAddressSort";
 import { CheckSquare, Edit2, FileSymlink, Server, Square, Expand, Minimize2 } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -15,6 +16,8 @@ import {
   type HostClickBehavior,
 } from '../domain/hostClickBehavior';
 import { sortByVaultOrder } from '../domain/vaultOrder';
+import { getVaultHostRowSubtitle } from '../domain/localShellHost';
+import { isVaultHostDraggable } from '../domain/vaultHostDrag';
 import { STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED } from '../infrastructure/config/storageKeys';
 import { GroupConfig, GroupNode, Host } from '../types';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
@@ -23,6 +26,8 @@ import { ContextMenu, ContextMenuTrigger } from './ui/context-menu';
 import { DistroAvatar } from './DistroAvatar';
 import { HostNotesIndicator } from './host/HostNotesIndicator';
 import { Button } from './ui/button';
+import { handleVaultHostDropToGroup } from './vault/vaultReorderDrag';
+import { beginVaultHostCardDrag } from './vault/vaultHostDragImage';
 import { VaultTreeGroupRow, VaultTreeItemRow } from './vault/VaultTreeRow';
 
 const getTreeGroupDropIntent = (
@@ -39,7 +44,7 @@ const getTreeGroupDropIntent = (
 const hasDragType = (dataTransfer: DataTransfer, type: string) =>
   Array.from(dataTransfer.types).includes(type);
 
-type HostTreeSortMode = 'manual' | 'az' | 'za' | 'newest' | 'oldest' | 'group';
+type HostTreeSortMode = 'manual' | 'az' | 'za' | 'newest' | 'oldest' | 'group' | 'ip';
 
 export type VisibleHostTreeItem =
   | {
@@ -59,22 +64,25 @@ export type VisibleHostTreeItem =
     setSize: number;
   };
 
-const sortHostTreeGroups = (
-  nodes: GroupNode[],
-  sortMode: HostTreeSortMode,
-  groupConfigs: GroupConfig[],
-): GroupNode[] => {
-  const originalIndex = new Map(nodes.map((node, index) => [node.path, index]));
-  const orderByPath = new Map(
+const buildHostTreeGroupOrder = (groupConfigs: GroupConfig[]): Map<string, number> => (
+  new Map(
     groupConfigs
       .filter((config) => typeof config.order === 'number' && Number.isFinite(config.order))
       .map((config) => [config.path, config.order as number]),
-  );
+  )
+);
+
+const sortHostTreeGroups = (
+  nodes: GroupNode[],
+  sortMode: HostTreeSortMode,
+  orderByPath?: ReadonlyMap<string, number>,
+): GroupNode[] => {
+  const originalIndex = new Map(nodes.map((node, index) => [node.path, index]));
   return [...nodes].sort((a, b) => {
     if (sortMode === 'za') return b.name.localeCompare(a.name);
     if (sortMode === 'manual') {
-      const orderA = orderByPath.get(a.path);
-      const orderB = orderByPath.get(b.path);
+      const orderA = orderByPath?.get(a.path);
+      const orderB = orderByPath?.get(b.path);
       if (orderA !== undefined && orderB !== undefined && orderA !== orderB) return orderA - orderB;
       if (orderA !== undefined) return -1;
       if (orderB !== undefined) return 1;
@@ -90,6 +98,7 @@ const sortHostTreeHosts = (hosts: Host[], sortMode: HostTreeSortMode): Host[] =>
     if (sortMode === 'newest') return (b.createdAt || 0) - (a.createdAt || 0);
     if (sortMode === 'oldest') return (a.createdAt || 0) - (b.createdAt || 0);
     if (sortMode === 'manual') return 0;
+    if (sortMode === 'ip') return compareHostAddresses(a.hostname, b.hostname) || a.label.localeCompare(b.label);
     return a.label.localeCompare(b.label);
   });
   return sortMode === 'manual' ? sortByVaultOrder(sorted) : sorted;
@@ -109,8 +118,9 @@ export function buildVisibleHostTreeItems({
   groupConfigs: GroupConfig[];
 }): VisibleHostTreeItem[] {
   const items: VisibleHostTreeItem[] = [];
+  const orderByPath = sortMode === 'manual' ? buildHostTreeGroupOrder(groupConfigs) : undefined;
   const visitGroups = (nodes: GroupNode[], depth: number) => {
-    const sortedGroups = sortHostTreeGroups(nodes, sortMode, groupConfigs);
+    const sortedGroups = sortHostTreeGroups(nodes, sortMode, orderByPath);
     // Root-level ungrouped hosts are siblings of top-level groups.
     const rootUngrouped = depth === 0 ? sortHostTreeHosts(ungroupedHosts, sortMode) : [];
     const siblingSetSize = sortedGroups.length + rootUngrouped.length;
@@ -127,7 +137,7 @@ export function buildVisibleHostTreeItems({
       const childGroups = sortHostTreeGroups(
         Object.values(node.children ?? {}) as GroupNode[],
         sortMode,
-        groupConfigs,
+        orderByPath,
       );
       const childHosts = sortHostTreeHosts(node.hosts, sortMode);
       const childSetSize = childGroups.length + childHosts.length;
@@ -176,7 +186,7 @@ export function buildVisibleHostTreeItems({
       const childGroups = sortHostTreeGroups(
         Object.values(node.children ?? {}) as GroupNode[],
         sortMode,
-        groupConfigs,
+        orderByPath,
       );
       const childHosts = sortHostTreeHosts(node.hosts, sortMode);
       const childSetSize = childGroups.length + childHosts.length;
@@ -279,6 +289,7 @@ interface HostTreeViewProps {
   onExpandAll?: (paths: string[]) => void;
   onCollapseAll?: () => void;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -289,6 +300,7 @@ interface HostTreeViewProps {
   onEditGroup: (groupPath: string) => void;
   onDeleteGroup: (groupPath: string) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
+  moveHostsToGroup?: (hostIds: ReadonlySet<string>, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetParent: string | null) => void;
   commitInlineGroupRename?: (name: string) => boolean | void | Promise<boolean | void>;
   cancelInlineGroupEdit?: () => void;
@@ -319,6 +331,7 @@ interface TreeNodeProps {
   expandedPaths: Set<string>;
   onToggle: (path: string) => void;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -329,6 +342,7 @@ interface TreeNodeProps {
   onEditGroup: (groupPath: string) => void;
   onDeleteGroup: (groupPath: string) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
+  moveHostsToGroup?: (hostIds: ReadonlySet<string>, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetParent: string | null) => void;
   commitInlineGroupRename?: (name: string) => boolean | void | Promise<boolean | void>;
   cancelInlineGroupEdit?: () => void;
@@ -365,6 +379,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   expandedPaths,
   onToggle,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -375,6 +390,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   onEditGroup,
   onDeleteGroup,
   moveHostToGroup,
+  moveHostsToGroup,
   moveGroup,
   managedGroupPaths,
   onUnmanageGroup,
@@ -427,7 +443,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   const childNodes = useMemo(() => sortHostTreeGroups(
     Object.values(node.children ?? {}) as GroupNode[],
     sortMode,
-    groupConfigs,
+    sortMode === 'manual' ? buildHostTreeGroupOrder(groupConfigs) : undefined,
   ), [groupConfigs, node.children, sortMode]);
   const sortedHosts = useMemo(
     () => sortHostTreeHosts(node.hosts, sortMode),
@@ -520,9 +536,14 @@ const TreeNode: React.FC<TreeNodeProps> = ({
                   e.preventDefault();
                   e.stopPropagation();
                   setDragOverDropTarget?.(null);
-                  const hostId = e.dataTransfer.getData("host-id");
+                  if (handleVaultHostDropToGroup({
+                    dataTransfer: e.dataTransfer,
+                    groupPath: node.path,
+                    moveHostToGroup,
+                    moveHostsToGroup,
+                    resetHostDragState: () => {},
+                  })) return;
                   const groupPath = e.dataTransfer.getData("group-path");
-                  if (hostId) moveHostToGroup(hostId, node.path);
                   if (groupPath && getTreeGroupDropIntent(e.currentTarget, e.clientY) === "inside") {
                     moveGroup(groupPath, node.path);
                   }
@@ -538,19 +559,24 @@ const TreeNode: React.FC<TreeNodeProps> = ({
                     ? <CheckSquare size={16} />
                     : <Square size={16} />
                   : undefined}
-                labelActions={!isMultiSelectMode && (
-                  <button
-                    aria-label={`Edit ${node.name}`}
-                    tabIndex={-1}
-                    data-host-tree-group-edit-button={node.path}
-                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-0 transition-colors hover:bg-secondary/80 group-hover:opacity-100"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onEditGroup(node.path);
-                    }}
-                  >
-                    <Edit2 size={12} />
-                  </button>
+                labelActions={(
+                  <span className="inline-flex items-center gap-1">
+                    <HostNotesIndicator notes={groupConfigs.find((config) => config.path === node.path)?.notes} label="Group notes" />
+                    {!isMultiSelectMode && (
+                      <button
+                        aria-label={`Edit ${node.name}`}
+                        tabIndex={-1}
+                        data-host-tree-group-edit-button={node.path}
+                        className="flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-0 transition-colors hover:bg-secondary/80 group-hover:opacity-100"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onEditGroup(node.path);
+                        }}
+                      >
+                        <Edit2 size={12} />
+                      </button>
+                    )}
+                  </span>
                 )}
               />
             </CollapsibleTrigger>
@@ -576,6 +602,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               expandedPaths={expandedPaths}
               onToggle={onToggle}
               onConnect={onConnect}
+              onOpenBrowser={onOpenBrowser}
               onEditHost={onEditHost}
               onDuplicateHost={onDuplicateHost}
               onDeleteHost={onDeleteHost}
@@ -586,6 +613,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               onEditGroup={onEditGroup}
               onDeleteGroup={onDeleteGroup}
               moveHostToGroup={moveHostToGroup}
+              moveHostsToGroup={moveHostsToGroup}
               moveGroup={moveGroup}
               managedGroupPaths={managedGroupPaths}
               onUnmanageGroup={onUnmanageGroup}
@@ -619,6 +647,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               host={host}
               depth={depth + 1}
               onConnect={onConnect}
+              onOpenBrowser={onOpenBrowser}
               onEditHost={onEditHost}
               onDuplicateHost={onDuplicateHost}
               onDeleteHost={onDeleteHost}
@@ -652,6 +681,7 @@ interface HostTreeItemProps {
   host: Host;
   depth: number;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -698,6 +728,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
   host,
   depth,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -719,6 +750,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
   initialTreeItemKey,
   onActiveTreeItemChange,
 }) => {
+  const { t } = useI18n();
   const safeHost = sanitizeHost(host);
   const tags = host.tags || [];
   const displayDetails = useMemo(
@@ -758,11 +790,16 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
             ? 0
             : -1}
           onFocus={() => onActiveTreeItemChange(`host:${host.id}`)}
-          draggable={!isMultiSelectMode}
+          draggable={isVaultHostDraggable(Boolean(isMultiSelectMode), selectedHostIds, host.id)}
           onDragStart={(e) => {
-            // copyMove: vault reorder uses move; focus-sidebar append uses copy.
-            e.dataTransfer.effectAllowed = "copyMove";
-            e.dataTransfer.setData("host-id", host.id);
+            const ids = beginVaultHostCardDrag({
+              dataTransfer: e.dataTransfer,
+              hostId: host.id,
+              isMultiSelectMode: Boolean(isMultiSelectMode),
+              selectedHostIds,
+              countLabel: (count) => t("vault.hosts.dragSelectionCount", { count }),
+            });
+            if (!ids) e.preventDefault();
           }}
           onClick={() => {
             const action = resolveHostActivateAction({
@@ -836,7 +873,9 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
                 <HostNotesIndicator notes={host.notes} />
               </div>
               <div className="truncate text-[11px] leading-4 text-muted-foreground">
-                {displayUsername}@{host.hostname}:{displayPort}
+                {displayProtocol === 'local'
+                  ? getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })
+                  : `${displayUsername}@${host.hostname}:${displayPort}`}
               </div>
             </div>
           )}
@@ -860,6 +899,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
       <HostTreeHostContextMenuContent
         host={host}
         onConnect={onConnect}
+        onOpenBrowser={onOpenBrowser}
         onEditHost={onEditHost}
         onDuplicateHost={onDuplicateHost}
         onCopyHostname={onCopyHostname}
@@ -879,6 +919,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
   onExpandAll: externalOnExpandAll,
   onCollapseAll: externalOnCollapseAll,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -889,6 +930,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
   onEditGroup,
   onDeleteGroup,
   moveHostToGroup,
+  moveHostsToGroup,
   moveGroup,
   managedGroupPaths,
   onUnmanageGroup,
@@ -1188,6 +1230,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
                 expandedPaths={expandedPaths}
                 onToggle={togglePath}
                 onConnect={onConnect}
+                onOpenBrowser={onOpenBrowser}
                 onEditHost={onEditHost}
                 onDuplicateHost={onDuplicateHost}
                 onDeleteHost={onDeleteHost}
@@ -1198,6 +1241,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
                 onEditGroup={onEditGroup}
                 onDeleteGroup={onDeleteGroup}
                 moveHostToGroup={moveHostToGroup}
+                moveHostsToGroup={moveHostsToGroup}
                 moveGroup={moveGroup}
                 managedGroupPaths={managedGroupPaths}
                 onUnmanageGroup={onUnmanageGroup}
@@ -1229,6 +1273,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
                 host={item.host}
                 depth={item.depth}
                 onConnect={onConnect}
+                onOpenBrowser={onOpenBrowser}
                 onEditHost={onEditHost}
                 onDuplicateHost={onDuplicateHost}
                 onDeleteHost={onDeleteHost}
@@ -1278,6 +1323,7 @@ function hostTreeViewAreEqual(prev: HostTreeViewProps, next: HostTreeViewProps):
     && prev.onExpandAll === next.onExpandAll
     && prev.onCollapseAll === next.onCollapseAll
     && prev.onConnect === next.onConnect
+    && prev.onOpenBrowser === next.onOpenBrowser
     && prev.onEditHost === next.onEditHost
     && prev.onDuplicateHost === next.onDuplicateHost
     && prev.onDeleteHost === next.onDeleteHost
@@ -1288,6 +1334,7 @@ function hostTreeViewAreEqual(prev: HostTreeViewProps, next: HostTreeViewProps):
     && prev.onEditGroup === next.onEditGroup
     && prev.onDeleteGroup === next.onDeleteGroup
     && prev.moveHostToGroup === next.moveHostToGroup
+    && prev.moveHostsToGroup === next.moveHostsToGroup
     && prev.moveGroup === next.moveGroup
     && prev.commitInlineGroupRename === next.commitInlineGroupRename
     && prev.cancelInlineGroupEdit === next.cancelInlineGroupEdit

@@ -46,10 +46,12 @@ function loadBridgeWithMocks(options = {}) {
       clearPendingApprovals() {},
       cleanupScopedMetadata: async () => {},
       cleanup() {},
+      ...options.mcpServerBridge,
     },
-    "../cli/discoveryPath.cjs": {
+      "../cli/discoveryPath.cjs": {
       getCliLauncherPath: () => "/tmp/netcatty-tool-cli",
       TOOL_CLI_DISCOVERY_ENV_VAR: "NETCATTY_TOOL_CLI_DISCOVERY_FILE",
+      TOOL_CLI_CHAT_SESSION_ENV_VAR: "NETCATTY_CLI_CHAT_SESSION_ID",
     },
     "./ai/userSkills.cjs": {
       scanUserSkills: async () => ({ readyCount: 0, warningCount: 0, skills: [], warnings: [] }),
@@ -108,6 +110,9 @@ function loadBridgeWithMocks(options = {}) {
     "./ai/codexHelpers.cjs": {
       codexLoginSessions: new Map(),
       appendCodexLoginOutput() {},
+      createCodexLoginOutputDecoder: () => ({ write() {}, end() {} }),
+      clearCodexLoginKillTimer() {},
+      recordCodexLoginSession: (session) => options.recordCodexLoginSession?.(session),
       toCodexLoginSessionResponse: (session) => ({ sessionId: session.id, codexPath: session.codexPath }),
       getActiveCodexLoginSession: () =>
         typeof options.getActiveCodexLoginSession === "function"
@@ -119,7 +124,10 @@ function loadBridgeWithMocks(options = {}) {
           : realNormalizeCodexIntegrationState(...args),
       appendCodexChatGptValidationFailure: (rawOutput, validationError) =>
         `${rawOutput}\n\nChatGPT auth validation failed:\n${validationError}`.trim(),
-      readCodexCustomProviderConfig: () => null,
+      readCodexCustomProviderConfig: (...args) =>
+        typeof options.readCodexCustomProviderConfig === "function"
+          ? options.readCodexCustomProviderConfig(...args)
+          : null,
       getCodexCustomConfigPreflightError: () => null,
       extractCodexError: (err) => ({ message: err?.message || String(err) }),
       isCodexAuthError: (...args) =>
@@ -970,6 +978,84 @@ test("codex login does not reuse an active session from a different resolved pat
   }
 });
 
+for (const homeVariable of ["HOME", "CODEX_HOME"]) {
+  for (const sameHome of [true, false]) {
+    test(`codex login ${sameHome ? "reuses" : "rejects"} an active session with ${sameHome ? "matching" : "changed"} ${homeVariable}`, async () => {
+      const originalHome = path.join(os.tmpdir(), "codex-login-original");
+      const requestedHome = sameHome ? originalHome : path.join(os.tmpdir(), "codex-login-other");
+      const existingSession = {
+        id: "codex_login_existing",
+        state: "running",
+        process: { killed: false },
+        codexPath: "/fixture/codex",
+        credentialHomeKey: homeVariable === "HOME" ? path.join(originalHome, ".codex") : originalHome,
+      };
+      const { bridge, restore } = loadBridgeWithMocks({
+        shellEnv: { HOME: originalHome },
+        resolveCliFromPathAsync: () => existingSession.codexPath,
+        getActiveCodexLoginSession: () => existingSession,
+        prepareCommandForSpawn: () => { throw new Error("An active login must not spawn another process"); },
+      });
+      const ipcMain = createIpcMainStub();
+      bridge.init({ sessions: new Map(), sftpClients: new Map(), electronModule: { app: { getPath: () => process.cwd() } } });
+      bridge.registerHandlers(ipcMain);
+      try {
+        const result = await ipcMain.handlers.get("netcatty:ai:codex:start-login")(
+          { sender: { id: 1 } },
+          { agentEnv: { [homeVariable]: requestedHome } },
+        );
+        assert.equal(result.ok, sameHome, JSON.stringify(result));
+        if (sameHome) {
+          assert.equal(result.session.sessionId, existingSession.id);
+        } else {
+          assert.match(result.error, /different credential home/);
+          assert.equal(result.session, undefined);
+        }
+      } finally {
+        restore();
+      }
+    });
+  }
+}
+
+for (const action of ["start-login", "logout"]) {
+  test(`codex ${action} child processes use the requested agent home`, async (t) => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-agent-home-"));
+    t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+    const codexPath = path.join(tempDir, "codex.cjs");
+    const observedPath = path.join(tempDir, "observed.jsonl");
+    fs.writeFileSync(codexPath, `
+      require('node:fs').appendFileSync(${JSON.stringify(observedPath)}, JSON.stringify({
+        args: process.argv.slice(2), HOME: process.env.HOME, CODEX_HOME: process.env.CODEX_HOME,
+      }) + '\\n');
+      console.log('Not logged in');
+    `);
+    const agentEnv = { HOME: path.join(tempDir, "agent-home"), CODEX_HOME: path.join(tempDir, "agent-codex") };
+    let finishLogin;
+    const loginFinished = new Promise((resolve) => { finishLogin = resolve; });
+    const { bridge, restore } = loadBridgeWithMocks({
+      shellEnv: { HOME: path.join(tempDir, "default-home"), CODEX_HOME: path.join(tempDir, "default-codex") },
+      prepareCommandForSpawn: (command, args) => ({ command: process.execPath, args: [command, ...args], shell: false }),
+      recordCodexLoginSession: (session) => {
+        if (session.state !== "running") finishLogin(session.state);
+      },
+    });
+    const ipcMain = createIpcMainStub();
+    bridge.init({ sessions: new Map(), sftpClients: new Map(), electronModule: { app: { getPath: () => process.cwd() } } });
+    bridge.registerHandlers(ipcMain);
+    try {
+      const result = await ipcMain.handlers.get(`netcatty:ai:codex:${action}`)({ sender: { id: 1 } }, { codexPath, agentEnv });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      if (action === "start-login") assert.equal(await loginFinished, "success");
+      const observed = fs.readFileSync(observedPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.deepEqual(observed, (action === "start-login" ? [["login"]] : [["logout"], ["login", "status"]])
+        .map((args) => ({ args, ...agentEnv })));
+    } finally {
+      restore();
+    }
+  });
+}
+
 test("codex integration keeps ChatGPT connected when the SDK validation probe fails", async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-integration-"));
   t.after(() => {
@@ -1008,6 +1094,107 @@ test("codex integration keeps ChatGPT connected when the SDK validation probe fa
     assert.equal(result.isConnected, true);
     assert.match(result.rawOutput, /Logged in using ChatGPT/);
     assert.match(result.rawOutput, /ChatGPT auth validation failed:/);
+  } finally {
+    restore();
+  }
+});
+
+test("codex integration surfaces config.toml provider even when auth.json reports an API-key login", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-integration-"));
+  t.after(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const codexPath = path.join(tempDir, "codex");
+  fs.writeFileSync(
+    codexPath,
+    `#!${process.execPath}\nconsole.log('Logged in using an API key');\n`,
+    { mode: 0o755 },
+  );
+
+  const customConfig = {
+    providerName: "ccs",
+    displayName: "Coding Plan",
+    baseUrl: "https://example.invalid/v1",
+    envKey: null,
+    envKeyPresent: false,
+    hasHardcodedApiKey: true,
+    model: "glm-5",
+    authHash: "hash",
+  };
+
+  const { bridge, restore } = loadBridgeWithMocks({
+    normalizeCliPathForPlatform: (value) => value,
+    shellEnv: { HOME: tempDir },
+    readCodexCustomProviderConfig: () => customConfig,
+  });
+  const ipcMain = createIpcMainStub();
+
+  bridge.init({
+    sessions: new Map(),
+    sftpClients: new Map(),
+    electronModule: { app: { getPath: () => process.cwd() } },
+  });
+  bridge.registerHandlers(ipcMain);
+
+  try {
+    const handler = ipcMain.handlers.get("netcatty:ai:codex:get-integration");
+    const result = await handler({ sender: { id: 1 } }, { codexPath });
+
+    assert.equal(result.state, "connected_custom_config", JSON.stringify(result));
+    assert.equal(result.isConnected, true);
+    assert.equal(result.customConfig?.model, "glm-5");
+    assert.equal(result.customConfig?.providerName, "ccs");
+  } finally {
+    restore();
+  }
+});
+
+test("codex integration keeps a validated ChatGPT login visible but still returns config.toml provider", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-codex-integration-"));
+  t.after(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const codexPath = path.join(tempDir, "codex");
+  fs.writeFileSync(
+    codexPath,
+    `#!${process.execPath}\nconsole.log('Logged in using ChatGPT');\n`,
+    { mode: 0o755 },
+  );
+
+  const customConfig = {
+    providerName: "ccs",
+    displayName: "Coding Plan",
+    baseUrl: null,
+    envKey: null,
+    envKeyPresent: false,
+    hasHardcodedApiKey: true,
+    model: "glm-5",
+    authHash: "hash",
+  };
+
+  const { bridge, restore } = loadBridgeWithMocks({
+    normalizeCliPathForPlatform: (value) => value,
+    shellEnv: { HOME: tempDir },
+    readCodexCustomProviderConfig: () => customConfig,
+  });
+  const ipcMain = createIpcMainStub();
+
+  bridge.init({
+    sessions: new Map(),
+    sftpClients: new Map(),
+    electronModule: { app: { getPath: () => process.cwd() } },
+  });
+  bridge.registerHandlers(ipcMain);
+
+  try {
+    const handler = ipcMain.handlers.get("netcatty:ai:codex:get-integration");
+    const result = await handler({ sender: { id: 1 } }, { codexPath });
+
+    assert.equal(result.state, "connected_chatgpt", JSON.stringify(result));
+    assert.equal(result.isConnected, true);
+    assert.equal(result.customConfig?.model, "glm-5");
   } finally {
     restore();
   }
@@ -1539,6 +1726,61 @@ async function withCapturingServer(t, options, respond) {
   };
 }
 
+test("delegated model stream release aborts its actual HTTP request and stale turns fail before HTTP", { timeout: 5_000 }, async (t) => {
+  const { randomUUID } = require("node:crypto");
+  const id = randomUUID(); const tag = randomUUID(); const chatId = `plugin-agent:${id}`;
+  let live = true; let release; let detached = 0; let requests = 0;
+  let resolveAccepted; const accepted = new Promise((resolve) => { resolveAccepted = resolve; });
+  const ctx = await withCapturingServer(t, { mcpServerBridge: {
+    beginPluginAgentModelRequest: () => {},
+    assertPluginAgentCaller: (actual, sender, actualTag) => {
+      assert.equal(actual, chatId); assert.equal(sender, 1);
+      if (!live || actualTag !== tag) throw Error("Agent turn unavailable");
+    },
+    onPluginAgentRelease: (_id, _tag, cancel) => { release = cancel; return () => detached++; },
+  } }, (res) => {
+    requests++; res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"synthetic":true}\n\n'); resolveAccepted();
+  });
+  try {
+    const invoke = (turnTag) => ctx.ipcMain.handlers.get("netcatty:ai:chat:stream")({ sender: ctx.sender }, {
+      requestId: `agent-model_${id}_${turnTag}_sdk_fixture`, url: `${ctx.baseURL}/v1/chat/completions`,
+      headers: { "content-type": "application/json" }, body: '{"stream":true}', providerId: "content-length",
+    });
+    const ended = new Promise((resolve) => ctx.onStreamEvent((channel) => {
+      if (channel === "netcatty:ai:stream:error" || channel === "netcatty:ai:stream:end") resolve();
+    }));
+    const pending = invoke(tag); await accepted; live = false; release();
+    await pending; await ended;
+    assert.equal(detached, 1); assert.equal(requests, 1);
+    const stale = await invoke(randomUUID());
+    assert.equal(stale.ok, false); assert.equal(requests, 1);
+  } finally { ctx.restore(); }
+});
+
+test("delegated compaction fetch uses the same exact-turn cancellation", { timeout: 5_000 }, async (t) => {
+  const { randomUUID } = require("node:crypto"); const id = randomUUID(); const tag = randomUUID();
+  let live = true; let release; let detached = 0; let requests = 0;
+  let accepted; const started = new Promise((resolve) => { accepted = resolve; });
+  const ctx = await withCapturingServer(t, { mcpServerBridge: {
+    beginPluginAgentModelRequest: () => {},
+    assertPluginAgentCaller: (chatId, sender, actualTag) => {
+      assert.equal(chatId, `plugin-agent:${id}`); assert.equal(sender, 1);
+      if (!live || actualTag !== tag) throw Error("Agent unavailable");
+    },
+    onPluginAgentRelease: (_id, _tag, cancel) => { release = cancel; return () => detached++; },
+  } }, (res) => { requests++; res.writeHead(200, { "content-type": "application/json" }); res.write('{"synthetic":'); accepted(); });
+  try {
+    const invoke = () => ctx.ipcMain.handlers.get("netcatty:ai:fetch")({ sender: ctx.sender }, {
+      requestId: `agent-model_${id}_${tag}_fetch_fixture`, url: `${ctx.baseURL}/v1/chat/completions`, method: "POST",
+      headers: { "content-type": "application/json" }, body: '{"messages":[]}', providerId: "content-length",
+    });
+    const pending = invoke(); await started; assert.equal(ctx.received.body.toString(), '{"messages":[]}');
+    live = false; release(); assert.equal((await pending).ok, false); assert.equal(detached, 1);
+    assert.equal((await invoke()).ok, false); assert.equal(requests, 1); assert.equal(ctx.ipcMain.handlers.has("netcatty:ai:chat:cancel"), true);
+  } finally { ctx.restore(); }
+});
+
 test("streaming AI requests send Content-Length instead of chunked encoding", { timeout: 5_000 }, async (t) => {
   const ctx = await withCapturingServer(t, {}, (res) => {
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -1648,5 +1890,34 @@ test("non-streaming AI requests send Content-Length instead of chunked encoding"
     assert.equal(ctx.received.body.toString("utf8"), body);
   } finally {
     ctx.restore();
+  }
+});
+
+test('custom provider headers are decrypted before HTTP and override auth case-insensitively', async () => {
+  let context;
+  const { bridge, restore } = loadBridgeWithMocks({ registerSdkStreamHandlers: (ctx) => { context = ctx; } });
+  const ipcMain = createIpcMainStub();
+  bridge.init({ sessions: new Map(), sftpClients: new Map(), electronModule: {
+    app: { getPath: () => process.cwd() }, session: {},
+    safeStorage: { isEncryptionAvailable: () => true, decryptString: () => 'Bearer tenant-secret' },
+  } });
+  bridge.registerHandlers(ipcMain);
+  const sealed = 'enc:v1:' + Buffer.from('ciphertext').toString('base64');
+  context.providerConfigs = [{ id: 'header-test', apiKey: 'key', customHeaders: { authorization: sealed, 'X-Tenant': 'tenant' } }];
+  const server = http.createServer((req, res) => { res.end(JSON.stringify(req.headers)); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const request = context.injectApiKeyIntoRequest(`http://127.0.0.1:${server.address().port}`, { Authorization: 'Bearer __IPC_SECURED__', 'X-Other': 'keep' }, 'header-test');
+    assert.equal(request.headers.Authorization, undefined);
+    const response = await fetch(request.url, { headers: request.headers });
+    const headers = await response.json();
+    assert.equal(headers.authorization, 'Bearer tenant-secret');
+    assert.equal(headers['x-tenant'], 'tenant');
+    assert.equal(headers['x-other'], 'keep');
+    context.electronModule.safeStorage.isEncryptionAvailable = () => false;
+    assert.throws(() => context.injectApiKeyIntoRequest(request.url, {}, 'header-test'), /Unable to decrypt/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    restore();
   }
 });

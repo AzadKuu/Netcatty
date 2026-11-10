@@ -63,6 +63,39 @@ describe('queryLocalFonts deduplication', () => {
     );
   });
 
+  it('recognizes Fixedsys Excelsior as a monospace terminal font (#3332)', async () => {
+    installMockWindow(async () => [
+      { family: 'Fixedsys Excelsior 3.01' },
+      { family: 'Fixedsys Excelsior' },
+      { family: 'Microsoft YaHei UI' },
+    ]);
+
+    const monoFonts = await getMonospaceFonts();
+    const names = monoFonts.map((f) => f.name);
+
+    // Both upstream family-name variants must be offered in the picker.
+    assert.ok(names.includes('Fixedsys Excelsior'));
+    assert.ok(names.includes('Fixedsys Excelsior 3.01'));
+    // Proportional system fonts stay excluded.
+    assert.ok(!names.includes('Microsoft YaHei UI'));
+  });
+
+  it('recognizes SFMono Nerd Font as a monospace terminal font (#3929)', async () => {
+    installMockWindow(async () => [
+      { family: 'SFMono Nerd Font' },
+      { family: 'SF Mono' },
+      { family: 'Segoe UI' },
+    ]);
+
+    const monoFonts = await getMonospaceFonts();
+    const names = monoFonts.map((f) => f.name);
+
+    // Glued typographic family (name ID 16) and the spaced family both belong.
+    assert.ok(names.includes('SFMono Nerd Font'));
+    assert.ok(names.includes('SF Mono'));
+    assert.ok(!names.includes('Segoe UI'));
+  });
+
   it('a second sequential call also reuses the resolved promise (no second API call)', async () => {
     let callCount = 0;
     installMockWindow(async () => {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -8,6 +9,11 @@ import {
   handleGlobalHotkeyKeyDownImpl,
   markForwardedNativeShortcutEvent,
 } from './app/AppHandlers.ts';
+import {
+  DEFAULT_SETTINGS_CHROME_SNAPSHOT,
+  getSettingsChromeSnapshot,
+  publishSettingsChromeSnapshot,
+} from './state/settingsChromeStore.ts';
 import { matchesKeyBinding } from '../domain/models.ts';
 import { DEFAULT_KEY_BINDINGS } from '../domain/models/keyBindings.ts';
 
@@ -371,7 +377,7 @@ test('move-focus shortcut cannot send input behind a magnified pane', () => {
   assert.equal(moveCalls, 0);
 });
 
-test('Escape restores magnification after transient dialogs are closed', () => {
+test('Escape leaves magnification unchanged and reaches the terminal', () => {
   let restores = 0;
   let prevented = false;
   let stopped = false;
@@ -399,30 +405,29 @@ test('Escape restores magnification after transient dialogs are closed', () => {
     },
   }), event);
 
-  assert.equal(restores, 1);
-  assert.equal(prevented, true);
-  assert.equal(stopped, true);
+  assert.equal(restores, 0);
+  assert.equal(prevented, false);
+  assert.equal(stopped, false);
 });
 
-test('consumed Escape does not restore magnification', () => {
-  let restores = 0;
+test('Escape closes the quick switcher', () => {
+  let open = true;
   handleEscapeKeyDownImpl(() => ({
-    isQuickSwitcherOpen: false,
-    setIsQuickSwitcherOpen: () => {},
-    terminalPaneMagnificationRef: {
-      current: {
-        getState: () => 'focused',
-        focus: () => false,
-        restore: () => {
-          restores += 1;
-          return true;
-        },
-        toggle: () => false,
-      },
-    },
+    isQuickSwitcherOpen: open,
+    setIsQuickSwitcherOpen: (value: boolean) => { open = value; },
+  }), { key: 'Escape', defaultPrevented: false } as KeyboardEvent);
+
+  assert.equal(open, false);
+});
+
+test('consumed Escape leaves the quick switcher open', () => {
+  let open = true;
+  handleEscapeKeyDownImpl(() => ({
+    isQuickSwitcherOpen: open,
+    setIsQuickSwitcherOpen: (value: boolean) => { open = value; },
   }), { key: 'Escape', defaultPrevented: true } as KeyboardEvent);
 
-  assert.equal(restores, 0);
+  assert.equal(open, true);
 });
 
 test('close tab hotkey routes native plugin view tabs through their owner', () => {
@@ -697,4 +702,333 @@ test('connection log host snapshot includes custom host icon fields', () => {
       hostIconColor: 'blue',
     },
   );
+});
+
+test('toggleOpacity hotkey invokes toggleWindowOpacity', () => {
+  let called = false;
+  const noop = () => {};
+
+  executeHotkeyActionImpl(
+    () => ({
+      IS_DEV: false,
+      MOVE_FOCUS_DEBOUNCE_MS: 0,
+      activeTabStore: { getActiveTabId: () => 'vault' },
+      addConnectionLogRef: { current: noop },
+      closeSession: noop,
+      closeTabInFlightRef: { current: false },
+      closeWorkspace: noop,
+      collectSessionIds: () => [],
+      confirmIfBusyLocalTerminal: async () => true,
+      createLocalTerminalWithCurrentShell: noop,
+      editorTabs: [],
+      fromEditorTabId: () => null,
+      handleOpenSettingsRef: { current: noop },
+      handleRequestCloseEditorTabRef: { current: noop },
+      isEditorTabId: () => false,
+      isQuickSwitcherOpen: false,
+      lastMoveFocusTimeRef: { current: 0 },
+      moveFocusInWorkspace: noop,
+      orderedTabs: [],
+      resolveCloseIntent: () => ({ kind: 'noop' }),
+      resolveSnippetsShortcutIntent: () => ({ kind: 'noop' }),
+      sessions: [],
+      setActiveTabId: noop,
+      setAddToWorkspaceDialog: noop,
+      setIsQuickSwitcherOpen: noop,
+      setNavigateToSection: noop,
+      settings: { showSftpTab: true, shellOnlyTabNumberShortcuts: false },
+      splitSessionWithCurrentShell: noop,
+      systemInfoRef: { current: { username: 'user', hostname: 'host' } },
+      toEditorTabId: (id: string) => `editor:${id}`,
+      toggleBroadcast: noop,
+      toggleScriptsSidePanelRef: { current: noop },
+      toggleSidePanelRef: { current: noop },
+      toggleWindowOpacity: () => { called = true; },
+      toggleWorkspaceViewMode: noop,
+      workspaces: [],
+    }),
+    'toggleOpacity',
+    { key: 'u', code: 'KeyU', ctrlKey: true, shiftKey: true } as KeyboardEvent,
+  );
+
+  assert.equal(called, true);
+});
+
+for (const scenario of [
+  { name: 'IME process key with its original physical code', key: 'Process', keyCode: 229, isComposing: false, expected: false },
+  { name: 'key during composition', key: 'U', keyCode: 85, isComposing: true, expected: false },
+  { name: 'ordinary shortcut', key: 'U', keyCode: 85, isComposing: false, expected: true },
+]) {
+  test(`transparency shortcut respects ${scenario.name}`, () => {
+    const target = new FakeHTMLElement();
+    const actions: string[] = [];
+    let prevented = false;
+    const event = {
+      ...scenario,
+      code: 'KeyU',
+      ctrlKey: true,
+      shiftKey: true,
+      altKey: false,
+      metaKey: false,
+      target,
+      composedPath: () => [target],
+      preventDefault: () => { prevented = true; },
+      stopPropagation: () => {},
+    } as unknown as KeyboardEvent;
+    handleGlobalHotkeyKeyDownImpl(() => ({
+      HOTKEY_DEBUG: false,
+      closeTabKeyStr: 'Ctrl + W',
+      executeHotkeyAction: (action: string) => actions.push(action),
+      hotkeyScheme: 'pc',
+      keyBindings: DEFAULT_KEY_BINDINGS,
+      matchesKeyBinding,
+    }), event);
+    assert.deepEqual(actions, scenario.expected ? ['toggleOpacity'] : []);
+    assert.equal(prevented, scenario.expected);
+  });
+}
+for (const scenario of [
+  { name: 'single orphan', active: 'one', sessions: [{ id: 'one' }], available: false, expected: null },
+  { name: 'two orphans', active: 'one', sessions: [{ id: 'one' }, { id: 'two' }], available: true, expected: 'global' },
+  { name: 'hidden active session', active: 'hidden', sessions: [{ id: 'one' }, { id: 'two' }, { id: 'hidden', hiddenFromTabs: true }], available: true, expected: null },
+  { name: 'non-terminal tab', active: 'vault', sessions: [{ id: 'one' }, { id: 'two' }], available: true, expected: null },
+  { name: 'workspace', active: 'workspace', sessions: [{ id: 'one', workspaceId: 'workspace' }, { id: 'two', workspaceId: 'workspace' }], available: false, expected: 'workspace' },
+]) {
+  for (const scheme of ['pc', 'mac'] as const) {
+    test(`broadcast shortcut ${scheme}: ${scenario.name} only consumes an executed toggle`, () => {
+      const target = new FakeHTMLElement();
+      let prevented = 0;
+      let stopped = 0;
+      let globalEnabled = false;
+      let workspaceEnabled = false;
+      const toggles: string[] = [];
+      const event = {
+        key: 'b', code: 'KeyB', ctrlKey: scheme === 'pc', metaKey: scheme === 'mac',
+        altKey: false, shiftKey: false, target, composedPath: () => [target],
+        preventDefault: () => { prevented += 1; },
+        stopPropagation: () => { stopped += 1; },
+      } as unknown as KeyboardEvent;
+      const actionCtx = {
+        activeTabStore: { getActiveTabId: () => scenario.active },
+        editorTabs: [], orderedTabs: [], settings: {}, toEditorTabId: (id: string) => id,
+        sessions: scenario.sessions,
+        workspaces: scenario.active === 'workspace' ? [{ id: 'workspace' }] : [],
+        canUseGlobalBroadcast: scenario.available,
+        toggleGlobalBroadcast: () => { globalEnabled = !globalEnabled; toggles.push('global'); },
+        toggleBroadcast: (id: string) => { assert.equal(id, 'workspace'); workspaceEnabled = !workspaceEnabled; toggles.push('workspace'); },
+      };
+      const invoke = () => handleGlobalHotkeyKeyDownImpl(() => ({
+        HOTKEY_DEBUG: false, closeTabKeyStr: '', hotkeyScheme: scheme,
+        keyBindings: DEFAULT_KEY_BINDINGS, matchesKeyBinding,
+        executeHotkeyAction: (action: string, e: KeyboardEvent) => executeHotkeyActionImpl(() => actionCtx, action, e),
+      }), event);
+      invoke();
+      assert.equal(globalEnabled, scenario.expected === 'global');
+      assert.equal(workspaceEnabled, scenario.expected === 'workspace');
+      invoke();
+      assert.equal(globalEnabled, false);
+      assert.equal(workspaceEnabled, false);
+      assert.deepEqual(toggles, scenario.expected ? [scenario.expected, scenario.expected] : []);
+      assert.equal(prevented, scenario.expected ? 2 : 0);
+      assert.equal(stopped, scenario.expected ? 2 : 0);
+    });
+  }
+}
+
+for (const scheme of ['pc', 'mac'] as const) {
+  test(`focused terminal ${scheme} consumes Shift+B for the host list and leaves plain B to broadcast`, () => {
+    const target = new FakeHTMLElement();
+    const shiftedActions: string[] = [];
+    let shiftedPrevented = false;
+    let shiftedStopped = false;
+    handleGlobalHotkeyKeyDownImpl(() => ({
+      HOTKEY_DEBUG: false,
+      closeTabKeyStr: '',
+      executeHotkeyAction: (action: string) => {
+        shiftedActions.push(action);
+        return action === 'toggleHostTree';
+      },
+      hotkeyScheme: scheme,
+      keyBindings: DEFAULT_KEY_BINDINGS,
+      matchesKeyBinding,
+    }), {
+      key: 'b',
+      code: 'KeyB',
+      ctrlKey: scheme === 'pc',
+      metaKey: scheme === 'mac',
+      altKey: false,
+      shiftKey: true,
+      target,
+      composedPath: () => [target],
+      preventDefault: () => { shiftedPrevented = true; },
+      stopPropagation: () => { shiftedStopped = true; },
+    } as unknown as KeyboardEvent);
+
+    assert.deepEqual(shiftedActions, ['toggleHostTree']);
+    assert.equal(shiftedPrevented, true);
+    assert.equal(shiftedStopped, true);
+
+    const plainActions: string[] = [];
+    let plainPrevented = false;
+    handleGlobalHotkeyKeyDownImpl(() => ({
+      HOTKEY_DEBUG: false,
+      closeTabKeyStr: '',
+      executeHotkeyAction: (action: string) => {
+        plainActions.push(action);
+        return undefined;
+      },
+      hotkeyScheme: scheme,
+      keyBindings: DEFAULT_KEY_BINDINGS,
+      matchesKeyBinding,
+    }), {
+      key: 'b',
+      code: 'KeyB',
+      ctrlKey: scheme === 'pc',
+      metaKey: scheme === 'mac',
+      altKey: false,
+      shiftKey: false,
+      target,
+      composedPath: () => [target],
+      preventDefault: () => { plainPrevented = true; },
+      stopPropagation: () => {},
+    } as unknown as KeyboardEvent);
+
+    assert.deepEqual(plainActions, ['broadcast']);
+    assert.equal(plainPrevented, false);
+  });
+}
+
+test('focused terminal leaves the host-list chord alone when the toggle does not run', () => {
+  const target = new FakeHTMLElement();
+  const actions: string[] = [];
+  let prevented = false;
+  let stopped = false;
+  handleGlobalHotkeyKeyDownImpl(() => ({
+    HOTKEY_DEBUG: false,
+    closeTabKeyStr: '',
+    executeHotkeyAction: (action: string) => {
+      actions.push(action);
+      return false;
+    },
+    hotkeyScheme: 'pc',
+    keyBindings: DEFAULT_KEY_BINDINGS,
+    matchesKeyBinding,
+  }), {
+    key: 'b',
+    code: 'KeyB',
+    ctrlKey: true,
+    metaKey: false,
+    altKey: false,
+    shiftKey: true,
+    target,
+    composedPath: () => [target],
+    preventDefault: () => { prevented = true; },
+    stopPropagation: () => { stopped = true; },
+  } as unknown as KeyboardEvent);
+
+  assert.deepEqual(actions, ['toggleHostTree']);
+  assert.equal(prevented, false);
+  assert.equal(stopped, false);
+});
+
+test('host list shortcut reaches a focused Monaco editor and stays out of plain text fields', () => {
+  const monaco = new FakeMonacoHTMLElement();
+  const monacoActions: string[] = [];
+  let monacoPrevented = false;
+  handleGlobalHotkeyKeyDownImpl(() => ({
+    HOTKEY_DEBUG: false,
+    closeTabKeyStr: '',
+    executeHotkeyAction: (action: string) => {
+      monacoActions.push(action);
+      return true;
+    },
+    hotkeyScheme: 'pc',
+    keyBindings: DEFAULT_KEY_BINDINGS,
+    matchesKeyBinding,
+  }), {
+    key: 'b',
+    code: 'KeyB',
+    ctrlKey: true,
+    metaKey: false,
+    altKey: false,
+    shiftKey: true,
+    target: monaco,
+    composedPath: () => [monaco],
+    preventDefault: () => { monacoPrevented = true; },
+    stopPropagation: () => {},
+  } as unknown as KeyboardEvent);
+
+  assert.deepEqual(monacoActions, ['toggleHostTree']);
+  assert.equal(monacoPrevented, true);
+
+  const input = new FakeInputHTMLElement();
+  const inputActions: string[] = [];
+  let inputPrevented = false;
+  handleGlobalHotkeyKeyDownImpl(() => ({
+    HOTKEY_DEBUG: false,
+    closeTabKeyStr: '',
+    executeHotkeyAction: (action: string) => {
+      inputActions.push(action);
+      return true;
+    },
+    hotkeyScheme: 'pc',
+    keyBindings: DEFAULT_KEY_BINDINGS,
+    matchesKeyBinding,
+  }), {
+    key: 'b',
+    code: 'KeyB',
+    ctrlKey: true,
+    metaKey: false,
+    altKey: false,
+    shiftKey: true,
+    target: input,
+    composedPath: () => [input],
+    preventDefault: () => { inputPrevented = true; },
+    stopPropagation: () => {},
+  } as unknown as KeyboardEvent);
+
+  assert.deepEqual(inputActions, []);
+  assert.equal(inputPrevented, false);
+});
+
+test('toggleHostTree uses the host list toggle only while that list can show', () => {
+  const previous = getSettingsChromeSnapshot();
+  const calls: string[] = [];
+  const toggleHostTree = () => { calls.push('toggle'); };
+  const event = {} as KeyboardEvent;
+  const contextFor = (activeTabId: string, orderedTabs: string[] = [activeTabId]) => ({
+    activeTabStore: { getActiveTabId: () => activeTabId },
+    editorTabs: [],
+    orderedTabs,
+    sessions: [{ id: 'session-1' }],
+    settings: {},
+    toEditorTabId: (id: string) => id,
+    toggleHostTree,
+    workspaces: [{ id: 'workspace-1' }],
+  });
+
+  try {
+    publishSettingsChromeSnapshot({ ...DEFAULT_SETTINGS_CHROME_SNAPSHOT, showHostTreeSidebar: true });
+    assert.equal(executeHotkeyActionImpl(() => contextFor('session-1'), 'toggleHostTree', event), true);
+    assert.equal(executeHotkeyActionImpl(() => contextFor('editor:note', []), 'toggleHostTree', event), true);
+    assert.equal(executeHotkeyActionImpl(() => contextFor('workspace-1'), 'toggleHostTree', event), true);
+    assert.deepEqual(calls, ['toggle', 'toggle', 'toggle']);
+
+    calls.length = 0;
+    assert.equal(executeHotkeyActionImpl(() => contextFor('vault', []), 'toggleHostTree', event), false);
+    assert.equal(executeHotkeyActionImpl(() => contextFor('sftp', []), 'toggleHostTree', event), false);
+    assert.equal(executeHotkeyActionImpl(() => contextFor('plugin-view:demo:main', ['plugin-view:demo:main']), 'toggleHostTree', event), false);
+    assert.deepEqual(calls, []);
+
+    publishSettingsChromeSnapshot({ ...DEFAULT_SETTINGS_CHROME_SNAPSHOT, showHostTreeSidebar: false });
+    assert.equal(executeHotkeyActionImpl(() => contextFor('session-1'), 'toggleHostTree', event), false);
+    assert.deepEqual(calls, []);
+  } finally {
+    publishSettingsChromeSnapshot(previous);
+  }
+});
+
+test('host list shortcut calls the same store toggle as the toolbar button', () => {
+  const source = readFileSync(new URL('./app/AppSideEffects.tsx', import.meta.url), 'utf8');
+  assert.match(source, /toggleHostTree:\s*\(\)\s*=>\s*terminalHostTreeStore\.toggle\(\)/);
 });

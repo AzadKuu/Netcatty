@@ -152,13 +152,13 @@ export interface FetchBridge {
 export interface NetcattyAiBridge {
   aiDiscoverAgents?: (options?: { refreshShellEnv?: boolean; apiKeyPresent?: boolean }) => Promise<Array<AgentPathInfo & { command: string }>>;
   aiPrewarmShellEnv?: () => Promise<{ ok: boolean; error?: string }>;
-  aiCodexGetIntegration?: (options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string }) => Promise<CodexIntegrationStatus>;
-  aiCodexStartLogin?: (options?: { codexPath?: string }) => Promise<{ ok: boolean; session?: CodexLoginSession; error?: string }>;
+  aiCodexGetIntegration?: (options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string; agentEnv?: Record<string, string> }) => Promise<CodexIntegrationStatus>;
+  aiCodexStartLogin?: (options?: { codexPath?: string; agentEnv?: Record<string, string> }) => Promise<{ ok: boolean; session?: CodexLoginSession; error?: string }>;
   aiCodexGetLoginSession?: (sessionId: string) => Promise<{ ok: boolean; session?: CodexLoginSession; error?: string }>;
   aiCodexCancelLogin?: (sessionId: string) => Promise<{ ok: boolean; found?: boolean; session?: CodexLoginSession; error?: string }>;
-  aiCodexLogout?: (options?: { codexPath?: string }) => Promise<{ ok: boolean; state?: CodexIntegrationState; isConnected?: boolean; rawOutput?: string; logoutOutput?: string; error?: string }>;
+  aiCodexLogout?: (options?: { codexPath?: string; agentEnv?: Record<string, string> }) => Promise<{ ok: boolean; state?: CodexIntegrationState; isConnected?: boolean; rawOutput?: string; logoutOutput?: string; error?: string }>;
   aiResolveCli?: (params: { command: string; customPath?: string; refreshShellEnv?: boolean; apiKeyPresent?: boolean }) => Promise<AgentPathInfo>;
-  aiSdkAgentListModels?: (sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server') => Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; error?: string }>;
+  aiSdkAgentListModels?: (sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server', force?: boolean) => Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; warning?: string; source?: 'live' | 'last-known-good'; fetchedAt?: string; error?: string }>;
   codexAppServerGetStatus?: (agentCommand?: string, agentEnv?: Record<string, string>) => Promise<{ ok: boolean; available: boolean; error?: string }>;
   aiUserSkillsGetStatus?: () => Promise<UserSkillsStatusResult>;
   aiUserSkillsOpenFolder?: () => Promise<UserSkillsStatusResult>;
@@ -177,7 +177,19 @@ export interface NetcattyAiBridge {
     mode?: 'temporary' | 'persistent';
     idleTimeoutMinutes?: number;
     sessionIdleTimeoutMinutes?: number;
+    redaction?: import("../../../../application/state/useExternalMcpToggleState").ExternalMcpRedactionSettings;
+    httpEnabled?: boolean;
+    httpPort?: number;
+    httpAllowCustomBind?: boolean;
+    httpListenAddress?: string;
+    httpClientHost?: string;
+    rotateHttpToken?: boolean;
   }) => Promise<Record<string, unknown>>;
+  externalMcpGetUniversalSetupPrompt?: () => Promise<{
+    ok: boolean;
+    prompt?: string;
+    error?: string | null;
+  }>;
   externalMcpCodexGetStatus?: () => Promise<Record<string, unknown>>;
   externalMcpCodexAdd?: () => Promise<Record<string, unknown>>;
   externalMcpClaudeGetStatus?: () => Promise<Record<string, unknown>>;
@@ -229,6 +241,12 @@ export const AGENT_DEFAULTS: Record<string, Omit<ExternalAgentConfig, "id" | "co
     args: [],
     icon: "grok",
     sdkBackend: "grok",
+  },
+  mimo: {
+    name: "MiMo Code",
+    args: [],
+    icon: "mimo",
+    sdkBackend: "mimo",
   },
 };
 

@@ -6,6 +6,7 @@ import { keepOnlyActivePaneSelections } from "./selectionScope";
 import { editorTabStore } from "../../../application/state/editorTabStore";
 import type { EditorTab, EditorTabId } from "../../../application/state/editorTabStore";
 import { releaseEditorTabSaveCoordinator, saveEditorTab } from "../../../application/state/editorTabSave";
+import { confirmCloseOwnedEditors } from "../../../application/state/editorWindowClient";
 import { promptUnsavedChanges } from "../../editor/UnsavedChangesDialog";
 import { toast } from "../../ui/toast";
 import { requireCopyToOtherPaneTarget } from "../copyToOtherPane";
@@ -68,6 +69,8 @@ interface UseSftpViewPaneActionsResult {
   onMoveEntriesToPathRight: (sourcePaths: string[], targetPath: string) => void;
   onCopyToOtherPaneLeft: (files: SftpTransferSource[]) => void;
   onCopyToOtherPaneRight: (files: SftpTransferSource[]) => void;
+  onDuplicateEntriesLeft: (files: SftpTransferSource[]) => void;
+  onDuplicateEntriesRight: (files: SftpTransferSource[]) => void;
   onReceiveFromOtherPaneLeft: (files: SftpTransferSource[]) => void;
   onReceiveFromOtherPaneRight: (files: SftpTransferSource[]) => void;
 }
@@ -144,6 +147,43 @@ export const useSftpViewPaneActions = ({
     (files: SftpTransferSource[]) => startGroupedTransfer(files, "right", "left"),
     [startGroupedTransfer],
   );
+
+  const startDuplicateTransfer = useCallback(
+    (files: SftpTransferSource[], side: "left" | "right") => {
+      const groups = new Map<string, SftpTransferSource[]>();
+      for (const file of files) {
+        // ".." is the tree's parent-navigation row, not a real entry.
+        if (!file.sourcePath || file.name === "..") continue;
+        const key = `${file.sourceConnectionId ?? ""}::${file.sourcePath}`;
+        const group = groups.get(key) ?? [];
+        group.push(file);
+        groups.set(key, group);
+      }
+
+      for (const group of groups.values()) {
+        const [{ sourceConnectionId, sourcePath }] = group;
+        if (!sourcePath) continue;
+        // Same pane, same folder: every task conflicts with its source name
+        // and the duplicate option resolves it to "<name> (copy)".
+        void sftpRef.current.startTransfer(group, side, side, {
+          sourceConnectionId,
+          sourcePath,
+          targetPath: sourcePath,
+          duplicate: true,
+        });
+      }
+    },
+    [sftpRef],
+  );
+
+  const onDuplicateEntriesLeft = useCallback(
+    (files: SftpTransferSource[]) => startDuplicateTransfer(files, "left"),
+    [startDuplicateTransfer],
+  );
+  const onDuplicateEntriesRight = useCallback(
+    (files: SftpTransferSource[]) => startDuplicateTransfer(files, "right"),
+    [startDuplicateTransfer],
+  );
   const onReceiveFromOtherPaneLeft = useCallback(
     (files: SftpTransferSource[]) => startGroupedTransfer(files, "right", "left"),
     [startGroupedTransfer],
@@ -182,7 +222,7 @@ export const useSftpViewPaneActions = ({
         throw new Error(tab?.saveError ?? "Save failed");
       }
     };
-    return editorTabStore.confirmCloseByOwner(
+    return confirmCloseOwnedEditors(
       { sessionId: pane.connection?.id, sftpTabId: pane.id },
       choice,
       saveTab,
@@ -399,6 +439,8 @@ export const useSftpViewPaneActions = ({
     onMoveEntriesToPathRight,
     onCopyToOtherPaneLeft,
     onCopyToOtherPaneRight,
+    onDuplicateEntriesLeft,
+    onDuplicateEntriesRight,
     onReceiveFromOtherPaneLeft,
     onReceiveFromOtherPaneRight,
   };

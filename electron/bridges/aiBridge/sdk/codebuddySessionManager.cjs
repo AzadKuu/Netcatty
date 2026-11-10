@@ -47,6 +47,7 @@ function computeOptionsFingerprint(sessionOptions) {
     agents: sessionOptions.agents,
     thinking: sessionOptions.thinking,
     effort: sessionOptions.effort,
+    persistSession: sessionOptions.persistSession,
     hasHooks: Boolean(sessionOptions.hooks),
     hasCanUseTool: typeof sessionOptions.canUseTool === "function",
     hasElicitation: Boolean(sessionOptions.elicitation),
@@ -118,7 +119,7 @@ class CodebuddySessionManager {
    * @param {string} [args.resumeSessionId]  resume an existing session by ID
    * @returns {Promise<object|null>} session instance or null if V2 unavailable
    */
-  async getOrCreateSession({ sessionKey, sessionOptions, resumeSessionId }) {
+  async getOrCreateSession({ sessionKey, sessionOptions, resumeSessionId, assertSessionValid }) {
     const fingerprint = computeOptionsFingerprint(sessionOptions);
     const existing = this.sessions.get(sessionKey);
     if (existing) {
@@ -149,6 +150,8 @@ class CodebuddySessionManager {
     const resumeSession = sdk.unstable_v2_resumeSession;
     if (!createSession || !resumeSession) return null;
 
+    // Session options can themselves contain system/custom-agent prompts.
+    assertSessionValid?.();
     let session;
     try {
       const callbackState = createSessionCallbackState(sessionOptions);
@@ -179,7 +182,7 @@ class CodebuddySessionManager {
    */
   async runTurn({
     sessionKey, prompt, attachments, options, emitter,
-    sessionOptions, resumeSessionId,
+    sessionOptions, resumeSessionId, assertSessionValid,
   }) {
     const signal = options.abortController?.signal;
     if (signal?.aborted) {
@@ -188,7 +191,7 @@ class CodebuddySessionManager {
     }
 
     const session = await this.getOrCreateSession({
-      sessionKey, sessionOptions, resumeSessionId,
+      sessionKey, sessionOptions, resumeSessionId, assertSessionValid,
     });
     if (!session) {
       if (signal?.aborted) {
@@ -229,6 +232,7 @@ class CodebuddySessionManager {
         }
       }
 
+      assertSessionValid?.();
       try {
         // Send before the initial connection so resumed sessions suppress
         // historical replay and stream only the response to this prompt.
@@ -237,6 +241,7 @@ class CodebuddySessionManager {
         } else {
           // Async iterable of UserMessage — send first message.
           for await (const msg of promptInput) {
+            assertSessionValid?.();
             await session.send(msg);
           }
         }
@@ -244,6 +249,8 @@ class CodebuddySessionManager {
         // Initial transport setup happens inside send(). Release any acquired
         // session lock/process before the caller falls back to legacy query().
         this.closeSession(sessionKey);
+        // Do not reinterpret invalid privacy state as a transport fallback.
+        assertSessionValid?.();
         if (signal?.aborted) {
           emitter.emitDone();
           return { sessionId, usedV2: true };
@@ -337,7 +344,7 @@ class CodebuddySessionManager {
    * Report mid-turn steer as unsupported for the current V2 Session API.
    */
   async steer() {
-    // SDK 0.3.230 Session.send() starts a new turn by resetting the shared
+    // SDK 0.3.258 Session.send() starts a new turn by resetting the shared
     // message iterator and discarding pending messages. Calling it while
     // runTurn() owns session.stream() can strand that active consumer.
     // Keep this disabled until the SDK exposes a dedicated mid-turn steer API.

@@ -25,6 +25,41 @@
  *   text + per-tool-call events (assistant.message / tool execution events).
  */
 const { mcpEnvPairsToObject } = require("./injectMcp.cjs");
+const { resolveCopilotExecutableForSdk } = require("../../ai/shellUtils.cjs");
+const { resolveCopilotPlatformExecutable } = require("./copilotHeadlessLoader.cjs");
+const { isRemovedChatSessionFlag } = require("../../../cli/cliChatSession.cjs");
+const {
+  TOOL_CLI_CHAT_SESSION_ENV_VAR,
+  TOOL_CLI_DISCOVERY_ENV_VAR,
+} = require("../../../cli/discoveryPath.cjs");
+
+/**
+ * Stop a CopilotClient and make sure the spawned CLI process is reaped.
+ *
+ * The SDK (client.d.ts) exposes graceful `stop()`, `forceStop()` (SIGKILL),
+ * and `[Symbol.asyncDispose]` (an alias of stop) — no separate kill/dispose.
+ * Graceful stop closes sessions + the JSON-RPC connection and terminates the
+ * CLI process, but the 1.0.59-era native CLI can hang during that handshake,
+ * leaving its conhost child alive after an app-side timeout/abort (the
+ * "console window stays open" amplifier). Race a short grace period and fall
+ * back to forceStop() when graceful stop fails or exceeds the grace period.
+ */
+async function stopCopilotClient(client, graceMs = 3000) {
+  if (!client || typeof client.stop !== "function") return;
+  let stopped = false;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve(client.stop()).then(() => { stopped = true; }),
+      new Promise((resolve) => { timer = setTimeout(resolve, graceMs); }),
+    ]);
+  } catch { /* best effort */ } finally {
+    clearTimeout(timer);
+  }
+  if (!stopped && typeof client.forceStop === "function") {
+    try { await client.forceStop(); } catch { /* best effort */ }
+  }
+}
 
 // Neutral client options. The real CopilotClient options (with RuntimeConnection)
 // are assembled in runCopilotTurn, because RuntimeConnection comes from the SDK
@@ -34,6 +69,18 @@ function buildCopilotClientOptions({ cliPath, gitHubToken }) {
   if (cliPath) options.cliPath = cliPath;
   if (gitHubToken) options.gitHubToken = gitHubToken;
   return options;
+}
+
+/**
+ * Resolve the CLI path handed to RuntimeConnection.forStdio. For the official
+ * Windows npm loader, select the same installed native runtime it forwards to.
+ * The SDK already hides that child and owns its PID for stop/forceStop.
+ * Keep the original loader when its native runtime cannot be resolved.
+ */
+function connectCopilotStdioPath(cliPath, platform = process.platform) {
+  const resolved = resolveCopilotExecutableForSdk(cliPath);
+  if (platform !== "win32" || !/(?:^|[\\/])@github[\\/]copilot[\\/]npm-loader\.js$/i.test(resolved || "")) return resolved;
+  return resolveCopilotPlatformExecutable(resolved) ?? resolved;
 }
 
 function toCopilotMcpServers(injectedMcpServers) {
@@ -167,8 +214,11 @@ function isNetcattyCliInvocationPrefix(localPart) {
   const text = String(localPart || "").trim();
   if (!text) return false;
   const pathPrefix = String.raw`(?:\.\./|\./|/|[A-Za-z]:[\\/])[\w. \\-]*[\\/]`;
+  // Do not allow `VAR=value cmd` prefixes. The host already injects
+  // NETCATTY_CLI_CHAT_SESSION_ID / discovery env; inline assignments would
+  // override that tenant binding.
   const invocation = new RegExp(
-    String.raw`^(?:(?:[A-Za-z_][\w.-]*=[^\s]+\s+)*)?(?:` +
+    String.raw`^(?:` +
     String.raw`"[^"]*${NETCATTY_CLI_PATH_SUFFIX}"|` +
     String.raw `'[^']*${NETCATTY_CLI_PATH_SUFFIX}'|` +
     String.raw `${NETCATTY_CLI_TOKEN}(?=\s|$)|` +
@@ -179,6 +229,74 @@ function isNetcattyCliInvocationPrefix(localPart) {
     "i",
   );
   return invocation.test(text);
+}
+
+function unquoteCliToken(token) {
+  const text = String(token || "");
+  if (
+    (text.startsWith('"') && text.endsWith('"') && text.length >= 2)
+    || (text.startsWith("'") && text.endsWith("'") && text.length >= 2)
+  ) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function someLocalCliToken(localPart, predicate) {
+  const text = String(localPart || "");
+  let inSingle = false;
+  let inDouble = false;
+  let escape = false;
+  let token = "";
+
+  const take = () => {
+    if (!token) return false;
+    const hit = predicate(unquoteCliToken(token));
+    token = "";
+    return hit;
+  };
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (escape) {
+      token += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && (inSingle || inDouble)) {
+      escape = true;
+      token += ch;
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      inSingle = !inSingle;
+      token += ch;
+      continue;
+    }
+    if (!inSingle && ch === '"') {
+      inDouble = !inDouble;
+      token += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && /\s/.test(ch)) {
+      if (take()) return true;
+      continue;
+    }
+    token += ch;
+  }
+  return take();
+}
+
+/** True when the local CLI argv still uses the removed --chat-session flag. */
+function localArgvHasRemovedChatSessionFlag(localPart) {
+  return someLocalCliToken(localPart, isRemovedChatSessionFlag);
+}
+
+function localPrefixOverridesHostCliEnv(localPart) {
+  const names = [TOOL_CLI_CHAT_SESSION_ENV_VAR, TOOL_CLI_DISCOVERY_ENV_VAR];
+  return someLocalCliToken(localPart, (token) => (
+    names.some((name) => token.startsWith(`${name}=`))
+  ));
 }
 
 function hasExecPayloadSubcommand(localPart) {
@@ -194,6 +312,8 @@ function isLikelyNetcattyCliShellCommand(fullCommandText) {
   const remotePayload = splitAt >= 0 ? command.slice(splitAt + 4).trim() : "";
 
   if (!localPart || LOCAL_SHELL_WRAPPER_PATTERN.test(localPart)) return false;
+  if (localPrefixOverridesHostCliEnv(localPart)) return false;
+  if (localArgvHasRemovedChatSessionFlag(localPart)) return false;
   if (!isNetcattyCliInvocationPrefix(localPart)) return false;
 
   if (remotePayload) {
@@ -227,7 +347,7 @@ function approveNetcattyCliShellOnly(request) {
     return {
       kind: "reject",
       feedback:
-        "Only Netcatty CLI shell commands are allowed. Invoke the netcatty-tool-cli launcher or script prefix provided in the host context, and include --chat-session on every call.",
+        "Only Netcatty CLI shell commands are allowed. Invoke the netcatty-tool-cli launcher or script prefix provided by the host. Do not pass --chat-session or override NETCATTY_CLI_CHAT_SESSION_ID; the host already bound this process.",
     };
   }
   return {
@@ -357,6 +477,7 @@ async function runCopilotTurn({
   emitter,
   signal,
   sdkModule,
+  assertSessionValid,
 }) {
   let resolvedModule = sdkModule;
   if (!resolvedModule) {
@@ -373,7 +494,13 @@ async function runCopilotTurn({
     realClientOptions.env = runtimeEnv;
   }
   if (clientOptions?.cliPath && RuntimeConnection?.forStdio) {
-    realClientOptions.connection = RuntimeConnection.forStdio({ path: clientOptions.cliPath });
+    // The SDK spawns `path` via node without shell:true; a Windows .cmd shim
+    // would fail with spawn EINVAL (Node >= 18.20), so hand over the real JS
+    // entry instead — wrapped in the generated headless wrapper so the CLI's
+    // console window stays hidden (copilotHeadlessLoader.cjs).
+    realClientOptions.connection = RuntimeConnection.forStdio({
+      path: connectCopilotStdioPath(clientOptions.cliPath),
+    });
   }
   if (clientOptions?.gitHubToken) realClientOptions.gitHubToken = clientOptions.gitHubToken;
 
@@ -425,6 +552,9 @@ async function runCopilotTurn({
         if (typeof session.abort === "function") {
           void session.abort().catch(() => {});
         }
+        // Reap the spawned CLI promptly: graceful session.abort() alone does
+        // not terminate the CLI server process.
+        void stopCopilotClient(client);
       };
       if (signal.aborted) {
         onAbort();
@@ -435,6 +565,7 @@ async function runCopilotTurn({
     }
     let final;
     try {
+      assertSessionValid?.();
       final = await session.sendAndWait(buildCopilotMessageOptions({ prompt, attachments }));
     } finally {
       try { unsubscribe(); } catch { /* best effort */ }
@@ -474,7 +605,7 @@ async function runCopilotTurn({
     }
     return { sessionId };
   } finally {
-    try { await client?.stop?.(); } catch { /* best effort */ }
+    await stopCopilotClient(client);
   }
 }
 
@@ -493,7 +624,7 @@ function mapCopilotModels(models) {
  * @param {string} [args.cliPath]
  * @param {object} [args.sdkModule] inject the @github/copilot-sdk module (for tests)
  */
-async function listCopilotModels({ cliPath, sdkModule, abortController, signal }) {
+async function listCopilotModels({ cliPath, runtimeEnv, sdkModule, abortController, signal }) {
   const externalSignal = signal || abortController?.signal;
   if (externalSignal?.aborted) return [];
   let resolvedModule = sdkModule;
@@ -503,15 +634,18 @@ async function listCopilotModels({ cliPath, sdkModule, abortController, signal }
   const sdk = resolvedModule;
   const { CopilotClient, RuntimeConnection } = sdk;
   const clientOptions = { useLoggedInUser: true };
+  if (runtimeEnv && typeof runtimeEnv === "object") clientOptions.env = runtimeEnv;
   if (cliPath && RuntimeConnection?.forStdio) {
-    clientOptions.connection = RuntimeConnection.forStdio({ path: cliPath });
+    // Same EINVAL hazard as runCopilotTurn: resolve .cmd/.bat shims first,
+    // then wrap for headless spawn (no console flash on Windows).
+    clientOptions.connection = RuntimeConnection.forStdio({
+      path: connectCopilotStdioPath(cliPath),
+    });
   }
   const client = new CopilotClient(clientOptions);
   let stopPromise;
   const stopClient = () => {
-    if (!stopPromise) {
-      try { stopPromise = Promise.resolve(client.stop()).catch(() => {}); } catch { stopPromise = Promise.resolve(); }
-    }
+    if (!stopPromise) stopPromise = stopCopilotClient(client);
     return stopPromise;
   };
   let resolveAbort;
@@ -548,6 +682,7 @@ module.exports = {
   buildCopilotPermissionHandler,
   approveNetcattyMcpOnly,
   approveNetcattyCliShellOnly,
+  connectCopilotStdioPath,
   isLikelyNetcattyCliShellCommand,
   getLocalNetcattyCliPrefix,
   findExecPayloadSeparatorIndex,

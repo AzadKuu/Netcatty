@@ -1,10 +1,14 @@
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogle } from '@ai-sdk/google';
+import { wrapLanguageModel, type LanguageModelMiddleware } from 'ai';
 import type { ProviderConfig, ProviderStyle } from '../types';
 import { resolveOpenAIApi, resolveProviderStyle } from '../types';
 import { normalizeAnthropicSdkBaseURL } from '../anthropicCompatBaseUrl';
+import { buildSdkRequestHeaders } from '../providerRequestHeaders';
 import { normalizeOllamaSdkBaseURL } from '../ollamaCompatBaseUrl';
+import { normalizeOpenAIChatCacheUsage } from '../openAIChatCacheUsage';
+import { toWellFormedValue } from '../textBoundaries';
 
 export { normalizeOllamaSdkBaseURL };
 import {
@@ -17,8 +21,19 @@ import {
 } from '../providerContinuation';
 
 export interface ProviderRequestContext {
+  /** Refuse direct-fetch fallback for host-brokered plugin model invocations. */
+  requireBridge?: boolean;
+  /** Optional aggregate SSE payload cap, enforced before renderer buffering. */
+  maxStreamBytes?: number;
+  /** Host-owned tag for targeted plugin model transport teardown. */
+  requestIdPrefix?: string;
   getOpenAIChatAssistantFields?: () => Array<OpenAIChatAssistantFields | undefined>;
+  transformOpenAIChatAssistantFields?: (
+    fields: Array<OpenAIChatAssistantFields | undefined>,
+  ) => Promise<Array<OpenAIChatAssistantFields | undefined>>;
   streamIdleTimeoutMs?: number;
+  /** Stable per-conversation id; used e.g. for OpenCode's x-opencode-session header. */
+  chatSessionId?: string;
 }
 
 /**
@@ -31,6 +46,10 @@ interface BridgeAPI {
     headers: Record<string, string>,
     body?: string,
     providerId?: string,
+    skipHostCheck?: boolean,
+    followRedirects?: boolean,
+    skipTLSVerify?: boolean,
+    requestId?: string,
   ): Promise<{
     ok: boolean;
     status: number;
@@ -133,6 +152,7 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
   // Keys forwarded inside choices array position 0 — the only element the
   // AI SDK reads. Tool calls living at position > 0 are invisible to it.
   const sdkVisibleKeys = new Set<string>();
+  const sdkIndexesByKey = new Map<string, number>();
   const requestIdToken = requestId.replace(/[^a-zA-Z0-9_-]/g, '_');
 
   return (data: string): string => {
@@ -162,6 +182,23 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
       const choiceIndex = typeof choiceRecord.index === 'number' ? choiceRecord.index : choicePosition;
       let deltaChanged = false;
       const normalizedToolCalls: unknown[] = [];
+      const forwardToolCall = (toolCall: Record<string, unknown>, key: string) => {
+        // The SDK reads only choices[0] and stores calls in a dense array.
+        // Assign indexes only when forwarding a named call to that array.
+        if (choicePosition === 0) {
+          let sdkIndex = sdkIndexesByKey.get(key);
+          if (sdkIndex === undefined) {
+            sdkIndex = sdkIndexesByKey.size;
+            sdkIndexesByKey.set(key, sdkIndex);
+          }
+          if (toolCall.index !== sdkIndex) {
+            toolCall = { ...toolCall, index: sdkIndex };
+            changed = true;
+            deltaChanged = true;
+          }
+        }
+        normalizedToolCalls.push(toolCall);
+      };
       for (const [toolCallPosition, toolCall] of deltaRecord.tool_calls.entries()) {
         if (!toolCall || typeof toolCall !== 'object') {
           normalizedToolCalls.push(toolCall);
@@ -206,11 +243,11 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
             normalizedToolCall.function === toolCallRecord.function &&
             (!rememberedName || hasFunctionName(toolCallRecord))
           ) {
-            normalizedToolCalls.push(toolCall);
+            forwardToolCall(toolCallRecord, key);
           } else {
             changed = true;
             deltaChanged = true;
-            normalizedToolCalls.push(normalizedToolCall);
+            forwardToolCall(normalizedToolCall, key);
           }
           continue;
         }
@@ -251,13 +288,13 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
           normalizedToolCall.type === toolCallRecord.type &&
           normalizedToolCall.function === toolCallRecord.function
         ) {
-          normalizedToolCalls.push(toolCall);
+          forwardToolCall(toolCallRecord, key);
           continue;
         }
 
         changed = true;
         deltaChanged = true;
-        normalizedToolCalls.push(normalizedToolCall);
+        forwardToolCall(normalizedToolCall, key);
       }
 
       if (!deltaChanged) return choice;
@@ -426,6 +463,7 @@ export function createBridgeFetchForSDK(
   ): Promise<Response> => {
     const bridge = getBridge();
     if (!bridge) {
+      if (requestContext?.requireBridge) throw new Error('Host AI transport is unavailable');
       return globalThis.fetch(input, init);
     }
 
@@ -451,16 +489,24 @@ export function createBridgeFetchForSDK(
     const headers = extractHeaders(resolvedInit?.headers);
     const body =
       resolvedInit?.body != null ? String(resolvedInit.body) : undefined;
+    const assistantFields = requestContext?.getOpenAIChatAssistantFields?.() ?? [];
+    const safeAssistantFields = requestContext?.transformOpenAIChatAssistantFields
+      ? await requestContext.transformOpenAIChatAssistantFields(assistantFields)
+      : assistantFields;
     const requestBody = body != null
       ? repairOpenAIChatToolResultPairsInBody(applyOpenAIChatContinuationToBody(
           body,
-          requestContext?.getOpenAIChatAssistantFields?.() ?? [],
+          safeAssistantFields,
         ))
       : undefined;
 
+    const delegatedId = /^plugin-agent:([0-9a-f-]{36})$/.exec(requestContext?.chatSessionId ?? '')?.[1];
+    if (delegatedId && (!/^agent-model_[0-9a-f-]{36}_[0-9a-f-]{36}_$/.test(requestContext?.requestIdPrefix ?? '')
+      || !requestContext?.requestIdPrefix?.startsWith(`agent-model_${delegatedId}_`))) throw Error('Delegated model request identity required');
     // Streaming path
     if (isStreamingRequest(resolvedInit)) {
-      const requestId = `sdk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const prefix = requestContext?.requestIdPrefix ?? '';
+      const requestId = `${prefix}sdk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const captureOpenAIChatFields = createOpenAIChatStreamFieldCapture(requestContext);
       const normalizeOpenAIChatToolCalls = createOpenAIChatToolCallNormalizer(requestId);
 
@@ -469,6 +515,7 @@ export function createBridgeFetchForSDK(
       const encoder = new TextEncoder();
       let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
       const pendingChunks: Uint8Array[] = [];
+      let receivedBytes = 0;
       let pendingClose = false;
       let pendingError: Error | null = null;
       let cleanedUp = false;
@@ -508,7 +555,15 @@ export function createBridgeFetchForSDK(
       };
 
       const unsubData = bridge.onAiStreamData(requestId, (data: string) => {
-        const normalizedData = normalizeOpenAIChatToolCalls(data);
+        if (cleanedUp) return;
+        receivedBytes += encoder.encode(data).byteLength;
+        if (requestContext?.maxStreamBytes !== undefined && receivedBytes > requestContext.maxStreamBytes) {
+          errorStream(new Error('AI stream byte budget exceeded'));
+          cleanup();
+          bridge.aiChatCancel(requestId).catch(() => {});
+          return;
+        }
+        const normalizedData = normalizeOpenAIChatCacheUsage(normalizeOpenAIChatToolCalls(data));
         captureOpenAIChatFields(normalizedData);
         // Re-wrap as SSE so the SDK can parse it
         enqueueChunk(encoder.encode(`data: ${normalizedData}\n\n`));
@@ -604,9 +659,18 @@ export function createBridgeFetchForSDK(
     }
 
     // Non-streaming path
-    const result = await bridge.aiFetch(url, method, headers, requestBody, providerId);
+    const fetchId = delegatedId ? `${requestContext!.requestIdPrefix}fetch_${crypto.randomUUID()}` : undefined;
+    const cancel = () => { if (fetchId) void bridge.aiChatCancel(fetchId).catch(() => {}); };
+    resolvedInit?.signal?.throwIfAborted();
+    if (fetchId) resolvedInit?.signal?.addEventListener('abort', cancel, { once: true });
+    let result;
+    try {
+      result = fetchId ? await bridge.aiFetch(url, method, headers, requestBody, providerId, false, false, false, fetchId)
+        : await bridge.aiFetch(url, method, headers, requestBody, providerId);
+      resolvedInit?.signal?.throwIfAborted();
+    } finally { resolvedInit?.signal?.removeEventListener('abort', cancel); }
 
-    return new Response(result.data, {
+    return new Response(normalizeOpenAIChatCacheUsage(result.data), {
       status: result.status,
       statusText: result.ok ? 'OK' : 'Error',
       headers: { 'content-type': 'application/json' },
@@ -659,7 +723,31 @@ export function resolveProviderEndpoint(
   return { baseURL, apiKey };
 }
 
+/**
+ * Last line of defence before serialization: a lone UTF-16 surrogate left by
+ * any upstream cut becomes `\udXXX` in the JSON body, which strict providers
+ * reject as an unparseable request. Replace it so one bad character cannot
+ * wedge every later turn of the conversation.
+ */
+const wellFormedPromptMiddleware: LanguageModelMiddleware = {
+  specificationVersion: 'v4',
+  transformParams: async ({ params }) => {
+    const prompt = toWellFormedValue(params.prompt);
+    return prompt === params.prompt ? params : { ...params, prompt };
+  },
+};
+
 export function createModelFromConfig(
+  config: ProviderConfig,
+  requestContext?: ProviderRequestContext,
+) {
+  return wrapLanguageModel({
+    model: createProviderModel(config, requestContext),
+    middleware: wellFormedPromptMiddleware,
+  });
+}
+
+function createProviderModel(
   config: ProviderConfig,
   requestContext?: ProviderRequestContext,
 ) {
@@ -669,6 +757,7 @@ export function createModelFromConfig(
   const modelId = config.defaultModel || '';
   const style = resolveProviderStyle(config);
   const { baseURL, apiKey } = resolveProviderEndpoint(config, style, safeApiKey);
+  const sdkHeaders = buildSdkRequestHeaders(config, requestContext?.chatSessionId);
 
   switch (style) {
     case 'openai': {
@@ -676,6 +765,7 @@ export function createModelFromConfig(
         apiKey,
         baseURL,
         fetch: customFetch,
+        headers: sdkHeaders,
       });
       // Chat Completions stays the default so OpenAI-compatible proxies keep
       // working. Responses is opt-in for relays that cache better on /v1/responses.
@@ -689,6 +779,7 @@ export function createModelFromConfig(
         apiKey,
         baseURL,
         fetch: customFetch,
+        headers: sdkHeaders,
       })(modelId);
 
     case 'google':
@@ -696,6 +787,7 @@ export function createModelFromConfig(
         apiKey,
         baseURL,
         fetch: customFetch,
+        headers: sdkHeaders,
       })(modelId);
 
     default: {

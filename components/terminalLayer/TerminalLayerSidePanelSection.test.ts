@@ -84,6 +84,7 @@ test('side panel tab order falls back to the default order', () => {
   assert.deepEqual(normalizeTerminalSidePanelTabOrder(['scripts', 'bad-tab']), [
     'scripts',
     'sftp',
+    'browser',
     'history',
     'theme',
     'system',
@@ -93,7 +94,7 @@ test('side panel tab order falls back to the default order', () => {
 });
 
 test('side panel tab order accepts a stored permutation', () => {
-  const stored = ['scripts', 'sftp', 'history', 'theme', 'system', 'notes', 'ai'];
+  const stored = ['scripts', 'sftp', 'browser', 'history', 'theme', 'system', 'notes', 'ai'];
 
   assert.deepEqual(normalizeTerminalSidePanelTabOrder(stored), stored);
 });
@@ -105,7 +106,7 @@ test('side panel tab order moves the dragged tab before the target tab', () => {
       'notes',
       'scripts',
     ),
-    ['sftp', 'notes', 'scripts', 'history', 'theme', 'system', 'ai'],
+    ['sftp', 'browser', 'notes', 'scripts', 'history', 'theme', 'system', 'ai'],
   );
 });
 
@@ -117,7 +118,7 @@ test('side panel tab order can move the dragged tab after the target tab', () =>
       'ai',
       'after',
     ),
-    ['sftp', 'history', 'theme', 'system', 'notes', 'ai', 'scripts'],
+    ['sftp', 'browser', 'history', 'theme', 'system', 'notes', 'ai', 'scripts'],
   );
 });
 
@@ -130,7 +131,7 @@ test('narrow side panels keep the active tool visible and move extra tools into 
   });
 
   assert.deepEqual(fitted.shown, ['sftp', 'ai']);
-  assert.deepEqual(fitted.collapsed, ['scripts', 'history', 'theme', 'system', 'notes']);
+  assert.deepEqual(fitted.collapsed, ['browser', 'scripts', 'history', 'theme', 'system', 'notes']);
 });
 
 test('notes side panel forwards repeated open-note requests', () => {
@@ -357,4 +358,19 @@ test('available-width observer releases a removed focus sidebar immediately', ()
   assert.match(sectionSource, /focusSidebar !== observedFocusSidebar/);
   assert.match(sectionSource, /if \(observedFocusSidebar\) resizeObserver\.unobserve\(observedFocusSidebar\)/);
   assert.match(sectionSource, /observedFocusSidebar = null/);
+});
+
+test('side panel close button stays visible at every panel width', () => {
+  const sectionSource = readFileSync(new URL('./TerminalLayerSidePanelSection.tsx', import.meta.url), 'utf8');
+
+  // The toolbar close button is the panel's only dismiss control and the
+  // rightmost item of the nowrap toolbar row. Closing is a core function, so
+  // it must never be a flex-shrink victim and must never carry responsive
+  // hiding classes; secondary toolbar actions yield first instead.
+  const closeLabelIndex = sectionSource.indexOf("t('terminal.layer.closePanel')");
+  assert.ok(closeLabelIndex > 0, 'close button tooltip label is rendered');
+  const closeSlice = sectionSource.slice(Math.max(0, closeLabelIndex - 600), closeLabelIndex);
+  assert.match(closeSlice, /onClick=\{handleCloseSidePanel\}/);
+  assert.match(closeSlice, /className="h-7 w-7 shrink-0 rounded-md p-0 hover:bg-transparent"/);
+  assert.doesNotMatch(closeSlice, /\bhidden\b|max-(sm|md|lg|xl):/);
 });

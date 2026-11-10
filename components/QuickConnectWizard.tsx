@@ -8,14 +8,17 @@ import {
   Plug,
   Plus,
   User,
+  X,
 } from "lucide-react";
 import React, { useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../application/i18n/I18nProvider";
 import type { QuickConnectTarget } from "../domain/quickConnect";
 import { formatHostPort } from "../domain/host";
 import {
   buildQuickConnectHost,
   getQuickConnectDefaultPort,
+  isQuickConnectIdentityCompatible,
   isQuickConnectIdentityUsable,
   type QuickConnectAuthMethod,
   type QuickConnectProtocol,
@@ -104,13 +107,13 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
     [keys, protocol, selectedIdentity],
   );
   const identityOptions = useMemo(
-    () => identities.map((identity) => ({
+    () => identities.filter((identity) => isQuickConnectIdentityCompatible(identity, target)).map((identity) => ({
       value: identity.id,
       label: identity.label,
       sublabel: identity.username,
       icon: <User size={14} />,
     })),
-    [identities],
+    [identities, target],
   );
 
   const detachSelectedIdentity = () => {
@@ -131,7 +134,7 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
       return;
     }
     const identity = identities.find((candidate) => candidate.id === identityId);
-    if (!identity) return;
+    if (!identity || !isQuickConnectIdentityCompatible(identity, target)) return;
     setSelectedIdentityId(identity.id);
     setUsername(identity.username);
     setAuthMethod(identity.authMethod);
@@ -431,7 +434,7 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
       </div>
       </div>
 
-      {protocol !== "telnet" && identities.length > 0 && (
+      {protocol !== "telnet" && identityOptions.length > 0 && (
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-3">
             <Label className="text-sm font-medium">{t("quickConnect.identity.label")}</Label>
@@ -670,10 +673,9 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
         : `${protocolLabel} ${hostEndpoint}`
     );
 
-  return (
+  const wizard = (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
-      onClick={onClose}
     >
       <div
         className="w-[560px] max-w-[90vw] bg-background border border-border rounded-2xl animate-in fade-in-0 zoom-in-95 duration-200"
@@ -684,7 +686,7 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-6 py-4 border-b border-border/50">
+        <div className="px-6 py-4 border-b border-border/50 flex items-center justify-between gap-4">
           <div className="flex items-center gap-2 min-w-0">
             <Plug size={18} className="shrink-0 text-foreground" />
             <div className="min-w-0">
@@ -694,6 +696,17 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
               ) : null}
             </div>
           </div>
+          {step !== "protocol" && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              aria-label={t("common.close")}
+              onClick={onClose}
+            >
+              <X size={16} />
+            </Button>
+          )}
         </div>
 
 
@@ -797,6 +810,13 @@ const QuickConnectWizard: React.FC<QuickConnectWizardProps> = ({
       </div>
     </div>
   );
+
+  // The vault surface is visibility:hidden while a terminal tab is active.
+  // Portal so the same wizard opened from the tab-bar switcher stays visible.
+  if (typeof document !== "undefined" && document.body) {
+    return createPortal(wizard, document.body);
+  }
+  return wizard;
 };
 
 export default QuickConnectWizard;

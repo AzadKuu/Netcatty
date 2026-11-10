@@ -17,7 +17,7 @@ import {
 } from "./promptDetector";
 import { getCompletions, parseCommandLine, type CompletionSuggestion } from "./completionEngine";
 import type { Snippet } from "../../../domain/models";
-import { recordCommand } from "./commandHistoryStore";
+import { recordCommand, subscribeCommandHistoryCleared } from "../../../application/state/commandHistoryStore";
 import { seedLocalShellHistoryFromHistfiles } from "./localShellHistorySeed";
 import { shellEscape } from "./completionEngine";
 import { preloadCommonSpecs } from "./figSpecLoader";
@@ -27,7 +27,7 @@ import {
   shouldPreferRemoteShellCwd,
 } from "./remotePathCompleter";
 import { decideGhostSuggestion } from "./ghostSuggestionPolicy";
-import { isWindowsShellLineInput, shouldWriteAutocompleteLivePreview } from "./livePreviewSequence";
+import { shouldWriteAutocompleteLivePreview } from "./livePreviewSequence";
 import {
   areSubDirPanelsEqual,
   areSuggestionsEqual,
@@ -41,9 +41,12 @@ import { handleTerminalAutocompleteInput } from "./terminalAutocompleteInput";
 import { handleTerminalAutocompleteKeyEvent } from "./terminalAutocompleteKeyEvent";
 import {
   computeAutocompleteAcceptWrite,
+  computeSnippetAcceptClearSequence,
   isSameAutocompleteQuery,
+  limitSuggestionsForPrompt,
   resolveAutocompleteQueryInput,
   shouldBlockAutocompleteForSensitivePrompt,
+  type SensitiveInputActiveRef,
 } from "./terminalAutocompletePrompt";
 import { sliceStringByCellColumns } from "./terminalStringCellWidth";
 import { isTerminalAlternateScreenActive } from "../terminalHibernateRuntime";
@@ -144,8 +147,8 @@ function isSubsequence(query: string, target: string): boolean {
 
 /**
  * Remove history rows that no longer match the edited input while a debounced
- * provider refresh is pending. Other sources keep their provider-specific
- * matching semantics (snippet search, plugin replacement, etc.).
+ * provider refresh is pending. Snippets must be re-queried for the new input
+ * before they can be selected or executed. Other sources retain their matching.
  */
 export function reconcileAutocompletePopupState(
   prev: AutocompleteState,
@@ -158,6 +161,7 @@ export function reconcileAutocompletePopupState(
   const inputContext = parseCommandLine(input);
   const allowFuzzyHistory = input.length >= 2 && inputContext.wordIndex === 0;
   const suggestions = prev.suggestions.filter((suggestion) => {
+    if (suggestion.source === "snippet") return false;
     if (suggestion.source !== "history") return true;
     const text = suggestion.text.toLowerCase();
     if (suggestion.historyMatch === "path-argument") {
@@ -233,7 +237,7 @@ interface UseTerminalAutocompleteOptions {
    * Host-owned password/auth prompt latch. When true, suppress autocomplete
    * even if the PS1 still looks like a normal shell (e.g. `read -s -p '$ '`).
    */
-  sensitiveInputActiveRef?: RefObject<boolean>;
+  sensitiveInputActiveRef?: SensitiveInputActiveRef;
   /** Host-owned completion Provider adapter; defaults to Netcatty's built-in Provider. */
   provideCompletions?: (
     input: string,
@@ -554,6 +558,7 @@ export function useTerminalAutocomplete(
 
   /** Fetch directory listing via IPC. */
   const fetchDirEntries = useCallback(async (dirPath: string): Promise<SubDirEntry[]> => {
+    if (isNetworkDeviceRef.current) return [];
     return listDirectoryEntries(dirPath, {
       sessionId: sessionIdRef.current,
       protocol: protocolRef.current,
@@ -760,6 +765,7 @@ export function useTerminalAutocomplete(
       candidate: newCommand,
       os: hostOsRef.current,
     });
+    if (seq === null) return;
     if (seq) writeToTerminal(seq);
     typedInputBufferRef.current = newCommand;
     typedBufferReliableRef.current = true;
@@ -873,6 +879,7 @@ export function useTerminalAutocomplete(
     if (
       shouldBlockAutocompleteForSensitivePrompt({
         sensitiveInputActive: sensitiveInputActiveRef?.current === true,
+        sensitiveSource: sensitiveInputActiveRef?.source,
         promptText: prompt.promptText,
       })
     ) {
@@ -1001,10 +1008,11 @@ export function useTerminalAutocomplete(
     };
 
     const applyCompletions = (
-      completions: CompletionSuggestion[],
+      incomingCompletions: CompletionSuggestion[],
       currentPrompt: ReturnType<typeof getAlignedPrompt>["prompt"],
       options?: { preserveSelection?: boolean },
     ) => {
+      const completions = limitSuggestionsForPrompt(currentPrompt.promptText, incomingCompletions);
       // Echo-lag-aware logical caret: resolved query `input` can be ahead of
       // the live xterm cursor / currentPrompt.userInput. When a late path
       // refresh lands while live-preview has already rewritten the shell line,
@@ -1159,6 +1167,7 @@ export function useTerminalAutocomplete(
         historyScope: settingsRef.current.historyScope,
         sessionId: sessionIdRef.current,
         protocol: protocolRef.current,
+        skipPathCompletion: isNetworkDeviceRef.current,
         cwd: cwdResolution.cwd,
         cwdSource: cwdResolution.source,
         snippets: snippetsRef.current,
@@ -1310,8 +1319,34 @@ export function useTerminalAutocomplete(
     });
   }, [termRef, writeToTerminal, repositionPopup]);
 
-  /** Accept a snippet: clear the user's typed input, then run it via the
-   *  host-canonical send path (onAcceptSnippet). */
+  /**
+   * Drop every trace of the popup when command history is cleared, including a
+   * clear performed in another renderer (e.g. the main window while this
+   * detached popup is open).
+   *
+   * Mirrors the Escape path: live preview writes the highlighted candidate into
+   * the shell line, so hiding the popup alone would leave the deleted command
+   * ready for Enter, with `lastAcceptedCommandRef` still pointing at it.
+   * Restore the typed baseline and reset the refs first.
+   */
+  const handleCommandHistoryCleared = useCallback(() => {
+    if (previewActiveRef.current) {
+      renderPreviewSelection(-1); // restore the typed baseline
+    }
+    clearState();
+    previewActiveRef.current = false;
+    // Drop a command accepted before the clear so a fast Enter cannot record it
+    // through the accepted-command path (the line buffer is authoritative now).
+    lastAcceptedCommandRef.current = null;
+  }, [clearState, renderPreviewSelection]);
+
+  useEffect(
+    () => subscribeCommandHistoryCleared(handleCommandHistoryCleared),
+    [handleCommandHistoryCleared],
+  );
+
+  /** Accept a snippet: clear the matched word (or the whole line for a script
+   *  or a shell prompt), then run it via onAcceptSnippet. */
   const acceptSnippet = useCallback((snippet: Snippet): boolean => {
     const term = termRef.current;
     if (term) {
@@ -1323,10 +1358,13 @@ export function useTerminalAutocomplete(
       );
       if (line !== null && line.length > 0) {
         if (!settingsRef.current.allowLineReplacement) return false;
-        const clearSequence = isWindowsShellLineInput(hostOsRef.current, prompt.promptText)
-          ? "\b".repeat(line.length)
-          : "\x15"; // Ctrl+U (readline kill-line)
-        writeToTerminal(clearSequence);
+        const clearSequence = computeSnippetAcceptClearSequence({
+          line,
+          os: hostOsRef.current,
+          promptText: prompt.promptText,
+          snippetKind: snippet.kind,
+        });
+        if (clearSequence) writeToTerminal(clearSequence);
       }
     }
     typedInputBufferRef.current = "";

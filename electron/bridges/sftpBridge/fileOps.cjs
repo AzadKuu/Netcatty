@@ -556,6 +556,41 @@ function createFileOpsApi(ctx) {
     }
     
     /**
+     * Drop the alias's lease on the login client. If the SFTP page already
+     * asked to close that client, end it only after the last borrower leaves.
+     */
+    function releaseSharedChannelOwner(client) {
+      const ownerId = client?.__netcattySharedChannelOwnerId;
+      const aliasId = client?.__netcattySharedChannelAliasId;
+      if (!ownerId || !aliasId || client.__netcattyOwnerLeaseReleased) return;
+      client.__netcattyOwnerLeaseReleased = true;
+      let store;
+      let result;
+      try {
+        const lease = require("../sftpTransferSessionLease.cjs");
+        store = lease.sftpTransferSessionLeaseStore;
+        result = store.release(ownerId, lease.channelAliasLeaseId(aliasId));
+      } catch {
+        return;
+      }
+      if (!result?.shouldHardClose) return;
+      const closeToken = store.getPendingHardCloseToken(ownerId);
+      setImmediate(() => {
+        if (store.isHeld(ownerId)) {
+          store.markSoftClosed(ownerId);
+          return;
+        }
+        if (!store.commitHardClose(ownerId, closeToken)) return;
+        void closeSftp(null, { sftpId: ownerId, force: true }).catch((err) => {
+          console.warn(
+            `[SFTP] Deferred close of borrowed owner ${ownerId} failed:`,
+            err?.message || err,
+          );
+        });
+      });
+    }
+
+    /**
      * Close an SFTP connection.
      * Also cleans up any jump host connections and file watchers if present.
      *
@@ -666,8 +701,16 @@ function createFileOpsApi(ctx) {
             };
           }
         } catch { /* optional */ }
-        // Transport-managed / session-backed: close channel + return lease only.
-        if (client.__netcattyRefHolder || client.__netcattyTransportManaged || client.__netcattySessionBacked) {
+        // Alias handles share the login channel. Closing the transfer id must
+        // not end that channel or the SFTP page listing dies with the upload.
+        // Releasing the owner lease lets a deferred closeSftp(owner) finish
+        // only after every borrower is gone.
+        if (client.__netcattySharedChannelAlias) {
+          client.__netcattyDisposed = true;
+          client.sftp = null;
+          try { await client.end?.(); } catch { /* alias end only detaches */ }
+          releaseSharedChannelOwner(client);
+        } else if (client.__netcattyRefHolder || client.__netcattyTransportManaged || client.__netcattySessionBacked) {
           try {
             if (client.sftp && typeof client.sftp.end === "function") client.sftp.end();
             else if (client.sftp && typeof client.sftp.close === "function") client.sftp.close();
@@ -886,10 +929,20 @@ function createFileOpsApi(ctx) {
     }
     
     function formatSftpStatResult(payloadPath, stat, permissions) {
+      // The renderer contract (SftpStatResult.size) requires a number. A
+      // stat-less SCP host reports an unknown size internally (undefined) so
+      // size-sensitive backend checks can skip it, but that value must not
+      // cross the IPC boundary: conflict dialogs and TransferTask.totalBytes
+      // would render "NaN undefined". Map unknown to 0 ("--" when formatted).
+      const sizeKnown = Number.isFinite(stat.size);
+      const size = sizeKnown ? stat.size : 0;
       return {
         name: path.basename(payloadPath),
         type: stat.isDirectory ? "directory" : stat.isSymbolicLink ? "symlink" : "file",
-        size: stat.size,
+        size,
+        // Skip-unchanged and resume checks must not mistake the placeholder 0
+        // for a real zero-byte file; they gate on this marker instead.
+        sizeKnown,
         lastModified: stat.modifyTime,
         permissions,
       };
@@ -1023,6 +1076,40 @@ function createFileOpsApi(ctx) {
       return true;
     }
 
+    /** Create a remote archive with an explicit, non-destructive publish step. */
+    async function createSftpArchive(_event, payload) {
+      const client = sftpClients.get(payload?.sftpId);
+      if (!client) throw new Error("SFTP session not found");
+      if (client.__netcattySingleChannelSsh || client.client?.__netcattySingleChannelSsh) {
+        const error = new Error(
+          "This host is configured for single-channel SSH. Creating an archive requires a shell channel, which this file-transfer login cannot open.",
+        );
+        error.code = "ERR_SFTP_SINGLE_CHANNEL_EXEC";
+        throw error;
+      }
+      if (!client.client || typeof client.client.exec !== "function" || typeof execRemoteShellCommand !== "function") {
+        throw new Error("SSH exec unavailable");
+      }
+      const {
+        buildCreateArchiveCommand,
+        parseCreateArchiveResult,
+        CREATE_ARCHIVE_OPEN_TIMEOUT_MS,
+        CREATE_ARCHIVE_RUN_TIMEOUT_MS,
+        CREATE_ARCHIVE_MAX_OUTPUT_BYTES,
+      } = require("./archiveCreate.cjs");
+      const encoding = resolveEncodingForRequest(payload.sftpId, payload.encoding);
+      const command = buildCreateArchiveCommand(payload.options, { encoding });
+      const signal = payload?.abortSignal || null;
+      throwIfAborted(signal);
+      const result = await execRemoteShellCommand(client.client, command, {
+        signal,
+        openingTimeoutMs: CREATE_ARCHIVE_OPEN_TIMEOUT_MS,
+        runTimeoutMs: CREATE_ARCHIVE_RUN_TIMEOUT_MS,
+        maxOutputBytes: CREATE_ARCHIVE_MAX_OUTPUT_BYTES,
+      });
+      return parseCreateArchiveResult(result.stdout);
+    }
+
     /**
      * Extract a remote archive into its parent directory via SSH exec.
      */
@@ -1051,14 +1138,6 @@ function createFileOpsApi(ctx) {
       const signal = payload?.abortSignal || null;
       throwIfAborted(signal);
 
-      const sshClient = client.client;
-      if (!sshClient || typeof sshClient.exec !== "function") {
-        throw new Error("SSH exec unavailable");
-      }
-      if (typeof execRemoteShellCommand !== "function") {
-        throw new Error("SSH exec unavailable");
-      }
-
       let archiveSize = 0;
       try {
         if (!isScpModeClient(client) && typeof lstatAsync === "function") {
@@ -1069,6 +1148,21 @@ function createFileOpsApi(ctx) {
         }
       } catch {
         archiveSize = 0;
+      }
+
+      if (client.__netcattySingleChannelSsh || client.client?.__netcattySingleChannelSsh) {
+        const err = new Error(
+          "This host is configured for single-channel SSH. Remote archive extraction needs a shell channel, which this file-transfer login cannot open.",
+        );
+        err.code = "ERR_SFTP_SINGLE_CHANNEL_EXEC";
+        throw err;
+      }
+      const sshClient = client.client;
+      if (!sshClient || typeof sshClient.exec !== "function") {
+        throw new Error("SSH exec unavailable");
+      }
+      if (typeof execRemoteShellCommand !== "function") {
+        throw new Error("SSH exec unavailable");
       }
 
       await execRemoteShellCommand(sshClient, command, {
@@ -1117,9 +1211,15 @@ function createFileOpsApi(ctx) {
       }
     
       // Method 1: SSH exec `echo ~` (with 5s timeout to avoid hanging on
-      // hosts with blocking shell init scripts or forced commands)
+      // hosts with blocking shell init scripts or forced commands).
+      // Skip on single-channel PAM bastions: the extra exec drops the SFTP
+      // transport (Cloudbility / QiZhi), same class as JumpServer exec denial.
       const sshClient = client.client;
-      if (sshClient && typeof sshClient.exec === "function") {
+      if (
+        sshClient
+        && typeof sshClient.exec === "function"
+        && !client.__netcattySingleChannelSsh
+      ) {
         let execStream = null;
         try {
           const result = await executeBoundedSshCommand(sshClient, "echo ~", {
@@ -1213,6 +1313,7 @@ function createFileOpsApi(ctx) {
       lstatSftp,
       chmodSftp,
       extractSftpArchive,
+      createSftpArchive,
       getSftpHomeDir,
     };
   }

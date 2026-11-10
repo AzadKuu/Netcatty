@@ -1,5 +1,5 @@
 import React, { type Dispatch, type SetStateAction } from 'react';
-import { History, Plus } from 'lucide-react';
+import { History, Plus, Undo2 } from 'lucide-react';
 import type { AIPermissionMode, AISession, ChatMessage, DiscoveredAgent, ExternalAgentConfig, AgentModelPreset, ProviderConfig, UploadedFile } from '../infrastructure/ai/types';
 import type { Host, VaultNote } from '../types';
 import type { UserSkillOption } from './ai/userSkillsState';
@@ -47,6 +47,8 @@ interface AIChatPanelContentProps {
   activeSessionId: string | null;
   handleSelectSession: (sessionId: string) => void;
   handleDeleteSession: (event: React.MouseEvent, sessionId: string) => void;
+  /** Fork the conversation up to a completed assistant response into a new session. */
+  onForkFromMessage?: (messageId: string) => void;
   messages: ChatMessage[];
   isStreaming: boolean;
   activeCompaction?: import('../application/state/useAgentCompactionUi').ActiveCompactionUi | null;
@@ -55,6 +57,23 @@ interface AIChatPanelContentProps {
   setInputValue: (value: string) => void;
   handleSend: () => void;
   handleCompact: () => void;
+  /** Rename a chat by id (history drawer edit affordance). Panel action, never agent content. */
+  onRenameSession?: (sessionId: string, title: string) => void;
+  /** `/rename <title>` for the current chat. Panel action, never agent content. */
+  onRenameActiveChat?: (title: string) => void;
+  /** `/chats`: list the chats visible to this panel. Panel action, never agent content. */
+  onListChats?: () => void;
+  /** `/rebind <n>`: rebind a dangling chat to this panel's scope. Panel action, never agent content. */
+  onRebindChat?: (arg: string) => void;
+  /** `/chats` listing output, rendered as a system-style note above the composer. */
+  panelCommandNote?: string | null;
+  onDismissPanelCommandNote?: () => void;
+  /** Manual durability escape hatch: export/import the whole session store. */
+  onExportSessions?: () => void;
+  onImportSessions?: () => void;
+  /** Undo last turn is offered at a safe boundary (never mid-tool / mid-compaction). */
+  canUndoLastTurn?: boolean;
+  handleUndoLastTurn?: () => void;
   canCompact?: boolean;
   handleSteer: () => void;
   handleStop: () => void;
@@ -66,7 +85,17 @@ interface AIChatPanelContentProps {
   providerDisplayName?: string;
   modelDisplayName?: string;
   modelCatalogWarning?: string;
+  /** Live SDK model catalog is loading (no built-in presets to show yet). */
+  modelCatalogLoading?: boolean;
+  /** Provenance of the active model list, rendered as the picker status chip. */
+  modelCatalogSource?: 'live' | 'last-known-good' | 'presets';
+  /** ISO timestamp of the successful fetch backing `modelCatalogSource`. */
+  modelCatalogFetchedAt?: string;
+  /** Retry a failed SDK model catalog load from the warning banner. */
+  handleModelCatalogRetry?: () => void;
   agentModelPresets: AgentModelPreset[];
+  /** Suppress the composer picker's "use custom model" action (locked model). */
+  allowCustomModelEntry?: boolean;
   selectedAgentModel: string;
   handleAgentModelSelect: (modelId: string) => void;
   cattyConfiguredProviders: ProviderConfig[];
@@ -118,6 +147,7 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
   activeSessionId,
   handleSelectSession,
   handleDeleteSession,
+  onForkFromMessage,
   messages,
   isStreaming,
   activeCompaction = null,
@@ -126,9 +156,20 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
   setInputValue,
   handleSend,
   handleCompact,
+  onRenameSession,
+  onRenameActiveChat,
+  onListChats,
+  onRebindChat,
+  panelCommandNote,
+  onDismissPanelCommandNote,
+  onExportSessions,
+  onImportSessions,
+  canUndoLastTurn = false,
+  handleUndoLastTurn,
   canCompact = false,
   handleSteer,
   handleStop,
+  handleModelCatalogRetry,
   canSteer,
   isSteering,
   steerWarning,
@@ -137,7 +178,11 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
   providerDisplayName,
   modelDisplayName,
   modelCatalogWarning,
+  modelCatalogLoading = false,
+  modelCatalogSource,
+  modelCatalogFetchedAt,
   agentModelPresets,
+  allowCustomModelEntry = true,
   selectedAgentModel,
   handleAgentModelSelect,
   cattyConfiguredProviders,
@@ -223,6 +268,23 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
               onManageAgents={handleOpenSettings}
             />
             <div className="flex items-center gap-0.5">
+              {handleUndoLastTurn && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 rounded-md text-muted-foreground/62 hover:bg-white/[0.05] hover:text-foreground"
+                      aria-label={t('ai.chat.undoLastTurn')}
+                      disabled={sending || isStreaming || !canUndoLastTurn}
+                      onClick={handleUndoLastTurn}
+                    >
+                      <Undo2 size={12} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t('ai.chat.undoLastTurn')}</TooltipContent>
+                </Tooltip>
+              )}
               <ConversationExport
                 session={activeSession}
                 onExport={handleExport}
@@ -269,6 +331,9 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
             activeSessionId={activeSessionId}
             onSelect={sending ? () => undefined : handleSelectSession}
             onDelete={handleDeleteSession}
+            onRename={onRenameSession}
+            onExportSessions={onExportSessions}
+            onImportSessions={onImportSessions}
             onClose={() => setShowHistory(false)}
           />
         </React.Profiler>
@@ -282,6 +347,8 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
                 isStreaming={isStreaming}
                 activeSessionId={activeSessionId}
                 activeCompaction={activeCompaction}
+                contextCompaction={activeSession?.contextCompaction}
+                onForkFromMessage={onForkFromMessage}
                 notes={notes}
                 hosts={hosts}
                 onOpenVaultNote={onOpenVaultNote}
@@ -327,13 +394,40 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
           {!hideInput && (
             <React.Profiler {...getAIPanelProfilerProps('AIChatPanel.Input')}>
               <div>
+                {panelCommandNote ? (
+                  <div role="status" className="mx-3 mb-1.5 rounded-md border border-border/50 bg-muted/30 px-2.5 py-1.5 text-[11px] leading-4 text-muted-foreground">
+                    <span className="block max-h-48 overflow-y-auto whitespace-pre-wrap break-words">{panelCommandNote}</span>
+                    {onDismissPanelCommandNote && (
+                      <button
+                        type="button"
+                        aria-label={t('common.close')}
+                        onClick={onDismissPanelCommandNote}
+                        className="mt-1 text-[11px] text-muted-foreground/60 underline-offset-2 transition-colors hover:text-foreground hover:underline cursor-pointer"
+                      >
+                        {t('common.close')}
+                      </button>
+                    )}
+                  </div>
+                ) : null}
                 {steerWarning ? (
                   <div role="status" className="mx-3 mb-1.5 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
                     {steerWarning}
                   </div>
                 ) : modelCatalogWarning ? (
-                  <div role="status" className="mx-3 mb-1.5 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
-                    {modelCatalogWarning}
+                  <div role="status" className="mx-3 mb-1.5 flex items-center gap-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
+                    <span className="min-w-0 flex-1">{modelCatalogWarning}</span>
+                    {handleModelCatalogRetry && (
+                      <button
+                        onClick={handleModelCatalogRetry}
+                        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium text-amber-600 underline-offset-2 transition-colors hover:bg-amber-500/10 hover:text-amber-500 hover:underline cursor-pointer dark:text-amber-400 dark:hover:text-amber-300"
+                      >
+                        {t('ai.chat.modelCatalogRetry')}
+                      </button>
+                    )}
+                  </div>
+                ) : modelCatalogLoading ? (
+                  <div role="status" className="mx-3 mb-1.5 rounded-md bg-muted/40 px-2.5 py-1.5 text-[11px] leading-4 text-muted-foreground/70">
+                    {t('ai.chat.loadingModels')}
                   </div>
                 ) : null}
                 <ChatInput
@@ -342,6 +436,9 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
                   onChange={setInputValue}
                   onSend={handleSend}
                   onCompact={handleCompact}
+                  onRenameSession={onRenameActiveChat}
+                  onListChats={onListChats}
+                  onRebindChat={onRebindChat}
                   canCompact={canCompact}
                   onSteer={handleSteer}
                   onStop={handleStop}
@@ -354,6 +451,12 @@ export const AIChatPanelContent: React.FC<AIChatPanelContentProps> = ({
                   modelName={modelDisplayName}
                   agentName={currentAgentId === 'catty' ? 'Catty Agent' : externalAgents.find(a => a.id === currentAgentId)?.name}
                   modelPresets={agentModelPresets}
+                  modelCatalogLoading={modelCatalogLoading}
+                  modelCatalogSource={modelCatalogSource}
+                  modelCatalogFetchedAt={modelCatalogFetchedAt}
+                  modelCatalogWarning={modelCatalogWarning}
+                  onRefreshModelCatalog={handleModelCatalogRetry}
+                  allowCustomModelEntry={allowCustomModelEntry}
                   selectedModelId={selectedAgentModel}
                   onModelSelect={handleAgentModelSelect}
                   providerSwitcher={providerSwitcher}

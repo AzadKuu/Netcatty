@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, ArrowDownToLine, ArrowUpFromLine, Cpu, HardDrive, MemoryStick } from 'lucide-react';
+import { Activity, ArrowDownToLine, ArrowUpFromLine, Cpu, Gpu, HardDrive, MemoryStick } from 'lucide-react';
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { cn } from '../../lib/utils';
@@ -8,6 +8,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { formatNetSpeed } from './terminalHelpers';
 import { useServerStats } from '../../application/state/useServerStats';
 import { formatDiskCapacityRange, resolveTerminalDiskSummary } from './serverStatsFormat';
+import { formatGpuMemoryGib, TerminalGpuCards } from './TerminalGpuCards';
 
 interface TerminalServerStatsProps {
   sessionId: string;
@@ -48,6 +49,7 @@ export const TerminalServerStats: React.FC<TerminalServerStatsProps> = ({
   const hasNetworkDetails = serverStats.netInterfaces.length > 0;
   const hasLatency = serverStats.latencyMs !== null;
   const diskSummary = resolveTerminalDiskSummary(serverStats);
+  const gpuMemory = formatGpuMemoryGib(serverStats.gpuMemUsed, serverStats.gpuMemTotal);
 
   if (!enabled || !isConnected || !serverStats.lastUpdated) return null;
 
@@ -122,6 +124,38 @@ export const TerminalServerStats: React.FC<TerminalServerStatsProps> = ({
                     </div>
                   </HoverCardContent>
                 </HoverCard>
+                {/* GPU — only rendered when the remote reports NVIDIA GPU data (Linux nvidia-smi).
+                    Compact chip stays aggregate, matching CPU; per-card detail is the hover card. */}
+                {serverStats.gpu !== null && (
+                  <HoverCard openDelay={200} closeDelay={100}>
+                    <HoverCardTrigger asChild>
+                      <button
+                        className="flex items-center gap-0.5 hover:opacity-100 opacity-80 transition-opacity cursor-pointer min-w-0 shrink"
+                        aria-label={t("terminal.serverStats.gpu")}
+                      >
+                        <Gpu size={10} className="flex-shrink-0" />
+                        <span className="truncate">
+                          {serverStats.gpu}%
+                          {gpuMemory ? ` (${gpuMemory})` : ''}
+                        </span>
+                      </button>
+                    </HoverCardTrigger>
+                    <HoverCardContent
+                      className="w-auto p-3"
+                      side="bottom"
+                      align="start"
+                      sideOffset={8}
+                    >
+                      <TerminalGpuCards
+                        gpus={serverStats.gpus}
+                        gpu={serverStats.gpu}
+                        gpuName={serverStats.gpuName}
+                        gpuMemUsed={serverStats.gpuMemUsed}
+                        gpuMemTotal={serverStats.gpuMemTotal}
+                      />
+                    </HoverCardContent>
+                  </HoverCard>
+                )}
                 {/* Memory with HoverCard for htop-style bar and top processes */}
                 <HoverCard openDelay={200} closeDelay={100}>
                   <HoverCardTrigger asChild>

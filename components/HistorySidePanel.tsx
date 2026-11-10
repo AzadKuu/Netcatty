@@ -27,8 +27,9 @@ import {
   toGlobalHistoryDisplayEntries,
 } from '../domain/globalHistory';
 import type { Host, RemoteHistoryEntry, ShellHistoryEntry } from '../domain/models';
-import { removeCommandHistoryEntry } from './terminal/autocomplete/commandHistoryStore';
+import { removeCommandHistoryEntry } from '../application/state/commandHistoryStore';
 import { cn } from '../lib/utils';
+import { ConfirmDialog } from './ui/confirm-dialog';
 import type { RemoteHistoryHostState } from '../application/state/useRemoteHistoryState';
 import {
   VariableSizeVirtualList,
@@ -46,6 +47,7 @@ export interface HistorySidePanelProps {
   globalEntries: ShellHistoryEntry[];
   onFetch: (sessionId: string, hostId: string) => void;
   onDeleteGlobalEntry?: (entryId: string) => void;
+  onClearGlobalHistory?: () => void;
   /** Paste into the terminal without executing (no trailing Enter). */
   onPasteToTerminal: (command: string) => void;
   /** Write to the terminal and execute (append Enter). */
@@ -115,6 +117,7 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
   globalEntries,
   onFetch,
   onDeleteGlobalEntry,
+  onClearGlobalHistory,
   onPasteToTerminal,
   onRunInTerminal,
   isVisible = true,
@@ -123,6 +126,7 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
   const [scope, setScope] = useState<HistoryPanelScope>('host');
   const [search, setSearch] = useState('');
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
+  const [clearAllOpen, setClearAllOpen] = useState(false);
   const listRef = useRef<VariableSizeVirtualListHandle>(null);
 
   const protocol = focusedHost?.protocol;
@@ -208,6 +212,14 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
     setSelectedEntryId(null);
   }, [globalEntries, onDeleteGlobalEntry, scope, sourceEntries]);
 
+  const handleClearAll = useCallback(() => {
+    // The application-state action clears both the global shell history and the
+    // autocomplete history, and fans the clear out to every renderer.
+    onClearGlobalHistory?.();
+    setClearAllOpen(false);
+    setSelectedEntryId(null);
+  }, [onClearGlobalHistory]);
+
   const handleRowClick = useCallback((entryId: string) => {
     setSelectedEntryId((current) => {
       const next = current === entryId ? null : entryId;
@@ -258,8 +270,8 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
     && state.entries.length === 0;
   const showNoGlobalHistory = scope === 'global' && globalEntries.length === 0;
 
-  if (!isVisible) return null;
-
+  // Stay mounted when the side panel parks this tree. Returning null here
+  // would remount the virtual list on every Notes <-> History switch.
   return (
     <div
       className="h-full flex flex-col bg-background overflow-hidden"
@@ -292,6 +304,18 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
             className="shrink-0 h-6 w-6 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors disabled:opacity-40 disabled:hover:text-muted-foreground disabled:hover:bg-transparent"
           >
             <RefreshCw size={14} className={cn(state.loading && 'animate-spin')} />
+          </button>
+        )}
+        {scope === 'global' && (
+          <button
+            type="button"
+            onClick={() => setClearAllOpen(true)}
+            disabled={!onClearGlobalHistory}
+            title={t('history.action.clearAll')}
+            aria-label={t('history.action.clearAll')}
+            className="shrink-0 h-6 w-6 flex items-center justify-center rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-40 disabled:hover:text-muted-foreground disabled:hover:bg-transparent"
+          >
+            <Trash2 size={14} />
           </button>
         )}
       </div>
@@ -370,6 +394,7 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
           <VariableSizeVirtualList
             ref={listRef}
             items={listRows}
+            measureEnabled={isVisible}
             getItemHeight={getRowHeight}
             getItemKey={(row, index) =>
               row.type === 'entry' ? row.entry.id : `detail-${row.entry.id}-${index}`}
@@ -411,6 +436,16 @@ const HistorySidePanelInner: React.FC<HistorySidePanelProps> = ({
           />
         )}
       </div>
+
+      <ConfirmDialog
+        open={clearAllOpen}
+        onOpenChange={setClearAllOpen}
+        title={t('history.clearAll.dialog.title')}
+        message={t('history.clearAll.dialog.desc')}
+        confirmLabel={t('history.clearAll.dialog.confirm')}
+        destructive
+        onConfirm={handleClearAll}
+      />
     </div>
   );
 };

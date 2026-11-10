@@ -5,6 +5,12 @@ const path = require("node:path");
 const {
   appendData,
   hasStream,
+  hasSessionLog,
+  prepareSessionLog,
+  forgetSessionLog,
+  getSessionLogToken,
+  forgetInactiveSessionLog,
+  withSessionLogRestart,
   registerProgrammaticCommandLogRewrite,
   registerSudoAutofillInput,
   startStream,
@@ -708,9 +714,9 @@ test("txt stream timestamps complete lines without duplicating split chunks", as
   const directory = path.join(TEMP_ROOT, `stream-timestamps-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const times = [
-    new Date(2026, 0, 2, 3, 4, 5).getTime(),
-    new Date(2026, 0, 2, 3, 4, 6).getTime(),
-    new Date(2026, 0, 2, 3, 4, 7).getTime(),
+    new Date(2026, 0, 2, 3, 4, 5, 123).getTime(),
+    new Date(2026, 0, 2, 3, 4, 6, 456).getTime(),
+    new Date(2026, 0, 2, 3, 4, 7, 89).getTime(),
   ];
 
   try {
@@ -730,7 +736,7 @@ test("txt stream timestamps complete lines without duplicating split chunks", as
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:05] first line\n[2026-01-02 03:04:06] second line\n[2026-01-02 03:04:07] partial",
+      "[2026-01-02 03:04:06.456] first line\n[2026-01-02 03:04:06.456] second line\n[2026-01-02 03:04:06.456] partial",
     );
   } finally {
     await stopStream(sessionId);
@@ -758,7 +764,7 @@ test("txt stream timestamps rendered lines after carriage-return rewrites", asyn
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:05] docker denied",
+      "[2026-01-02 03:04:05.000] docker denied",
     );
   } finally {
     await stopStream(sessionId);
@@ -785,14 +791,14 @@ test("txt stream updates a line timestamp when a later snapshot rewrites that li
       timestampProvider: () => times.shift(),
     });
     appendData(sessionId, "old prompt");
-    await waitForFileContent(directory, "[2026-01-02 03:04:05] old prompt");
+    await waitForFileContent(directory, "[2026-01-02 03:04:05.000] old prompt");
     appendData(sessionId, "\rdocker denied");
 
     const filePath = await stopStream(sessionId);
 
     assert.equal(
       fs.readFileSync(filePath, "utf8"),
-      "[2026-01-02 03:04:06] docker denied",
+      "[2026-01-02 03:04:06.000] docker denied",
     );
   } finally {
     await stopStream(sessionId);
@@ -819,7 +825,7 @@ test("html stream includes line timestamps in rendered content", async () => {
     const filePath = await stopStream(sessionId);
     const html = fs.readFileSync(filePath, "utf8");
 
-    assert.match(html, /\[2026-01-02 03:04:05\] line/);
+    assert.match(html, /\[2026-01-02 03:04:05\.000\] line/);
   } finally {
     await stopStream(sessionId);
     fs.rmSync(directory, { recursive: true, force: true });
@@ -845,7 +851,7 @@ test("html stream timestamps rendered lines after carriage-return rewrites", asy
     const filePath = await stopStream(sessionId);
     const html = fs.readFileSync(filePath, "utf8");
 
-    assert.match(html, /\[2026-01-02 03:04:05\] docker denied/);
+    assert.match(html, /\[2026-01-02 03:04:05\.000\] docker denied/);
     assert.doesNotMatch(html, /old prompt/);
   } finally {
     await stopStream(sessionId);
@@ -903,4 +909,319 @@ function findFirstTxtFile(directory) {
     if (fileName) return path.join(hostDir, fileName);
   }
   return null;
+}
+
+for (const format of ["txt", "html"]) {
+  test(`${format} timestamps preserve arrival gaps inside one flush interval`, async () => {
+    const directory = path.join(TEMP_ROOT, `arrival-${format}-${Date.now()}`);
+    const sessionId = `arrival-${format}`;
+    let now = new Date(2026, 0, 2, 3, 4, 5, 89).getTime();
+    try {
+      startStream(sessionId, {
+        hostLabel: "host", directory, format, timestampsEnabled: true,
+        timestampProvider: () => now,
+      });
+      appendData(sessionId, "first\r\n");
+      now += 300;
+      appendData(sessionId, "second\r\n");
+      now += 100;
+      const filePath = await stopStream(sessionId);
+      const content = fs.readFileSync(filePath, "utf8");
+      assert.match(content, /\[2026-01-02 03:04:05\.089\] first/);
+      assert.match(content, /\[2026-01-02 03:04:05\.389\] second/);
+    } finally {
+      await stopStream(sessionId);
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const format of ["txt", "html", "raw"]) {
+  test(`prepare ${format} log flushes current output and leaves recording active`, async (t) => {
+    const directory = path.join(TEMP_ROOT, `prepare-${format}-${Date.now()}`);
+    const filePath = path.join(directory, `session.${format}`);
+    const sessionId = `prepare-${format}`;
+    t.after(async () => {
+      await stopStream(sessionId);
+      forgetSessionLog(sessionId);
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
+    startStreamToFile(sessionId, { filePath, format });
+    assert.equal(await prepareSessionLog(sessionId), filePath, "empty logs must exist before opening");
+    assert.equal(fs.statSync(filePath).isFile(), true);
+    appendData(sessionId, "first\r\n");
+    assert.equal(await prepareSessionLog(sessionId), filePath);
+    assert.match(fs.readFileSync(filePath, "utf8"), /first/);
+    assert.equal(hasStream(sessionId), true);
+    appendData(sessionId, "second\r\n");
+    await prepareSessionLog(sessionId);
+    assert.match(fs.readFileSync(filePath, "utf8"), /first[\s\S]*second/);
+    const stopping = stopStream(sessionId);
+    assert.equal(await prepareSessionLog(sessionId), filePath, "prepare waits for finalization");
+    assert.equal(await stopping, filePath);
+    assert.equal(hasStream(sessionId), false);
+    assert.equal(await prepareSessionLog(sessionId), filePath, "stopped logs remain accessible");
+    assert.equal(await prepareSessionLog(`${sessionId}-wrong`), null);
+    fs.unlinkSync(filePath);
+    await assert.rejects(prepareSessionLog(sessionId), /ENOENT/);
+  });
+}
+
+test("prepare raw log waits for the write callback, including already-queued writes", async (t) => {
+  const { Writable } = require("node:stream");
+  const directory = path.join(TEMP_ROOT, `prepare-raw-barrier-${Date.now()}`);
+  const filePath = path.join(directory, "session.log");
+  const sessionId = "prepare-raw-barrier";
+  let completedWrites = 0;
+  t.mock.method(fs, "createWriteStream", () => new Writable({
+    write(chunk, _encoding, callback) {
+      setTimeout(() => {
+        fs.appendFileSync(filePath, chunk);
+        completedWrites++;
+        callback();
+      }, 15);
+    },
+  }));
+  t.after(async () => {
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  startStreamToFile(sessionId, { filePath, format: "raw" });
+  appendData(sessionId, "x".repeat(64 * 1024));
+  const preparing = prepareSessionLog(sessionId);
+  assert.equal(completedWrites, 0);
+  assert.equal(await preparing, filePath);
+  assert.equal(completedWrites, 2, "data write and barrier callbacks must both complete");
+  assert.equal(fs.readFileSync(filePath, "utf8").length, 64 * 1024);
+});
+
+test("prepare reports snapshot failures promptly and background writes keep retrying", async (t) => {
+  const directory = path.join(TEMP_ROOT, `prepare-error-${Date.now()}`);
+  const filePath = path.join(directory, "session.txt");
+  const sessionId = "prepare-snapshot-error";
+  const writeFile = fs.promises.writeFile.bind(fs.promises);
+  let fail = true;
+  let attempts = 0;
+  t.mock.method(fs.promises, "writeFile", async (...args) => {
+    if (args[0] === filePath) {
+      attempts++;
+      if (fail) throw new Error("disk full");
+    }
+    return writeFile(...args);
+  });
+  t.after(async () => {
+    fail = false;
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  startStreamToFile(sessionId, { filePath, format: "txt" });
+  appendData(sessionId, "not lost\n");
+  await assert.rejects(prepareSessionLog(sessionId), /disk full/);
+  const attemptsAtReport = attempts;
+  assert.ok(attemptsAtReport >= 1);
+  fail = false;
+  const started = Date.now();
+  while (!fs.existsSync(filePath) || !fs.readFileSync(filePath, "utf8").includes("not lost")) {
+    if (Date.now() - started > 2000) {
+      assert.fail(`snapshot retry did not persist the log (attempts=${attempts})`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(attempts > attemptsAtReport, "a failed snapshot write retries without another prepare");
+  assert.equal(await prepareSessionLog(sessionId), filePath);
+});
+
+test("persistent snapshot failures back off instead of retrying immediately", async (t) => {
+  const directory = path.join(TEMP_ROOT, `snapshot-backoff-${Date.now()}`);
+  const filePath = path.join(directory, "session.txt");
+  const sessionId = "snapshot-backoff";
+  const writeFile = fs.promises.writeFile.bind(fs.promises);
+  let attempts = 0;
+  t.mock.method(fs.promises, "writeFile", async (...args) => {
+    if (args[0] === filePath) {
+      attempts++;
+      throw new Error("disk full");
+    }
+    return writeFile(...args);
+  });
+  t.after(async () => {
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  startStreamToFile(sessionId, { filePath, format: "txt" });
+  appendData(sessionId, "x".repeat(64 * 1024));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(attempts, 1, "a failed snapshot must not retry in a tight loop");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(attempts, 2, "the first retry waits for the backoff delay");
+});
+
+test("finalize ends a raw write stream that a synchronous flush already disabled", async (t) => {
+  const directory = path.join(TEMP_ROOT, `finalize-disabled-${Date.now()}`);
+  const filePath = path.join(directory, "session.log");
+  const sessionId = "finalize-disabled-raw";
+  const stream = {
+    ended: false,
+    on() { return this; },
+    write() { throw new Error("flush failed"); },
+    end(callback) {
+      this.ended = true;
+      if (typeof callback === "function") callback();
+    },
+  };
+  t.mock.method(fs, "createWriteStream", () => stream);
+  t.after(async () => {
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const started = startStreamToFile(sessionId, { filePath, format: "raw" });
+  assert.equal(started.ok, true);
+  appendData(sessionId, "pending");
+  assert.equal(await stopStream(sessionId), null);
+  assert.equal(stream.ended, true);
+});
+
+test("prepare reports raw stream errors rather than opening an empty or stale file", async (t) => {
+  const directory = path.join(TEMP_ROOT, `prepare-raw-error-${Date.now()}`);
+  const filePath = path.join(directory, "directory.log");
+  const sessionId = "prepare-raw-error";
+  fs.mkdirSync(filePath, { recursive: true });
+  t.after(async () => {
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  startStreamToFile(sessionId, { filePath, format: "raw" });
+  appendData(sessionId, "data");
+  await assert.rejects(prepareSessionLog(sessionId), /EISDIR/);
+  assert.equal(await stopStream(sessionId), null);
+  await assert.rejects(prepareSessionLog(sessionId), /EISDIR/);
+});
+
+test("late finalization and stale tokens cannot replace a reconnected session's target", async (t) => {
+  const directory = path.join(TEMP_ROOT, `prepare-reconnect-${Date.now()}`);
+  const oldPath = path.join(directory, "old.txt");
+  const newPath = path.join(directory, "new.txt");
+  const sessionId = "prepare-reconnect";
+  const writeFile = fs.promises.writeFile.bind(fs.promises);
+  let releaseOldWrite;
+  const oldWriteGate = new Promise((resolve) => { releaseOldWrite = resolve; });
+  t.mock.method(fs.promises, "writeFile", async (...args) => {
+    if (args[0] === oldPath) await oldWriteGate;
+    return writeFile(...args);
+  });
+  t.after(async () => {
+    releaseOldWrite();
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const first = startStreamToFile(sessionId, { filePath: oldPath, format: "txt" });
+  appendData(sessionId, "old\n");
+  const stopping = stopStream(sessionId, first.token);
+  const stalePrepare = prepareSessionLog(sessionId);
+  const second = startStreamToFile(sessionId, { filePath: newPath, format: "txt" });
+  assert.equal(second.ok, true);
+  appendData(sessionId, "new\n");
+  releaseOldWrite();
+  await assert.rejects(stalePrepare, /changed/);
+  assert.equal(await stopping, oldPath);
+  assert.equal(await stopStream(sessionId, first.token), null);
+  assert.equal(await prepareSessionLog(sessionId), newPath);
+  await stopStream(sessionId, second.token);
+  assert.equal(await prepareSessionLog(sessionId), newPath);
+});
+
+test("forgetting a session prevents late finalization from restoring its old path", async (t) => {
+  const directory = path.join(TEMP_ROOT, `prepare-forget-${Date.now()}`);
+  const filePath = path.join(directory, "old.txt");
+  const sessionId = "prepare-forget";
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  startStreamToFile(sessionId, { filePath, format: "txt" });
+  appendData(sessionId, "old\n");
+  const stopping = stopStream(sessionId);
+  forgetSessionLog(sessionId);
+  await stopping;
+  assert.equal(hasSessionLog(sessionId), false);
+  assert.equal(await prepareSessionLog(sessionId), null);
+});
+
+test("conditional log invalidation clears only the observed inactive stream token", async (t) => {
+  const directory = path.join(TEMP_ROOT, `conditional-forget-${Date.now()}`);
+  const sessionId = "conditional-forget";
+  const oldPath = path.join(directory, "old.txt");
+  const newPath = path.join(directory, "new.txt");
+  t.after(async () => {
+    await stopStream(sessionId);
+    forgetSessionLog(sessionId);
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  assert.equal(getSessionLogToken(sessionId), null);
+  assert.equal(forgetInactiveSessionLog(sessionId, null), false);
+  const first = startStreamToFile(sessionId, { filePath: oldPath, format: "txt" });
+  assert.equal(getSessionLogToken(sessionId), first.token);
+  assert.equal(forgetInactiveSessionLog(sessionId, first.token), false, "active recording survives");
+  await stopStream(sessionId);
+  assert.equal(getSessionLogToken(sessionId), first.token, "finalization preserves record identity");
+  assert.equal(forgetInactiveSessionLog(sessionId, Symbol("wrong")), false);
+  assert.equal(forgetInactiveSessionLog(sessionId, first.token), true);
+  assert.equal(await prepareSessionLog(sessionId), null);
+  const second = startStreamToFile(sessionId, { filePath: newPath, format: "txt" });
+  assert.notEqual(second.token, first.token);
+  assert.equal(forgetInactiveSessionLog(sessionId, first.token), false);
+  await stopStream(sessionId);
+  assert.equal(forgetInactiveSessionLog(sessionId, first.token), false, "a new finalized log survives");
+  assert.equal(await prepareSessionLog(sessionId), newPath);
+});
+
+for (const outcome of ["success", "throw", "failure", "different-session", "new-active", "new-finalized", "manual"]) {
+  test(`fallback restart wrapper preserves the correct saved log (${outcome})`, async (t) => {
+    const directory = path.join(TEMP_ROOT, `fallback-${outcome}-${Date.now()}`);
+    const sessionId = `fallback-${outcome}`;
+    const oldPath = path.join(directory, "old.txt");
+    const newPath = path.join(directory, "new.txt");
+    const event = { sender: { id: 9 } };
+    const payload = { sessionId, sessionLog: { enabled: false } };
+    t.after(async () => {
+      await stopStream(sessionId, getSessionLogToken(sessionId));
+      forgetSessionLog(sessionId);
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
+    startStreamToFile(sessionId, { filePath: oldPath, format: "txt", stopRequiresToken: outcome === "manual" });
+    appendData(sessionId, "previous output\n");
+    if (outcome !== "manual") await stopStream(sessionId);
+    const previousToken = getSessionLogToken(sessionId);
+    const start = withSessionLogRestart(async (receivedEvent, receivedPayload) => {
+      assert.equal(receivedEvent, event);
+      assert.equal(receivedPayload, payload);
+      assert.equal(await prepareSessionLog(sessionId), oldPath, "pending starts retain the old target");
+      if (outcome === "throw") throw new Error("authentication failed");
+      if (outcome === "failure") return { sessionId, success: false, error: "connection refused" };
+      if (outcome === "different-session") return { sessionId: "different" };
+      if (outcome.startsWith("new-")) {
+        startStreamToFile(sessionId, { filePath: newPath, format: "txt" });
+        appendData(sessionId, "new output\n");
+        if (outcome === "new-finalized") await stopStream(sessionId);
+      }
+      return { sessionId };
+    });
+    if (outcome === "throw") await assert.rejects(start(event, payload), /authentication failed/);
+    else {
+      const result = await start(event, payload);
+      assert.equal(result.sessionId, outcome === "different-session" ? "different" : sessionId);
+    }
+    if (outcome === "success") {
+      assert.equal(await prepareSessionLog(sessionId), null);
+    } else {
+      const newLog = outcome.startsWith("new-");
+      assert.equal(await prepareSessionLog(sessionId), newLog ? newPath : oldPath);
+      if (newLog) assert.notEqual(getSessionLogToken(sessionId), previousToken);
+      else assert.equal(getSessionLogToken(sessionId), previousToken);
+      assert.equal(hasStream(sessionId), outcome === "manual" || outcome === "new-active");
+    }
+  });
 }

@@ -21,6 +21,12 @@ export const isQuickConnectIdentityUsable = (
   return Boolean(identity.keyId && keys.some((key) => key.id === identity.keyId));
 };
 
+export const isQuickConnectIdentityCompatible = (
+  identity: Identity,
+  target: QuickConnectTarget,
+): boolean => !target.isJumpServerLogin
+  || identity.username === target.username;
+
 type BuildQuickConnectHostInput = {
   id: string;
   createdAt: number;
@@ -62,6 +68,7 @@ export const buildQuickConnectHost = ({
     os: "linux",
     protocol: protocol === "mosh" || protocol === "et" ? "ssh" : protocol,
     authMethod,
+    sshInputCompatibility: false,
     identityId: applicableIdentityId,
     password: !applicableIdentityId && authMethod === "password" ? password : undefined,
     identityFileId:

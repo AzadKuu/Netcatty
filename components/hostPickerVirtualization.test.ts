@@ -34,13 +34,9 @@ test('SelectHostPanelContent virtualizes with listbox keyboard model', () => {
   assert.match(source, /navigableIndexByKey/);
   assert.match(source, /navigableIndexByKey\.get\(row\.key\)/);
   assert.doesNotMatch(source, /navigable\.findIndex/);
-  // Selected hosts must still show the keyboard active ring.
-  assert.match(source, /isSelected \? 'bg-muted' : isActive \? 'bg-primary\/10' : 'hover:bg-muted\/70'/);
-  assert.match(source, /isActive && 'ring-1 ring-primary\/40'/);
-  assert.doesNotMatch(
-    source,
-    /isSelected \? 'bg-muted' : isActive \? 'bg-primary\/10 ring-1 ring-primary\/40'/,
-  );
+  // The keyboard cursor stays visible on selected hosts through background alone.
+  assert.match(source, /isActive \? 'bg-primary\/10' : isSelected \? 'bg-muted' : 'hover:bg-muted\/70'/);
+  assert.doesNotMatch(source, /ring-1 ring-primary\/40/);
   assert.doesNotMatch(source, /filteredHosts\.map\(\(host\) =>/);
   // One listbox tab stop — not per-host tabIndex under virtualization.
   assert.match(source, /role="listbox"[\s\S]*tabIndex=\{0\}/);
@@ -83,6 +79,7 @@ test('AddToWorkspaceDialog virtualizes and clamps selection on shrink', () => {
   const source = read('workspace/AddToWorkspaceDialog.tsx');
   assert.match(source, /VariableSizeVirtualList/);
   assert.match(source, /data-host-picker-virtual="add-workspace"/);
+  assert.match(source, /matchesWorkspaceHostPickerQuery/);
   assert.match(source, /clampListIndex\(prev, items\.length\)/);
   assert.match(source, /onClick=\{\(\) => handleTargetClick\(idx, LOCAL_ITEM_ID\)\}/);
   assert.match(source, /onClick=\{\(\) => handleTargetClick\(idx, host\.id\)\}/);
@@ -96,6 +93,7 @@ test('CreateWorkspaceDialog virtualizes selectable hosts', () => {
   const source = read('CreateWorkspaceDialog.tsx');
   assert.match(source, /FixedSizeVirtualList/);
   assert.match(source, /data-host-picker-virtual="create-workspace"/);
+  assert.match(source, /matchesWorkspaceHostPickerQuery/);
   assert.doesNotMatch(source, /filteredHosts\.map\(host =>/);
 });
 

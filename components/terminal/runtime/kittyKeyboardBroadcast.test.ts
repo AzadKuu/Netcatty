@@ -541,7 +541,7 @@ test("Shift+Enter broadcast uses CSI-u only after the target negotiated a preser
     applicationCursorMode: false,
     encodedKeys: new Set<string>(),
   }), {
-    data: "\n",
+    data: "\u001b\r",
     kittyEncoded: false,
     urgentInterrupt: false,
   });
@@ -552,7 +552,7 @@ test("Shift+Enter broadcast uses CSI-u only after the target negotiated a preser
     applicationCursorMode: false,
     encodedKeys: new Set<string>(),
   }), {
-    data: "\n",
+    data: "\u001b\r",
     kittyEncoded: false,
     urgentInterrupt: false,
   });
@@ -569,6 +569,126 @@ test("Shift+Enter broadcast uses CSI-u only after the target negotiated a preser
     kittyEncoded: true,
     urgentInterrupt: false,
   });
+});
+
+test("native kitty broadcast targets keep Shift+Enter as CSI-u when custom kitty is off", () => {
+  const shiftEnter = {
+    kind: "key" as const,
+    fallbackToLegacy: true,
+    event: {
+      type: "keydown" as const,
+      key: "Enter",
+      code: "Enter",
+      shiftKey: true,
+    },
+  };
+  const encodedKeys = new Set<string>();
+  const legacySuppressedKeys = new Set<string>();
+  const base = {
+    kittyProtocolEnabled: false,
+    kittyMode: createKittyKeyboardModeState(),
+    applicationCursorMode: false,
+    shiftEnterSettings: {
+      shiftEnterNewlineEnabled: true,
+      shiftEnterNewlineText: "\\e\\r",
+    },
+  };
+
+  assert.deepEqual(resolveKittyKeyboardBroadcastInput(shiftEnter, {
+    ...base,
+    encodedKeys,
+    legacySuppressedKeys,
+    nativeKittyPreservesShiftEnter: true,
+  }), {
+    data: SHIFT_ENTER_CSI_U_SEQUENCE,
+    kittyEncoded: true,
+    urgentInterrupt: false,
+  });
+  assert.equal(resolveKittyKeyboardBroadcastInput({
+    kind: "legacy",
+    data: SHIFT_ENTER_CSI_U_SEQUENCE,
+    keyIdentity: "Enter",
+  }, {
+    ...base,
+    encodedKeys,
+    legacySuppressedKeys,
+    nativeKittyPreservesShiftEnter: true,
+  }), null);
+
+  assert.deepEqual(resolveKittyKeyboardBroadcastInput(shiftEnter, {
+    ...base,
+    encodedKeys: new Set<string>(),
+    nativeKittyPreservesShiftEnter: false,
+  }), {
+    data: "\u001b\r",
+    kittyEncoded: false,
+    urgentInterrupt: false,
+  });
+});
+
+test("Win32 broadcast targets resolve Shift+Enter from their own force-text setting", () => {
+  const shiftEnterRecord = "\u001b[13;28;13;1;16;1_";
+  const press = { type: "keydown" as const, key: "Enter", code: "Enter", shiftKey: true };
+  const release = { ...press, type: "keyup" as const, shiftKey: false };
+  const targetOptions = (shiftEnterForceText: boolean) => ({
+    kittyProtocolEnabled: false,
+    kittyMode: createKittyKeyboardModeState(),
+    applicationCursorMode: false,
+    encodedKeys: new Set<string>(),
+    legacySuppressedKeys: new Set<string>(),
+    win32ShiftEnterTextKeys: new Set<string>(),
+    win32InputMode: true,
+    shiftEnterSettings: {
+      shiftEnterNewlineEnabled: true,
+      shiftEnterNewlineText: "\\e\\r",
+      shiftEnterForceText,
+    },
+  });
+  const configuredText = {
+    data: "\u001b\r",
+    kittyEncoded: false,
+    urgentInterrupt: false,
+  };
+  // A forced source sends a normalized key chord; a source without the
+  // opt-out sends its native Win32 record. The target must not care which.
+  const sources = {
+    forcedSource: {
+      press: { kind: "key" as const, event: press, fallbackToLegacy: true },
+      release: { kind: "key" as const, event: release },
+    },
+    nativeSource: {
+      press: { kind: "win32" as const, data: shiftEnterRecord, fallbackToLegacy: true, event: press },
+      release: { kind: "win32" as const, data: "\u001b[13;28;13;0;0;1_", event: release },
+    },
+  };
+
+  for (const [name, source] of Object.entries(sources)) {
+    // Target opted in: configured text on press, and the paired release is
+    // consumed so ConPTY never sees a native key-up without its key-down.
+    const forcedTarget = targetOptions(true);
+    assert.deepEqual(
+      resolveKittyKeyboardBroadcastInput(source.press, forcedTarget),
+      configuredText,
+      name,
+    );
+    assert.equal(resolveKittyKeyboardBroadcastInput(source.release, forcedTarget), null, name);
+    assert.equal(forcedTarget.encodedKeys.size, 0, name);
+    assert.equal(forcedTarget.legacySuppressedKeys.size, 0, name);
+    assert.equal(forcedTarget.win32ShiftEnterTextKeys.size, 0, name);
+    // A later unrelated Enter release is not swallowed by stale state.
+    const plainEnter = { ...press, shiftKey: false };
+    assert.ok(resolveKittyKeyboardBroadcastInput({ ...source.press, event: plainEnter }, forcedTarget));
+    assert.ok(resolveKittyKeyboardBroadcastInput(source.release, forcedTarget), name);
+
+    // Target without the opt-out keeps the native press/release pair even
+    // when the source forced its own text.
+    const nativeTarget = targetOptions(false);
+    const nativePress = resolveKittyKeyboardBroadcastInput(source.press, nativeTarget);
+    assert.ok(nativePress && nativePress.data !== configuredText.data, name);
+    const nativeRelease = resolveKittyKeyboardBroadcastInput(source.release, nativeTarget);
+    assert.ok(nativeRelease, name);
+    assert.equal(nativeTarget.encodedKeys.size, 0, name);
+  }
 });
 
 test("Win32 input broadcast preserves native records for Win32 targets", () => {
@@ -1020,4 +1140,217 @@ test("a key pressed while disconnected cannot produce an orphan release after re
     event: { type: "keyup", key: "a", code: "KeyA" },
   });
   assert.deepEqual(writes, []);
+});
+
+test("a dedicated keyIdentity pairs the interrupt press with its release (#3409)", () => {
+  const options = () => {
+    // Disambiguate + event-type flags so Ctrl+C press/release encode as CSI-u.
+    const mode = createKittyKeyboardModeState();
+    setKittyKeyboardModeFlags(mode, 1 | 2);
+    return {
+      kittyProtocolEnabled: true,
+      kittyMode: mode,
+      applicationCursorMode: false,
+      encodedKeys: new Set<string>(),
+      legacySuppressedKeys: new Set<string>(),
+    };
+  };
+
+  // A Command+Period interrupt is normalized to a Ctrl+C event but paired under a
+  // dedicated identity, so it must not collapse with an outstanding physical
+  // KeyC press on the peer: the press, the legacy suppression and the release
+  // all use the propagated identity, while the physical KeyC state survives.
+  const pressOptions = options();
+  const interruptPress = resolveKittyKeyboardBroadcastInput({
+    kind: "key",
+    event: { type: "keydown", key: "c", code: "KeyC", ctrlKey: true },
+    keyIdentity: "KeyC mac-period-interrupt",
+    urgentInterrupt: true,
+  }, pressOptions);
+  assert.equal(interruptPress?.data, "\x1b[99;5u");
+  assert.ok(pressOptions.encodedKeys.has("KeyC mac-period-interrupt"));
+  assert.ok(pressOptions.legacySuppressedKeys.has("KeyC mac-period-interrupt"));
+
+  // The physical KeyC press keeps its own entry.
+  assert.equal(pressOptions.encodedKeys.has("KeyC"), false);
+
+  // The legacy \x03 fan-out under the dedicated identity is suppressed on a
+  // Kitty peer (already encoded) but delivered on a legacy peer.
+  assert.equal(resolveKittyKeyboardBroadcastInput({
+    kind: "legacy",
+    data: "\x03",
+    keyIdentity: "KeyC mac-period-interrupt",
+    urgentInterrupt: true,
+  }, pressOptions), null);
+
+  const legacyPeerOptions = options();
+  const legacyInterrupt = resolveKittyKeyboardBroadcastInput({
+    kind: "legacy",
+    data: "\x03",
+    keyIdentity: "KeyC mac-period-interrupt",
+    urgentInterrupt: true,
+  }, legacyPeerOptions);
+  assert.equal(legacyInterrupt?.data, "\x03");
+  assert.equal(legacyInterrupt?.urgentInterrupt, true);
+
+  // The release pairs under the dedicated identity, leaving the physical
+  // KeyC press entry intact for its own keyup.
+  const releaseOptions = options();
+  releaseOptions.encodedKeys.add("KeyC mac-period-interrupt");
+  releaseOptions.encodedKeys.add("KeyC");
+  releaseOptions.legacySuppressedKeys.add("KeyC");
+  const interruptRelease = resolveKittyKeyboardBroadcastInput({
+    kind: "key",
+    event: { type: "keyup", key: "c", code: "KeyC", ctrlKey: true },
+    keyIdentity: "KeyC mac-period-interrupt",
+  }, releaseOptions);
+  assert.equal(interruptRelease?.data, "\x1b[99;5:3u");
+  assert.ok(releaseOptions.encodedKeys.has("KeyC"));
+  assert.equal(releaseOptions.encodedKeys.has("KeyC mac-period-interrupt"), false);
+
+  // Without an explicit identity, pairing still keys from the event code.
+  const defaultOptions = options();
+  defaultOptions.encodedKeys.add("KeyA");
+  const defaultRelease = resolveKittyKeyboardBroadcastInput({
+    kind: "key",
+    event: { type: "keyup", key: "a", code: "KeyA" },
+  }, defaultOptions);
+  assert.equal(defaultRelease?.data, "\x1b[97;1:3u");
+  assert.equal(defaultOptions.encodedKeys.has("KeyA"), false);
+});
+
+test("a bypassed password-prompt source tags Kitty broadcasts as sourceSensitive", () => {
+  const dispatched: Array<{
+    kittyKeyboardInput?: KittyKeyboardBroadcastInput;
+    sourceSensitive?: boolean;
+  }> = [];
+  const forward = createKittyKeyboardBroadcastForwarder({
+    sourceSessionId: "source",
+    isHandlingBroadcast: () => false,
+    isBroadcastEnabled: () => true,
+    // #3488 bypass: the sensitive-prompt pause is lifted, but the source still
+    // tags the dispatch so peers keep input interceptors skipped.
+    isSensitiveInput: () => false,
+    isSensitivePromptSource: () => true,
+    getDispatcher: () => (_data, _sourceSessionId, dispatchOptions) => {
+      dispatched.push(dispatchOptions);
+      return ["target-a"];
+    },
+  });
+  const press: KittyKeyboardBroadcastInput = {
+    kind: "key",
+    event: { type: "keydown", key: "x", code: "KeyX" },
+  };
+
+  assert.deepEqual(forward(press), { targetSessionIds: ["target-a"] });
+  assert.deepEqual(dispatched, [
+    { kittyKeyboardInput: press, sourceSensitive: true },
+  ]);
+});
+
+test("a pre-write sensitivity snapshot tags the Kitty dispatch as sourceSensitive", () => {
+  const dispatched: Array<{
+    kittyKeyboardInput?: KittyKeyboardBroadcastInput;
+    sourceSensitive?: boolean;
+  }> = [];
+  const forward = createKittyKeyboardBroadcastForwarder({
+    sourceSessionId: "source",
+    isHandlingBroadcast: () => false,
+    isBroadcastEnabled: () => true,
+    isSensitiveInput: () => false,
+    // #3491: the source's local Enter submission already cleared the live
+    // prompt flag before this dispatch runs, so the live check reports
+    // nonsensitive and only the pre-write snapshot can restore the tag.
+    isSensitivePromptSource: () => false,
+    getDispatcher: () => (_data, _sourceSessionId, dispatchOptions) => {
+      dispatched.push(dispatchOptions);
+      return ["target-a"];
+    },
+  });
+  const enter: KittyKeyboardBroadcastInput = {
+    kind: "key",
+    event: { type: "keydown", key: "Enter", code: "Enter" },
+  };
+
+  // Snapshot taken before the local write says the source sat at a prompt.
+  assert.deepEqual(
+    forward(enter, false, undefined, { sourceSensitive: true }),
+    { targetSessionIds: ["target-a"] },
+  );
+  // Without a snapshot the dispatch stays nonsensitive (live flag is false).
+  forward(enter);
+  assert.deepEqual(dispatched, [
+    { kittyKeyboardInput: enter, sourceSensitive: true },
+    { kittyKeyboardInput: enter },
+  ]);
+});
+
+test("a source-sensitive Kitty dispatch forces sensitive peer writes", () => {
+  const mode = createKittyKeyboardModeState();
+  const activeWrites: Array<{ data: string; sensitive?: boolean }> = [];
+  const handler = createKittyKeyboardBroadcastHandler({
+    resolveOptions: () => ({
+      kittyProtocolEnabled: false,
+      kittyMode: mode,
+      applicationCursorMode: false,
+      encodedKeys: new Set<string>(),
+    }),
+    getSessionId: () => "peer-session",
+    // The peer has not classified its own prompt as sensitive.
+    isSensitiveInput: () => false,
+    isConnected: () => true,
+    isRuntimeDisposed: () => false,
+    writeDisposed: () => {},
+    writeActive: (data, _logicalData, writeOptions) => {
+      activeWrites.push({ data, sensitive: writeOptions?.sensitive === true });
+    },
+  });
+
+  handler({ kind: "text", text: "secret" });
+  assert.deepEqual(activeWrites, [{ data: "secret", sensitive: false }]);
+
+  handler({ kind: "text", text: "secret" }, { sourceSensitive: true });
+  assert.deepEqual(activeWrites, [
+    { data: "secret", sensitive: false },
+    { data: "secret", sensitive: true },
+  ]);
+});
+
+test("a source-sensitive dispatch forces sensitive Win32 peer writes", () => {
+  const encodedKeys = new Set<string>();
+  const win32Writes: Array<{ type?: string; sensitive?: boolean }> = [];
+  const handler = createKittyKeyboardBroadcastHandler({
+    resolveOptions: () => ({
+      kittyProtocolEnabled: false,
+      kittyMode: createKittyKeyboardModeState(),
+      applicationCursorMode: false,
+      encodedKeys,
+      win32InputMode: true,
+    }),
+    getSessionId: () => "win32-peer",
+    // The peer has not classified its own prompt as sensitive.
+    isSensitiveInput: () => false,
+    isConnected: () => true,
+    isRuntimeDisposed: () => false,
+    writeDisposed: () => {},
+    writeActive: () => {},
+    writeWin32Event: (event, _logicalData, writeOptions) => {
+      win32Writes.push({
+        type: event.type,
+        sensitive: writeOptions?.sensitive === true,
+      });
+    },
+  });
+
+  handler({ kind: "key", event: { type: "keydown", key: "Enter", code: "Enter", shiftKey: true } });
+  assert.deepEqual(win32Writes, [{ type: "keydown", sensitive: false }]);
+
+  handler(
+    { kind: "key", event: { type: "keydown", key: "Enter", code: "Enter", shiftKey: true } },
+    { sourceSensitive: true },
+  );
+  assert.deepEqual(win32Writes, [
+    { type: "keydown", sensitive: false },
+    { type: "keydown", sensitive: true },
+  ]);
 });

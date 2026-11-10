@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { GroupConfig, Host, ProxyProfile, TerminalSession } from "./models";
 import {
+  resolveEffectiveTerminalHost,
   resolveTerminalChainHosts,
   resolveTerminalSessionHost,
 } from "./terminalHostResolution";
@@ -82,6 +83,45 @@ test("resolveTerminalSessionHost applies group default proxy profiles before ope
 
   assert.equal(resolved.proxyProfileId, "proxy-1");
   assert.deepEqual(resolved.proxyConfig, proxyProfiles[0].config);
+});
+
+test("resolveEffectiveTerminalHost applies the nearest group X11 default on the connect path", () => {
+  const host: Host = {
+    id: "target",
+    label: "Target",
+    hostname: "target.example.test",
+    username: "alice",
+    port: 22,
+    protocol: "ssh",
+    tags: [],
+    os: "linux",
+    group: "prod/web",
+  };
+  const groupConfigs: GroupConfig[] = [
+    { path: "prod", x11Forwarding: true },
+    { path: "prod/edge", x11Forwarding: false },
+  ];
+
+  assert.equal(
+    resolveEffectiveTerminalHost({ host, groupConfigs, proxyProfiles: [] }).x11Forwarding,
+    true,
+  );
+  assert.equal(
+    resolveEffectiveTerminalHost({
+      host: { ...host, x11Forwarding: false },
+      groupConfigs,
+      proxyProfiles: [],
+    }).x11Forwarding,
+    false,
+  );
+  assert.equal(
+    resolveEffectiveTerminalHost({
+      host: { ...host, group: "prod/edge/api" },
+      groupConfigs,
+      proxyProfiles: [],
+    }).x11Forwarding,
+    false,
+  );
 });
 
 test("resolveTerminalSessionHost defaults missing saved remote sessions to SSH", () => {
@@ -171,6 +211,79 @@ test("resolveTerminalSessionHost keeps the session plugin configuration when the
     providerId,
     configuration: { endpoint: "session.example" },
   });
+});
+
+test("resolveTerminalSessionHost preserves the session local-shell snapshot over an edited Vault host", () => {
+  const host: Host = {
+    id: "target",
+    label: "Edited PowerShell",
+    hostname: "localhost",
+    username: "local",
+    protocol: "local",
+    tags: [],
+    os: "windows",
+    localShell: "powershell.exe",
+    localShellArgs: ["-NoLogo"],
+    localShellName: "PowerShell",
+    localShellIcon: "powershell",
+    localStartDir: "C:/edited",
+  };
+
+  const resolved = resolveTerminalSessionHost({
+    session: {
+      ...baseSession,
+      hostname: "localhost",
+      username: "local",
+      port: undefined,
+      protocol: "local",
+      localShell: "cmd.exe",
+      localShellArgs: [],
+      localShellName: "Command Prompt",
+      localShellIcon: "cmd",
+      localStartDir: "C:/project",
+    },
+    hosts: [host],
+    groupConfigs: [],
+    proxyProfiles,
+    localOs: "windows",
+  });
+
+  assert.equal(resolved.localShell, "cmd.exe");
+  assert.deepEqual(resolved.localShellArgs, []);
+  assert.equal(resolved.localShellName, "Command Prompt");
+  assert.equal(resolved.localShellIcon, "cmd");
+  assert.equal(resolved.localStartDir, "C:/project");
+});
+
+test("resolveTerminalSessionHost falls back to the saved local shell when the session has no snapshot", () => {
+  const host: Host = {
+    id: "target",
+    label: "Local Shell",
+    hostname: "localhost",
+    username: "local",
+    protocol: "local",
+    tags: [],
+    os: "windows",
+    localShell: "powershell.exe",
+    localShellName: "PowerShell",
+  };
+
+  const resolved = resolveTerminalSessionHost({
+    session: {
+      ...baseSession,
+      hostname: "localhost",
+      username: "local",
+      port: undefined,
+      protocol: "local",
+    },
+    hosts: [host],
+    groupConfigs: [],
+    proxyProfiles,
+    localOs: "windows",
+  });
+
+  assert.equal(resolved.localShell, "powershell.exe");
+  assert.equal(resolved.localShellName, "PowerShell");
 });
 
 test("resolveTerminalSessionHost carries local session start directory into fallback host", () => {
@@ -487,4 +600,91 @@ test("resolveTerminalChainHosts applies group default proxy profiles to jump hos
   assert.equal(resolved[0]?.id, "jump-1");
   assert.equal(resolved[0]?.proxyProfileId, "proxy-1");
   assert.deepEqual(resolved[0]?.proxyConfig, proxyProfiles[0].config);
+});
+
+test("resolveTerminalChainHosts skips non-SSH jump candidates", () => {
+  const target: Host = {
+    id: "target",
+    label: "Target",
+    hostname: "target.example.test",
+    username: "alice",
+    port: 22,
+    protocol: "ssh",
+    tags: [],
+    os: "linux",
+    hostChain: { hostIds: ["jump-local", "jump-serial", "jump-telnet", "jump-ssh", "jump-mosh"] },
+  };
+  const localHost: Host = {
+    id: "jump-local",
+    label: "Local Shell",
+    hostname: "localhost",
+    username: "",
+    port: 22,
+    protocol: "local",
+    tags: [],
+    os: "linux",
+  };
+  const serialHost: Host = {
+    id: "jump-serial",
+    label: "Serial",
+    hostname: "/dev/ttyUSB0",
+    username: "",
+    port: 22,
+    protocol: "serial",
+    tags: [],
+    os: "linux",
+  };
+  const telnetHost: Host = {
+    id: "jump-telnet",
+    label: "Telnet",
+    hostname: "telnet.example.test",
+    username: "bob",
+    port: 23,
+    protocol: "telnet",
+    tags: [],
+    os: "linux",
+  };
+  const sshHost: Host = {
+    id: "jump-ssh",
+    label: "Jump SSH",
+    hostname: "jump.example.test",
+    username: "jump",
+    port: 22,
+    protocol: "ssh",
+    tags: [],
+    os: "linux",
+  };
+  const moshHost: Host = {
+    id: "jump-mosh",
+    label: "Jump Mosh",
+    hostname: "mosh.example.test",
+    username: "jump",
+    port: 22,
+    protocol: "ssh",
+    moshEnabled: true,
+    tags: [],
+    os: "linux",
+  };
+
+  const resolved = resolveTerminalChainHosts({
+    host: target,
+    hosts: [target, localHost, serialHost, telnetHost, sshHost, moshHost],
+    groupConfigs: [],
+    proxyProfiles,
+  });
+
+  assert.deepEqual(resolved.map((host) => host.id), ["jump-ssh", "jump-mosh"]);
+});
+
+
+test("input compatibility belongs to the terminal endpoint, independently of SSH jump hops", () => {
+  const target: Host = { id: "target", label: "Target", hostname: "target.example.test", username: "alice",
+    protocol: "ssh", tags: [], os: "linux", sshInputCompatibility: false, hostChain: { hostIds: ["bastion"] } };
+  const bastion: Host = { ...target, id: "bastion", hostChain: undefined, sshInputCompatibility: true };
+  const resolve = (hostId: string) => resolveTerminalSessionHost({
+    session: { ...baseSession, hostId }, hosts: [target, bastion], groupConfigs: [], proxyProfiles: [], localOs: "linux",
+  });
+  assert.equal(resolve("target").sshInputCompatibility, false);
+  assert.equal(resolve("bastion").sshInputCompatibility, true);
+  assert.equal(resolveTerminalChainHosts({ host: target, hosts: [target, bastion], groupConfigs: [], proxyProfiles: [] })[0].sshInputCompatibility, true);
 });

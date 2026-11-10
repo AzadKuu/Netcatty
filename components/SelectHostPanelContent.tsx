@@ -1,3 +1,4 @@
+import { compareHostAddresses } from "../domain/hostAddressSort";
 import {
   Check,
   CheckSquare,
@@ -49,6 +50,7 @@ export interface SelectHostPanelContentProps {
   /** Preferred multi-select path for host/group toggles (selection resolves to host ids). */
   onSelectionChange?: (selectedHostIds: string[]) => void;
   onConfirm: () => void;
+  confirmDisabled?: boolean;
   onNewHost?: () => void;
   availableKeys?: SSHKey[];
   identities?: import('../domain/models').Identity[];
@@ -57,6 +59,8 @@ export interface SelectHostPanelContentProps {
   onSaveHost?: (host: Host) => void;
   onCreateGroup?: (groupPath: string) => void;
   onNewHostPanelOpenChange?: (open: boolean) => void;
+  /** Allow saved local-shell (CMD/PowerShell/...) hosts as targets, e.g. snippet/script runners. */
+  allowLocalHosts?: boolean;
   className?: string;
 }
 
@@ -76,6 +80,7 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
   onSelect,
   onSelectionChange,
   onConfirm,
+  confirmDisabled = false,
   onNewHost,
   availableKeys = [],
   identities = [],
@@ -84,6 +89,7 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
   onSaveHost,
   onCreateGroup,
   onNewHostPanelOpenChange,
+  allowLocalHosts = false,
   className,
 }) => {
   const { t } = useI18n();
@@ -105,9 +111,14 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
     onNewHostPanelOpenChange?.(showNewHostPanel);
   }, [onNewHostPanelOpenChange, showNewHostPanel]);
 
+  // This panel picks hosts for SSH-backed capabilities (tunnels, keychain
+  // key export targets); serial hosts have no SSH session to target and, by
+  // default, neither do local-shell hosts. Snippet/script target pickers pass
+  // `allowLocalHosts` because their domain treats every non-serial host
+  // (including saved CMD/PowerShell shells) as a runnable target.
   const selectableHosts = useMemo(
-    () => hosts.filter((host) => host.protocol !== 'serial'),
-    [hosts],
+    () => hosts.filter((host) => host.protocol !== 'serial' && (allowLocalHosts || host.protocol !== 'local')),
+    [hosts, allowLocalHosts],
   );
   const selectedHostIdSet = useMemo(
     () => new Set(selectedHostIds),
@@ -200,6 +211,8 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
 
     result = [...result].sort((a, b) => {
       switch (sortMode) {
+        case 'ip':
+          return compareHostAddresses(a.hostname, b.hostname) || a.label.localeCompare(b.label);
         case 'az':
           return a.label.localeCompare(b.label);
         case 'za':
@@ -418,7 +431,7 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
           data-active={isActive ? 'true' : undefined}
           className={cn(
             'flex h-full min-h-0 items-center gap-2.5 overflow-hidden rounded-lg px-2.5 transition-colors',
-            isActive ? 'bg-primary/10 ring-1 ring-primary/40' : 'hover:bg-muted/70',
+            isActive ? 'bg-primary/10' : 'hover:bg-muted/70',
           )}
           onClick={() => {
             if (navIndex >= 0) setActiveNavIndex(navIndex);
@@ -476,9 +489,7 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
         aria-label={t('selectHost.toggleHost', { name: host.label })}
         className={cn(
           'flex h-full min-h-0 cursor-pointer items-center gap-2.5 overflow-hidden rounded-lg px-2.5 transition-colors',
-          isSelected ? 'bg-muted' : isActive ? 'bg-primary/10' : 'hover:bg-muted/70',
-          // Keep keyboard cursor visible even when the host is already selected.
-          isActive && 'ring-1 ring-primary/40',
+          isActive ? 'bg-primary/10' : isSelected ? 'bg-muted' : 'hover:bg-muted/70',
         )}
         onClick={() => {
           if (navIndex >= 0) setActiveNavIndex(navIndex);
@@ -634,7 +645,7 @@ export const SelectHostPanelContent: React.FC<SelectHostPanelContentProps> = ({
         <div className="px-4 py-3 border-t border-border/60 shrink-0">
           <Button
             className="w-full"
-            disabled={selectedHostIds.length === 0}
+            disabled={confirmDisabled || selectedHostIds.length === 0}
             onClick={onConfirm}
           >
             {multiSelect

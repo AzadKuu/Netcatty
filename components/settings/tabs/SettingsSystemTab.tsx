@@ -47,6 +47,8 @@ interface TempDirInfo {
   path: string;
   fileCount: number;
   totalSize: number;
+  isCustom: boolean;
+  defaultPath: string;
 }
 
 interface SshDebugLogInfo {
@@ -121,6 +123,8 @@ interface SettingsSystemTabProps {
   setToggleWindowHotkey: (hotkey: string) => void;
   closeToTray: boolean;
   setCloseToTray: (enabled: boolean) => void;
+  showTrayIcon: boolean;
+  setShowTrayIcon: (enabled: boolean) => void;
   autoLaunchEnabled: boolean;
   setAutoLaunchEnabled: (enabled: boolean) => void;
   autoLaunchSupported: boolean;
@@ -173,6 +177,8 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   setToggleWindowHotkey,
   closeToTray,
   setCloseToTray,
+  showTrayIcon,
+  setShowTrayIcon,
   autoLaunchEnabled,
   setAutoLaunchEnabled,
   autoLaunchSupported,
@@ -192,6 +198,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   const { t } = useI18n();
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
+  const [tempDirInput, setTempDirInput] = useState("");
+  const [tempDirError, setTempDirError] = useState("");
+  const [tempDirBusy, setTempDirBusy] = useState(false);
   const [tempDirInfo, setTempDirInfo] = useState<TempDirInfo | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
@@ -231,6 +240,8 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     try {
       const info = await bridge.getTempDirInfo();
       setTempDirInfo(info);
+      if (info?.isCustom && info.path) setTempDirInput(info.path);
+      else if (info && !info.isCustom) setTempDirInput("");
     } catch (err) {
       console.error("[SettingsSystemTab] Failed to get temp dir info:", err);
     } finally {
@@ -358,6 +369,37 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
       setIsClearing(false);
     }
   }, [loadTempDirInfo]);
+
+  const applyTempDir = useCallback(async (dir: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.setCustomTempDir) return;
+    setTempDirBusy(true);
+    setTempDirError("");
+    try {
+      const result = await bridge.setCustomTempDir(dir);
+      if (!result.ok) setTempDirError(result.error || t("settings.system.tempDirError"));
+      else { setTempDirInput(result.path || dir); await loadTempDirInfo(); }
+    } catch { setTempDirError(t("settings.system.tempDirError")); }
+    finally { setTempDirBusy(false); }
+  }, [loadTempDirInfo, t]);
+
+  const chooseTempDir = useCallback(async () => {
+    try {
+      const dir = await netcattyBridge.get()?.chooseTempDir?.();
+      if (dir) { setTempDirInput(dir); await applyTempDir(dir); }
+    } catch { setTempDirError(t("settings.system.tempDirError")); }
+  }, [applyTempDir, t]);
+
+  const resetTempDir = useCallback(async () => {
+    setTempDirBusy(true);
+    setTempDirError("");
+    try {
+      const result = await netcattyBridge.get()?.resetCustomTempDir?.();
+      if (!result?.ok) setTempDirError(result?.error || t("settings.system.tempDirError"));
+      else { setTempDirInput(""); await loadTempDirInfo(); }
+    } catch { setTempDirError(t("settings.system.tempDirError")); }
+    finally { setTempDirBusy(false); }
+  }, [loadTempDirInfo, t]);
 
   const handleOpenTempDir = useCallback(async () => {
     const bridge = netcattyBridge.get();
@@ -921,6 +963,18 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                 </Tooltip>
               </div>
 
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" onClick={chooseTempDir} disabled={tempDirBusy}>{t("settings.system.tempDirChoose")}</Button>
+                  {tempDirInfo?.isCustom && <Button variant="outline" size="sm" onClick={resetTempDir} disabled={tempDirBusy}>{t("settings.system.tempDirReset")}</Button>}
+                </div>
+                <div className="flex gap-2">
+                  <input className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-1 text-sm" aria-label={t("settings.system.tempDirManual")} placeholder={t("settings.system.tempDirManual")} value={tempDirInput} onChange={e => setTempDirInput(e.target.value)} />
+                  <Button variant="outline" size="sm" onClick={() => applyTempDir(tempDirInput)} disabled={tempDirBusy}>{t("settings.system.tempDirApply")}</Button>
+                </div>
+                {tempDirError && <p role="alert" className="text-sm text-destructive">{t("settings.system.tempDirError")} {tempDirError}</p>}
+              </div>
+
               {/* Stats */}
               <div className="flex items-center gap-6 text-sm">
                 <div>
@@ -1313,6 +1367,23 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   onChange={setCloseToTray}
                 />
               </SettingRow>
+
+              {/* Show System Tray Icon */}
+              <SettingRow
+                anchorId="system-show-tray-icon"
+                label={t("settings.globalHotkey.showTrayIcon")}
+                description={t("settings.globalHotkey.showTrayIconDesc")}
+              >
+                <Toggle
+                  checked={showTrayIcon}
+                  onChange={setShowTrayIcon}
+                />
+              </SettingRow>
+              {!showTrayIcon && (
+                <p className="text-sm text-muted-foreground">
+                  {t("settings.globalHotkey.showTrayIconHiddenHint")}
+                </p>
+              )}
             </SettingCard>
 
             <SettingHint>

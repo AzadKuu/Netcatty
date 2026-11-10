@@ -1,3 +1,6 @@
+import { detectVendorFromSshVersion } from './sshServerVendor.mjs';
+export { detectVendorFromSshVersion } from './sshServerVendor.mjs';
+import { remoteSoftwareRequiresSingleChannel } from './singleChannelSshBanner.shared.mjs';
 import { Host, Snippet, TerminalSettings } from './models';
 import type { HostOperatingSystem, HostOsSelection } from './models/connection';
 import { sanitizeHostIconFields } from './hostIcon';
@@ -151,55 +154,7 @@ export const normalizeDistroId = (value?: string) => {
  * Arista EOS, all of which either are POSIX systems or present as
  * plain `OpenSSH_*` with no distinct vendor marker.
  */
-export const detectVendorFromSshVersion = (softwareVersion?: string): '' | NetworkDeviceVendor => {
-  const s = (softwareVersion || '').trim().replace(/^SSH-(?:2\.0|1\.99)-/i, '');
-  if (!s) return '';
 
-  // Cisco family — IOS, IOS XA, Wireless LAN Controller
-  if (/^Cisco[-_]/i.test(s)) return 'cisco';
-  if (/^CiscoIOS_/i.test(s)) return 'cisco';
-  if (/^CISCO_WLC\b/.test(s)) return 'cisco';
-  // Note: `IPSSH-*` is used by both Cisco and 3Com devices (per Nmap
-  // `match ssh m|^SSH-([\d.]+)-IPSSH-([\d.]+)\|`), so we cannot map it
-  // to a specific vendor icon from the banner alone. Users who want a
-  // custom icon for such devices can set one via the Host Details
-  // manual distro override. The stats-polling gate is still handled
-  // correctly via `host.deviceType === 'network'`.
-
-  // Juniper NetScreen firewall (JUNOS itself uses OpenSSH and is caught
-  // by the fallback failure-counter path in useServerStats).
-  if (/^NetScreen\b/.test(s)) return 'juniper';
-
-  // Huawei VRP and related products
-  if (s === '-') return 'huawei';
-  if (/^HUAWEI[-_]/i.test(s)) return 'huawei';
-  if (/^VRP-/i.test(s)) return 'huawei';
-
-  // H3C / 3Com Comware switches
-  if (/^H3C[-_\s]/i.test(s)) return 'h3c';
-  if (/^Comware-/i.test(s)) return 'h3c';
-  if (/^3Com\s*OS/i.test(s)) return 'h3c';
-
-  // HPE iLO
-  if (/^mpSSH_/i.test(s)) return 'hpe';
-
-  // MikroTik RouterOS
-  if (/^ROSSSH\b/.test(s)) return 'mikrotik';
-
-  // Fortinet FortiOS / FortiGate
-  if (/^FortiSSH_/i.test(s)) return 'fortinet';
-
-  // Palo Alto Networks PAN-OS
-  if (/^PaloAltoNetworks[_-]/i.test(s)) return 'paloalto';
-
-  // ZyXEL ZyWALL
-  if (/^Zyxel\s*SSH/i.test(s)) return 'zyxel';
-
-  // Ruijie RGOS
-  if (/^RGOS_SSH\b/i.test(s)) return 'ruijie';
-
-  return '';
-};
 
 /**
  * Classify a distro/vendor ID into a high-level device class. Features that
@@ -270,11 +225,22 @@ export const shouldSuggestNetworkDeviceMode = (opts: {
 };
 
 /**
+ * True when an extra exec channel on the terminal transport is unsafe because
+ * the host is a network device. Use this to skip probes. Do not store it as
+ * session.singleChannelSsh: that runtime flag is stamped only after a
+ * recognized one-channel bastion banner.
+ */
+export const hostRestrictsExtraSshChannels = (
+  host?: Pick<Host, 'deviceType'> | null,
+): boolean => host?.deviceType === 'network';
+
+/**
  * Decide whether it is safe to run the post-connect `pwd` probe that
  * discovers the session's working directory. The probe opens an extra exec
  * channel running a POSIX-shell script; strict network-device CLIs such as
  * Huawei VRP respond by closing the whole SSH session (#1043), so it must be
- * skipped for them.
+ * skipped for them. Software banners that allow only one session channel per
+ * TCP connection have the same constraint.
  *
  * `isNetworkDevice` covers hosts we already classified (a reconnect, or an
  * explicit `deviceType: 'network'`). On a brand-new host that field is not
@@ -284,8 +250,12 @@ export const shouldSuggestNetworkDeviceMode = (opts: {
 export const shouldProbeSessionCwd = (opts: {
   isNetworkDevice: boolean;
   remoteSshVersion?: string;
+  restrictExtraSshChannels?: boolean;
 }): boolean =>
-  !opts.isNetworkDevice && !detectVendorFromSshVersion(opts.remoteSshVersion);
+  !opts.isNetworkDevice
+  && !opts.restrictExtraSshChannels
+  && !remoteSoftwareRequiresSingleChannel(opts.remoteSshVersion)
+  && !detectVendorFromSshVersion(opts.remoteSshVersion);
 
 export const getEffectiveHostDistro = (
   host?: Pick<Host, 'distro' | 'manualDistro' | 'distroMode'> | null,
@@ -445,7 +415,10 @@ export const hostsEqualForIdentityReuse = (a: Host, b: Host): boolean => {
 };
 
 export const sanitizeHost = (host: Host, snippets: Snippet[] = []): Host => {
-  const cleanHostname = (host.hostname || '').trim().split(/\s+/)[0];
+  // Serial endpoints are paths, not network hostnames; pipe names may contain spaces.
+  const cleanHostname = host.protocol === 'serial'
+    ? (host.serialConfig?.path || host.hostname || '').trim()
+    : (host.hostname || '').trim().split(/\s+/)[0];
   const cleanDistro = normalizeDistroId(host.distro);
   const cleanManualDistro = normalizeDistroId(host.manualDistro);
   const cleanDistroMode =
@@ -493,6 +466,11 @@ export const sanitizeHost = (host: Host, snippets: Snippet[] = []): Host => {
       ? undefined
       : migrated.authMethod ?? inferredLegacyAuthMethod,
     authPolicyVersion: 1,
+    // Legacy SSH records used per-character IME/short-paste writes globally.
+    // Persist the choice on normalization; explicit false survives every reload.
+    sshInputCompatibility: host.protocol === undefined || host.protocol === 'ssh'
+      ? host.sshInputCompatibility ?? true
+      : host.sshInputCompatibility,
     hostname: cleanHostname,
     osOverride: osSelection,
     os: osSelection === 'linux' || osSelection === 'windows' || osSelection === 'macos' ? osSelection : host.os,
@@ -515,5 +493,7 @@ export const sanitizeHost = (host: Host, snippets: Snippet[] = []): Host => {
     connectScriptIds: connectScriptIds && connectScriptIds.length > 0 ? connectScriptIds : undefined,
     pluginConnection,
   };
+  delete (sanitized as { singleChannelSsh?: unknown }).singleChannelSsh;
+  delete (sanitized as { backedBySavedHost?: boolean }).backedBySavedHost;
   return stripBuiltInConnectionFieldsForPluginHost(sanitized);
 };

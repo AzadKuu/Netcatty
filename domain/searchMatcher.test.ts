@@ -2,13 +2,31 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PINYIN_CACHE_MAX_CHARS,
   PINYIN_CACHE_MAX_ENTRIES,
   getPinyinCacheStatsForTests,
   getHostSearchMatch,
   matchesHostSearchQuery,
   matchesSearchQuery,
+  matchesWordPrefixQuery,
+  matchesWorkspaceHostPickerQuery,
   resetPinyinCacheForTests,
 } from "../lib/searchMatcher.ts";
+
+test("shared pinyin search reaches later fields after a long first field", () => {
+  const prefix = "a".repeat(256);
+  for (const query of ["fuwuqi", "fwq", "nginx fuwuqi"]) {
+    assert.equal(matchesSearchQuery(query, `${prefix} nginx`, "服务器"), true);
+  }
+  assert.equal(matchesSearchQuery("fuwuqi", prefix, "服务器"), true);
+  assert.equal(matchesSearchQuery("fuwuqi missing", prefix, "服务器"), false);
+});
+
+test("shared pinyin search preserves full fields and host labels", () => {
+  const label = `${"a".repeat(256)}服务器`;
+  assert.equal(matchesSearchQuery("fuwuqi", label), true);
+  assert.equal(matchesHostSearchQuery("fuwuqi", { label }), true);
+});
 
 test("matches mixed Chinese and dash-separated numeric suffix with spaced query", () => {
   assert.equal(
@@ -124,6 +142,18 @@ test("punctuation-only query does not match every field", () => {
   assert.equal(matchesSearchQuery("-", "some-host"), false);
 });
 
+test("over-limit query keeps its full meaning instead of matching on a truncated prefix", () => {
+  // The shared matcher never truncates: a >256-char query whose distinguishing
+  // suffix is beyond the suggested `MAX_SEARCH_QUERY_LENGTH` cap must not
+  // match a field that only contains the cap-bounded prefix. Callers that
+  // rescan many haystacks (session history) bound their own input instead.
+  const field = "a".repeat(300);
+  const query = `${"a".repeat(300)} missing-suffix`;
+  assert.equal(matchesSearchQuery(query, field), false);
+  // The same query still matches when the whole query is present.
+  assert.equal(matchesSearchQuery(query, `${field} missing-suffix`), true);
+});
+
 test("host search avoids compact hostname false positives on numeric segments", () => {
   assert.equal(
     matchesHostSearchQuery("61", {
@@ -131,6 +161,57 @@ test("host search avoids compact hostname false positives on numeric segments", 
       hostname: "10.6.1.88",
       group: "网络设备",
       tags: [],
+    }),
+    false,
+  );
+});
+
+test("host search matches tags without requiring the label or group", () => {
+  assert.equal(
+    matchesHostSearchQuery("prod", {
+      label: "web-1",
+      hostname: "10.0.0.8",
+      group: "infra",
+      tags: ["prod", "k8s"],
+    }),
+    true,
+  );
+  assert.equal(
+    matchesHostSearchQuery("prod", {
+      label: "web-1",
+      hostname: "10.0.0.8",
+      group: "infra",
+      tags: ["staging"],
+    }),
+    false,
+  );
+});
+
+test("workspace picker search matches tags and usernames", () => {
+  assert.equal(
+    matchesWorkspaceHostPickerQuery("k8s", {
+      label: "api-gateway",
+      hostname: "10.0.0.9",
+      group: "edge",
+      tags: ["k8s", "prod"],
+    }),
+    true,
+  );
+  assert.equal(
+    matchesWorkspaceHostPickerQuery("deploy", {
+      label: "api-gateway",
+      hostname: "10.0.0.9",
+      username: "deploy",
+      tags: [],
+    }),
+    true,
+  );
+  assert.equal(
+    matchesWorkspaceHostPickerQuery("k8s", {
+      label: "api-gateway",
+      hostname: "10.0.0.9",
+      username: "deploy",
+      tags: ["prod"],
     }),
     false,
   );
@@ -174,4 +255,86 @@ test("pinyin cache covers 8000 hosts and stays hard-bounded through import/edit 
   assert.ok(stats.keys.includes("主机0"));
   assert.ok(!stats.keys.includes("主机1"));
   resetPinyinCacheForTests();
+});
+
+// Regression: short labels keep the pinyin cache under the entry cap, but the
+// entry cap alone is not a memory bound — a Latin query that matches nothing
+// transliterates every distinct field it scans, so long fields (e.g. up to
+// MAX_SEARCHABLE_FIELD_LENGTH-character session titles) could retain several
+// copies of each source in the global cache. The cache must also be bounded
+// by retained characters.
+test("pinyin cache stays hard-bounded by retained characters, not just entries", () => {
+  resetPinyinCacheForTests();
+  // 17 long CJK titles (~20_000 chars each): their entries can never all fit
+  // under the 1,000,000-char budget, so earlier ones must be evicted instead
+  // of pinning memory within the 16_384-entry cap.
+  for (let index = 0; index < 17; index += 1) {
+    matchesSearchQuery("unmatched-latin", "重启".repeat(10_000) + String(index));
+  }
+  assert.ok(getPinyinCacheStatsForTests().chars <= PINYIN_CACHE_MAX_CHARS);
+  assert.ok(getPinyinCacheStatsForTests().size > 0);
+  resetPinyinCacheForTests();
+});
+
+test("host ASCII fallback preserves compact matches and their complete ranking details", () => {
+  const separators = ["-", "_", " ", "/", "\\", "|", ".", ",", ";", ":", "!", "?", "(", ")", "[", "]", "{", "}", "<", ">", '"', "'", "`", "~"];
+  for (const separator of separators) {
+    assert.deepEqual(getHostSearchMatch("prefixsuffix", { label: `prefix${separator}suffix` }), {
+      matched: true, phase: "loose", score: 100525,
+      details: [{ segment: "prefixsuffix", field: "label", method: "compact", phase: "loose" }],
+    }, JSON.stringify(separator));
+  }
+  for (const separator of ["+", "&", "@", "=", "%", "$", "#", "^"]) {
+    assert.deepEqual(getHostSearchMatch("prefixsuffix", { label: `prefix${separator}suffix` }), {
+      matched: false, phase: "none", score: 0, details: [],
+    }, JSON.stringify(separator));
+  }
+  assert.deepEqual(getHostSearchMatch("ＰＲＯＤＡＰＩ", { label: "ＰＲＯＤ－ＡＰＩ" }), {
+    matched: true, phase: "loose", score: 100525,
+    details: [{ segment: "prodapi", field: "label", method: "compact", phase: "loose" }],
+  });
+});
+
+test("host ASCII bypass preserves strict source selection, IP isolation, and pinyin scoring", () => {
+  const host = { label: "Production API-01", group: "Region 99", hostname: "10.6.1.88", tags: ["production", "web", "核心"] };
+  assert.deepEqual(getHostSearchMatch("production web", host), {
+    matched: true, phase: "strict", score: 1000820,
+    details: [
+      { segment: "production", field: "label", method: "literal", phase: "strict" },
+      { segment: "web", field: "tag", method: "literal", phase: "strict" },
+    ],
+  });
+  assert.deepEqual(getHostSearchMatch("10.6.1.88", host), {
+    matched: true, phase: "strict", score: 1000430,
+    details: [{ segment: "10.6.1.88", field: "hostname", method: "literal", phase: "strict" }],
+  });
+  for (const query of ["61", "production 10.6"]) {
+    assert.deepEqual(getHostSearchMatch(query, host), { matched: false, phase: "none", score: 0, details: [] });
+  }
+  for (const [query, method, score] of [["hexin", "pinyinFull", 100232], ["hx", "pinyinInitials", 100228]] as const) {
+    assert.deepEqual(getHostSearchMatch(query, host), {
+      matched: true, phase: "loose", score,
+      details: [{ segment: query, field: "tag", method, phase: "loose" }],
+    });
+  }
+  assert.deepEqual(getHostSearchMatch("apibu", { label: "API部署" }), {
+    matched: true, phase: "loose", score: 100512,
+    details: [{ segment: "apibu", field: "label", method: "pinyinFull", phase: "loose" }],
+  });
+});
+
+
+test("word prefixes retain literal, normalized, and non-ASCII matching", () => {
+  assert.equal(matchesWordPrefixQuery("", "deploy"), true);
+  assert.equal(matchesWordPrefixQuery("DEP", "deploy-service"), true);
+  assert.equal(matchesWordPrefixQuery("ser", "deploy-service"), true);
+  assert.equal(matchesWordPrefixQuery("123", "item-1234"), true);
+  assert.equal(matchesWordPrefixQuery("dep", "ＤＥＰＬＯＹ"), true);
+  assert.equal(matchesWordPrefixQuery("caf", "café"), true);
+  assert.equal(matchesWordPrefixQuery("mail", "gmail"), false);
+  assert.equal(matchesWordPrefixQuery("zz", "deploy-service"), false);
+  assert.equal(matchesWordPrefixQuery("--de", "deploy-service"), false);
+  assert.equal(matchesWordPrefixQuery("bushu", "部署服务"), true);
+  assert.equal(matchesWordPrefixQuery("bsfw", "部署服务"), true);
+  assert.equal(matchesWordPrefixQuery("apibu", "API部署"), true);
 });

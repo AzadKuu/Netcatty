@@ -1,8 +1,32 @@
 diff --git a/node_modules/ssh2/lib/agent.js b/node_modules/ssh2/lib/agent.js
-index bb495d1..c0d5def 100644
+index bb495d1..32c48a0 100644
 --- a/node_modules/ssh2/lib/agent.js
 +++ b/node_modules/ssh2/lib/agent.js
-@@ -711,7 +711,10 @@ const AgentProtocol = (() => {
+@@ -6,7 +6,7 @@ const { resolve } = require('path');
+ const { readFile } = require('fs');
+ const { execFile, spawn } = require('child_process');
+ 
+-const { isParsedKey, parseKey } = require('./protocol/keyParser.js');
++const { isParsedKey, parseKey, getOpenSSHCertSignatureAlgorithm } = require('./protocol/keyParser.js');
+ 
+ const {
+   makeBufferParser,
+@@ -655,8 +655,12 @@ const AgentProtocol = (() => {
+               // TODO: verify signature type based on key and options used
+               // during initial sign request
+               binaryParser.init(signature, 0);
+-              binaryParser.readString(true);
+-              signature = binaryParser.readString();
++              const signatureType = binaryParser.readString(true);
++              // SK signatures append flags/counter outside the inner string.
++              // Preserve the complete algorithm-specific payload for authPK.
++              signature = signatureType && signatureType.startsWith('sk-')
++                ? signature.subarray(binaryParser.pos())
++                : binaryParser.readString();
+               binaryParser.clear();
+ 
+               if (signature === undefined)
+@@ -711,7 +715,10 @@ const AgentProtocol = (() => {
                  hash: undefined,
                };
                let ctx;
@@ -14,7 +38,26 @@ index bb495d1..c0d5def 100644
                  if (flagsVal & SSH_AGENT_RSA_SHA2_256) {
                    ctx = 'rsa-sha2-256';
                    flags.hash = 'sha256';
-@@ -781,7 +784,11 @@ const AgentProtocol = (() => {
+@@ -721,7 +728,7 @@ const AgentProtocol = (() => {
+                 }
+               }
+               if (ctx === undefined)
+-                ctx = pubKey.type;
++                ctx = getOpenSSHCertSignatureAlgorithm(pubKey.type);
+ 
+               const req = new AgentInboundRequest(msgType, ctx);
+               this[SYM_REQS].push(req);
+@@ -732,6 +739,9 @@ const AgentProtocol = (() => {
+             default: {
+               const req = new AgentInboundRequest(msgType);
+               this[SYM_REQS].push(req);
++              // Unknown extensions can carry data. Consume their entire frame
++              // before reading the next request on this connection.
++              p = 4 + this[SYM_MSGLEN];
+               this.failureReply(req);
+             }
+           }
+@@ -781,7 +791,11 @@ const AgentProtocol = (() => {
        if (pubKey instanceof Error)
          throw new Error('Invalid public key argument');
  
@@ -27,6 +70,35 @@ index bb495d1..c0d5def 100644
          switch (options.hash) {
            case 'sha256':
              flags = SSH_AGENT_RSA_SHA2_256;
+@@ -992,19 +1006,24 @@ const AgentProtocol = (() => {
+       let p = 0;
+       const sigFormat = req.getContext();
+       const sigFormatLen = Buffer.byteLength(sigFormat);
++      const sigPrefixLen = sigFormat.startsWith('sk-') ? 0 : 4;
+       const buf = Buffer.allocUnsafe(
+-        4 + 1 + 4 + 4 + sigFormatLen + 4 + signature.length
++        4 + 1 + 4 + 4 + sigFormatLen + sigPrefixLen + signature.length
+       );
+ 
+       writeUInt32BE(buf, buf.length - 4, p);
+ 
+       buf[p += 4] = SSH_AGENT_SIGN_RESPONSE;
+ 
+-      writeUInt32BE(buf, 4 + sigFormatLen + 4 + signature.length, ++p);
++      writeUInt32BE(buf, 4 + sigFormatLen + sigPrefixLen + signature.length, ++p);
+       writeUInt32BE(buf, sigFormatLen, p += 4);
+       buf.utf8Write(sigFormat, p += 4, sigFormatLen);
+-      writeUInt32BE(buf, signature.length, p += sigFormatLen);
+-      signature.copy(buf, p += 4);
++      p += sigFormatLen;
++      if (sigPrefixLen) {
++        writeUInt32BE(buf, signature.length, p);
++        p += 4;
++      }
++      signature.copy(buf, p);
+ 
+       return respond(this, req, buf);
+     }
 diff --git a/node_modules/ssh2/lib/client.js b/node_modules/ssh2/lib/client.js
 index 7291c2c..8943c9a 100644
 --- a/node_modules/ssh2/lib/client.js
@@ -62,36 +134,44 @@ index 7291c2c..8943c9a 100644
  }
  
 diff --git a/node_modules/ssh2/lib/protocol/Protocol.js b/node_modules/ssh2/lib/protocol/Protocol.js
-index 7302488..634acdd 100644
+index 7302488..df0c9b3 100644
 --- a/node_modules/ssh2/lib/protocol/Protocol.js
 +++ b/node_modules/ssh2/lib/protocol/Protocol.js
-@@ -701,11 +701,19 @@ class Protocol {
+@@ -58,6 +58,7 @@ const {
+ } = require('./kex.js');
+ const {
+   parseKey,
++  getOpenSSHCertSignatureAlgorithm,
+ } = require('./keyParser.js');
+ const MESSAGE_HANDLERS = require('./handlers.js');
+ const {
+@@ -701,11 +702,19 @@ class Protocol {
        if (signature === false)
          throw new Error('Error while converting handshake signature');
  
 +      let sigAlgo = keyAlgo;
 +      if (signature && typeof signature === 'object' && signature._signatureAlgorithm)
 +        sigAlgo = signature._signatureAlgorithm;
-+      else if (typeof keyAlgo === 'string'
-+               && keyAlgo.endsWith('-cert-v01@openssh.com'))
-+        sigAlgo = keyAlgo.slice(0, -'-cert-v01@openssh.com'.length);
++      else
++        sigAlgo = getOpenSSHCertSignatureAlgorithm(keyAlgo);
 +
        const sigLen = signature.length;
++      const sigPrefixLen = sigAlgo.startsWith('sk-') ? 0 : 4;
 +      const sigAlgoLen = Buffer.byteLength(sigAlgo);
        p = this._packetRW.write.allocStart;
        packet = this._packetRW.write.alloc(
          1 + 4 + userLen + 4 + 14 + 4 + 9 + 1 + 4 + algoLen + 4 + pubKeyLen + 4
 -          + 4 + algoLen + 4 + sigLen
-+          + 4 + sigAlgoLen + 4 + sigLen
++          + 4 + sigAlgoLen + sigPrefixLen + sigLen
        );
  
        // TODO: simply copy from original "packet" to new `packet` to avoid
-@@ -729,12 +737,12 @@ class Protocol {
+@@ -729,13 +738,17 @@ class Protocol {
        writeUInt32BE(packet, pubKeyLen, p += algoLen);
        packet.set(pubKey, p += 4);
  
 -      writeUInt32BE(packet, 4 + algoLen + 4 + sigLen, p += pubKeyLen);
-+      writeUInt32BE(packet, 4 + sigAlgoLen + 4 + sigLen, p += pubKeyLen);
++      writeUInt32BE(packet, 4 + sigAlgoLen + sigPrefixLen + sigLen, p += pubKeyLen);
  
 -      writeUInt32BE(packet, algoLen, p += 4);
 -      packet.utf8Write(keyAlgo, p += 4, algoLen);
@@ -99,28 +179,34 @@ index 7302488..634acdd 100644
 +      packet.utf8Write(sigAlgo, p += 4, sigAlgoLen);
  
 -      writeUInt32BE(packet, sigLen, p += algoLen);
-+      writeUInt32BE(packet, sigLen, p += sigAlgoLen);
-       packet.set(signature, p += 4);
+-      packet.set(signature, p += 4);
++      p += sigAlgoLen;
++      if (sigPrefixLen) {
++        writeUInt32BE(packet, sigLen, p);
++        p += 4;
++      }
++      packet.set(signature, p);
  
        // Servers shouldn't send packet type 60 in response to signed publickey
-@@ -810,19 +818,27 @@ class Protocol {
+       // attempts, but if they do, interpret as type 60.
+@@ -810,20 +823,32 @@ class Protocol {
        if (!signature)
          throw new Error('Error while converting handshake signature');
  
 +      let sigAlgo = keyAlgo;
 +      if (signature && typeof signature === 'object' && signature._signatureAlgorithm)
 +        sigAlgo = signature._signatureAlgorithm;
-+      else if (typeof keyAlgo === 'string'
-+               && keyAlgo.endsWith('-cert-v01@openssh.com'))
-+        sigAlgo = keyAlgo.slice(0, -'-cert-v01@openssh.com'.length);
++      else
++        sigAlgo = getOpenSSHCertSignatureAlgorithm(keyAlgo);
 +
        const sigLen = signature.length;
++      const sigPrefixLen = sigAlgo.startsWith('sk-') ? 0 : 4;
 +      const sigAlgoLen = Buffer.byteLength(sigAlgo);
        const reqDataLen = (data.length - sesLen - 4);
        p = this._packetRW.write.allocStart;
        const packet = this._packetRW.write.alloc(
 -        reqDataLen + 4 + 4 + algoLen + 4 + sigLen
-+        reqDataLen + 4 + 4 + sigAlgoLen + 4 + sigLen
++        reqDataLen + 4 + 4 + sigAlgoLen + sigPrefixLen + sigLen
        );
  
        bufferCopy(data, packet, 4 + sesLen, data.length, p);
@@ -129,14 +215,20 @@ index 7302488..634acdd 100644
 -      writeUInt32BE(packet, algoLen, p += 4);
 -      packet.utf8Write(keyAlgo, p += 4, algoLen);
 -      writeUInt32BE(packet, sigLen, p += algoLen);
-+      writeUInt32BE(packet, 4 + sigAlgoLen + 4 + sigLen, p += reqDataLen);
+-      packet.set(signature, p += 4);
++      writeUInt32BE(packet, 4 + sigAlgoLen + sigPrefixLen + sigLen, p += reqDataLen);
 +      writeUInt32BE(packet, sigAlgoLen, p += 4);
 +      packet.utf8Write(sigAlgo, p += 4, sigAlgoLen);
-+      writeUInt32BE(packet, sigLen, p += sigAlgoLen);
-       packet.set(signature, p += 4);
++      p += sigAlgoLen;
++      if (sigPrefixLen) {
++        writeUInt32BE(packet, sigLen, p);
++        p += 4;
++      }
++      packet.set(signature, p);
  
        this._authsQueue.push('hostbased');
-@@ -1916,7 +1932,10 @@ class Protocol {
+ 
+@@ -1916,7 +1941,10 @@ class Protocol {
  }
  
  // SSH-protoversion-softwareversion (SP comments) CR LF
@@ -768,10 +860,49 @@ index 9f33c02..9751164 100644
        if (names !== undefined) {
          sftp._debug && sftp._debug(
 diff --git a/node_modules/ssh2/lib/protocol/constants.js b/node_modules/ssh2/lib/protocol/constants.js
-index ad77592..4b3f71a 100644
+index ad77592..03ab33b 100644
 --- a/node_modules/ssh2/lib/protocol/constants.js
 +++ b/node_modules/ssh2/lib/protocol/constants.js
-@@ -160,6 +160,7 @@ const COMPAT = {
+@@ -71,14 +71,37 @@ const DEFAULT_SERVER_HOST_KEY = [
+ ];
+ if (eddsaSupported)
+   DEFAULT_SERVER_HOST_KEY.unshift('ssh-ed25519');
++// OpenSSH host certificates, offered before the matching plain key so a
++// cert-only server (for example ssh-ed25519-cert-v01@openssh.com) can
++// negotiate. Plain keys stay as fallbacks.
++const OPENSSH_HOST_CERT_ALGS = [
++  'ecdsa-sha2-nistp256-cert-v01@openssh.com',
++  'ecdsa-sha2-nistp384-cert-v01@openssh.com',
++  'ecdsa-sha2-nistp521-cert-v01@openssh.com',
++  'rsa-sha2-512-cert-v01@openssh.com',
++  'rsa-sha2-256-cert-v01@openssh.com',
++  'ssh-rsa-cert-v01@openssh.com',
++];
++if (eddsaSupported)
++  OPENSSH_HOST_CERT_ALGS.unshift('ssh-ed25519-cert-v01@openssh.com');
++DEFAULT_SERVER_HOST_KEY.unshift(...OPENSSH_HOST_CERT_ALGS);
+ const SUPPORTED_SERVER_HOST_KEY = DEFAULT_SERVER_HOST_KEY.concat([
+   'ssh-dss',
++  // FIDO/U2F security keys (client publickey auth / rare host keys).
++  'sk-ecdsa-sha2-nistp256@openssh.com',
++  'sk-ecdsa-sha2-nistp256-cert-v01@openssh.com',
+ ]);
++if (eddsaSupported) {
++  SUPPORTED_SERVER_HOST_KEY.push('sk-ssh-ed25519@openssh.com');
++  SUPPORTED_SERVER_HOST_KEY.push('sk-ssh-ed25519-cert-v01@openssh.com');
++}
+ 
+ 
+ const canUseCipher = (() => {
+   const ciphers = crypto.getCiphers();
+-  return (name) => ciphers.includes(CIPHER_INFO[name].sslName);
++  // crypto.js supplies the original ChaCha20 primitive on BoringSSL too.
++  return (name) => (name === 'chacha20-poly1305@openssh.com'
++                    || ciphers.includes(CIPHER_INFO[name].sslName));
+ })();
+ let DEFAULT_CIPHER = [
+   // http://tools.ietf.org/html/rfc5647
+@@ -160,6 +183,7 @@ const COMPAT = {
    DYN_RPORT_BUG: 1 << 2,
    BUG_DHGEX_LARGE: 1 << 3,
    IMPLY_RSA_SHA2_SIGALGS: 1 << 4,
@@ -779,7 +910,7 @@ index ad77592..4b3f71a 100644
  };
  
  module.exports = {
-@@ -330,6 +331,7 @@ module.exports = {
+@@ -330,6 +354,7 @@ module.exports = {
    COMPAT_CHECKS: [
      [ 'Cisco-1.25', COMPAT.BAD_DHGEX ],
      [ /^Cisco-1[.]/, COMPAT.BUG_DHGEX_LARGE ],
@@ -787,11 +918,306 @@ index ad77592..4b3f71a 100644
      [ /^[0-9.]+$/, COMPAT.OLD_EXIT ], // old SSH.com implementations
      [ /^OpenSSH_5[.][0-9]+/, COMPAT.DYN_RPORT_BUG ],
      [ /^OpenSSH_7[.]4/, COMPAT.IMPLY_RSA_SHA2_SIGALGS ],
+diff --git a/node_modules/ssh2/lib/protocol/crypto.js b/node_modules/ssh2/lib/protocol/crypto.js
+index 851cc73..088de2a 100644
+--- a/node_modules/ssh2/lib/protocol/crypto.js
++++ b/node_modules/ssh2/lib/protocol/crypto.js
+@@ -11,6 +11,7 @@ const {
+ } = require('crypto');
+ 
+ const { readUInt32BE, writeUInt32BE } = require('./utils.js');
++const { chacha20, nativeChacha20 } = require('./crypto/chacha20.js');
+ 
+ const FastBuffer = Buffer[Symbol.species];
+ const MAX_SEQNO = 2 ** 32 - 1;
+@@ -198,20 +199,17 @@ class ChaChaPolyCipherNative {
+     POLY1305_OUT_COMPUTE[0] = 0; // Set counter to 0 (little endian)
+     writeUInt32BE(POLY1305_OUT_COMPUTE, this.outSeqno, 12);
+     const polyKey =
+-      createCipheriv('chacha20', this._encKeyMain, POLY1305_OUT_COMPUTE)
+-      .update(POLY1305_ZEROS);
++      chacha20(this._encKeyMain, POLY1305_OUT_COMPUTE, POLY1305_ZEROS);
+ 
+     // Encrypt packet length
+     const pktLenEnc =
+-      createCipheriv('chacha20', this._encKeyPktLen, POLY1305_OUT_COMPUTE)
+-      .update(packet.slice(0, 4));
++      chacha20(this._encKeyPktLen, POLY1305_OUT_COMPUTE, packet.slice(0, 4));
+     this._onWrite(pktLenEnc);
+ 
+     // Encrypt rest of packet
+     POLY1305_OUT_COMPUTE[0] = 1; // Set counter to 1 (little endian)
+     const payloadEnc =
+-      createCipheriv('chacha20', this._encKeyMain, POLY1305_OUT_COMPUTE)
+-      .update(packet.slice(4));
++      chacha20(this._encKeyMain, POLY1305_OUT_COMPUTE, packet.slice(4));
+     this._onWrite(payloadEnc);
+ 
+     // Calculate Poly1305 MAC
+@@ -650,8 +648,7 @@ class ChaChaPolyDecipherNative {
+         writeUInt32BE(POLY1305_OUT_COMPUTE, this.inSeqno, 12);
+ 
+         const decLenBytes =
+-          createDecipheriv('chacha20', this._decKeyPktLen, POLY1305_OUT_COMPUTE)
+-          .update(this._lenBuf);
++          chacha20(this._decKeyPktLen, POLY1305_OUT_COMPUTE, this._lenBuf);
+         this._len = readUInt32BE(decLenBytes, 0);
+ 
+         if (this._len > MAX_PACKET_SIZE
+@@ -706,8 +703,7 @@ class ChaChaPolyDecipherNative {
+       POLY1305_OUT_COMPUTE[0] = 0; // Set counter to 0 (little endian)
+       writeUInt32BE(POLY1305_OUT_COMPUTE, this.inSeqno, 12);
+       const polyKey =
+-        createCipheriv('chacha20', this._decKeyMain, POLY1305_OUT_COMPUTE)
+-        .update(POLY1305_ZEROS);
++        chacha20(this._decKeyMain, POLY1305_OUT_COMPUTE, POLY1305_ZEROS);
+ 
+       // Calculate and compare Poly1305 MACs
+       poly1305_auth(POLY1305_RESULT_MALLOC,
+@@ -729,8 +725,7 @@ class ChaChaPolyDecipherNative {
+       // Decrypt packet
+       POLY1305_OUT_COMPUTE[0] = 1; // Set counter to 1 (little endian)
+       const packet =
+-        createDecipheriv('chacha20', this._decKeyMain, POLY1305_OUT_COMPUTE)
+-        .update(this._packet);
++        chacha20(this._decKeyMain, POLY1305_OUT_COMPUTE, this._packet);
+ 
+       const payload = new FastBuffer(packet.buffer,
+                                      packet.byteOffset + 1,
+@@ -1496,7 +1491,7 @@ function createCipher(config) {
+               ? new AESGCMCipherBinding(config)
+               : new AESGCMCipherNative(config));
+     case 'chacha20':
+-      return (ChaChaPolyCipher && !forceNative
++      return (ChaChaPolyCipher && nativeChacha20 && !forceNative
+               ? new ChaChaPolyCipherBinding(config)
+               : new ChaChaPolyCipherNative(config));
+     default: {
+@@ -1556,7 +1551,7 @@ function createDecipher(config) {
+               ? new AESGCMDecipherBinding(config)
+               : new AESGCMDecipherNative(config));
+     case 'chacha20':
+-      return (ChaChaPolyDecipher && !forceNative
++      return (ChaChaPolyDecipher && nativeChacha20 && !forceNative
+               ? new ChaChaPolyDecipherBinding(config)
+               : new ChaChaPolyDecipherNative(config));
+     default: {
+diff --git a/node_modules/ssh2/lib/protocol/crypto/chacha20.js b/node_modules/ssh2/lib/protocol/crypto/chacha20.js
+new file mode 100644
+index 0000000..86dd731
+--- /dev/null
++++ b/node_modules/ssh2/lib/protocol/crypto/chacha20.js
+@@ -0,0 +1,17 @@
++// OpenSSH uses original ChaCha20 (64-bit nonce), not the IETF/TLS AEAD.
++// Electron's BoringSSL lacks the standalone cipher, including in sshcrypto.
++'use strict';
++const { createCipheriv, getCiphers } = require('crypto');
++const nativeChacha20 = getCiphers().includes('chacha20');
++const { chacha20orig } = nativeChacha20 ? {} : require('@noble/ciphers/chacha.js');
++
++function chacha20(key, iv, data) {
++  if (nativeChacha20)
++    return createCipheriv('chacha20', key, iv).update(data);
++  // ssh2 only uses block counters 0 (length/Poly1305 key) and 1 (payload).
++  // The last eight IV bytes are its big-endian SSH packet sequence nonce.
++  return Buffer.from(chacha20orig(key, iv.subarray(8), data, undefined,
++                                  iv.readUInt32LE(0)));
++}
++
++module.exports = { chacha20, nativeChacha20 };
 diff --git a/node_modules/ssh2/lib/protocol/kex.js b/node_modules/ssh2/lib/protocol/kex.js
-index 811e631..4b5f792 100644
+index 811e631..422a198 100644
 --- a/node_modules/ssh2/lib/protocol/kex.js
 +++ b/node_modules/ssh2/lib/protocol/kex.js
-@@ -1377,8 +1377,13 @@ const createKeyExchange = (() => {
+@@ -30,7 +30,10 @@ const {
+   createDecipher,
+   MAC_INFO,
+ } = require('./crypto.js');
+-const { parseDERKey } = require('./keyParser.js');
++const {
++  parseDERKey,
++  getOpenSSHCertSignatureAlgorithm,
++} = require('./keyParser.js');
+ const {
+   bufferFill,
+   bufferParser,
+@@ -49,6 +52,68 @@ const {
+ 
+ let MESSAGE_HANDLERS;
+ 
++const LEGACY_RSA_HOST_CERT = /^ssh-rsa-cert-v0[01]@openssh\.com$/;
++const RSA_SHA2_256_HOST_CERT = /^rsa-sha2-256-cert-v0[01]@openssh\.com$/;
++const RSA_SHA2_512_HOST_CERT = /^rsa-sha2-512-cert-v0[01]@openssh\.com$/;
++const LEGACY_RSA_HOST_SIGNATURES = new Set([
++  'rsa-sha2-256',
++  'rsa-sha2-512',
++  'ssh-rsa',
++]);
++
++// Client KEX accepts the negotiated host-key name or, for OpenSSH host
++// certificates, the underlying key algorithm. Real servers sign with the
++// embedded key (ssh-ed25519, ecdsa-sha2-*, rsa-sha2-*) rather than the
++// certificate algorithm name. OpenSSH allows any RSA signature only for the
++// legacy ssh-rsa certificate. rsa-sha2-256/512 certificates must use the
++// hash that was negotiated.
++function hostKeySignatureTypeAccepted(negotiatedServerHostKey, sigType) {
++  if (RSA_SHA2_256_HOST_CERT.test(negotiatedServerHostKey))
++    return sigType === 'rsa-sha2-256';
++  if (RSA_SHA2_512_HOST_CERT.test(negotiatedServerHostKey))
++    return sigType === 'rsa-sha2-512';
++  if (sigType === negotiatedServerHostKey)
++    return true;
++  if (sigType === getOpenSSHCertSignatureAlgorithm(negotiatedServerHostKey))
++    return true;
++  return LEGACY_RSA_HOST_CERT.test(negotiatedServerHostKey)
++    && LEGACY_RSA_HOST_SIGNATURES.has(sigType);
++}
++
++// Plain rsa-sha2-* keeps an ssh-rsa key blob. An RSA certificate negotiation
++// is KEY_RSA_CERT: the blob must be ssh-rsa-cert-v01@openssh.com, never a
++// plain ssh-rsa key.
++function hostKeyBlobTypeAccepted(negotiatedServerHostKey, hostPubKeyType) {
++  if (hostPubKeyType === negotiatedServerHostKey)
++    return true;
++  switch (negotiatedServerHostKey) {
++    case 'rsa-sha2-256':
++    case 'rsa-sha2-512':
++      return hostPubKeyType === 'ssh-rsa';
++    case 'rsa-sha2-256-cert-v01@openssh.com':
++    case 'rsa-sha2-512-cert-v01@openssh.com':
++      return hostPubKeyType === 'ssh-rsa-cert-v01@openssh.com';
++    default:
++      return false;
++  }
++}
++
++function hashAlgoForHostKey(negotiatedServerHostKey, sigType) {
++  // Negotiated RSA-SHA2 wins over the signature label so a mismatched
++  // signature cannot select a weaker hash.
++  if (negotiatedServerHostKey === 'rsa-sha2-256'
++      || RSA_SHA2_256_HOST_CERT.test(negotiatedServerHostKey))
++    return 'sha256';
++  if (negotiatedServerHostKey === 'rsa-sha2-512'
++      || RSA_SHA2_512_HOST_CERT.test(negotiatedServerHostKey))
++    return 'sha512';
++  if (sigType === 'rsa-sha2-256')
++    return 'sha256';
++  if (sigType === 'rsa-sha2-512')
++    return 'sha512';
++  return undefined;
++}
++
+ const GEX_MIN_BITS = 2048; // RFC 8270
+ const GEX_MAX_BITS = 8192; // RFC 8270
+ 
+@@ -635,7 +700,7 @@ const createKeyExchange = (() => {
+           );
+         }
+ 
+-        if (sigType !== negotiated.serverHostKey) {
++        if (!hostKeySignatureTypeAccepted(negotiated.serverHostKey, sigType)) {
+           return doFatalError(
+             this._protocol,
+             `Wrong signature type: ${sigType}, `
+@@ -659,7 +724,10 @@ const createKeyExchange = (() => {
+           );
+         }
+ 
+-        if (!(sigValue = sigSSHToASN1(sigValue, sigType))) {
++        if (!(sigValue = sigSSHToASN1(
++          sigValue,
++          getOpenSSHCertSignatureAlgorithm(sigType)
++        ))) {
+           return doFatalError(
+             this._protocol,
+             'Malformed signature',
+@@ -685,12 +753,10 @@ const createKeyExchange = (() => {
+           }
+         }
+ 
+-        let hashAlgo;
+-        // Check if we need to override the default hash algorithm
+-        switch (this.negotiated.serverHostKey) {
+-          case 'rsa-sha2-256': hashAlgo = 'sha256'; break;
+-          case 'rsa-sha2-512': hashAlgo = 'sha512'; break;
+-        }
++        const hashAlgo = hashAlgoForHostKey(
++          this.negotiated.serverHostKey,
++          sigType
++        );
+ 
+         this._protocol._debug
+           && this._protocol._debug('Verifying signature ...');
+@@ -717,12 +783,7 @@ const createKeyExchange = (() => {
+       } else {
+         // Server
+ 
+-        let hashAlgo;
+-        // Check if we need to override the default hash algorithm
+-        switch (this.negotiated.serverHostKey) {
+-          case 'rsa-sha2-256': hashAlgo = 'sha256'; break;
+-          case 'rsa-sha2-512': hashAlgo = 'sha512'; break;
+-        }
++        const hashAlgo = hashAlgoForHostKey(this.negotiated.serverHostKey);
+ 
+         this._protocol._debug && this._protocol._debug(
+           'Generating signature ...'
+@@ -739,7 +800,12 @@ const createKeyExchange = (() => {
+           );
+         }
+ 
+-        signature = convertSignature(signature, this._hostKey.type);
++        // OpenSSH signs a host certificate with the embedded key algorithm,
++        // not the certificate algorithm name.
++        const sigType = getOpenSSHCertSignatureAlgorithm(
++          this.negotiated.serverHostKey
++        );
++        signature = convertSignature(signature, sigType);
+         if (signature === false) {
+           return doFatalError(
+             this._protocol,
+@@ -759,7 +825,6 @@ const createKeyExchange = (() => {
+           string    <method-specific data>
+           string    signature of H
+         */
+-        const sigType = this.negotiated.serverHostKey;
+         const sigTypeLen = Buffer.byteLength(sigType);
+         const sigLen = 4 + sigTypeLen + 4 + signature.length;
+         let p = this._protocol._packetRW.write.allocStartKEX;
+@@ -1167,22 +1232,16 @@ const createKeyExchange = (() => {
+                 DISCONNECT_REASON.KEY_EXCHANGE_FAILED
+               );
+             }
+-            if (hostPubKeyType !== this.negotiated.serverHostKey) {
+-              // Check if we need to make an exception
+-              switch (this.negotiated.serverHostKey) {
+-                case 'rsa-sha2-256':
+-                case 'rsa-sha2-512':
+-                  if (hostPubKeyType === 'ssh-rsa')
+-                    break;
+-                // FALLTHROUGH
+-                default:
+-                  return doFatalError(
+-                    this._protocol,
+-                    'Host key does not match negotiated type',
+-                    'handshake',
+-                    DISCONNECT_REASON.KEY_EXCHANGE_FAILED
+-                  );
+-              }
++            if (!hostKeyBlobTypeAccepted(
++              this.negotiated.serverHostKey,
++              hostPubKeyType
++            )) {
++              return doFatalError(
++                this._protocol,
++                'Host key does not match negotiated type',
++                'handshake',
++                DISCONNECT_REASON.KEY_EXCHANGE_FAILED
++              );
+             }
+ 
+             this._hostKey = hostPubKey;
+@@ -1377,8 +1436,13 @@ const createKeyExchange = (() => {
        this._generator = null;
        this._minBits = GEX_MIN_BITS;
        this._prefBits = dhEstimate(this.negotiated);
@@ -806,14 +1232,302 @@ index 811e631..4b5f792 100644
        this._maxBits = GEX_MAX_BITS;
      }
      start() {
+@@ -1868,6 +1932,8 @@ function trySendNEWKEYS(kex) {
+ 
+ module.exports = {
+   KexInit,
++  hostKeyBlobTypeAccepted,
++  hostKeySignatureTypeAccepted,
+   kexinit,
+   onKEXPayload,
+   DEFAULT_KEXINIT_CLIENT: new KexInit({
 diff --git a/node_modules/ssh2/lib/protocol/keyParser.js b/node_modules/ssh2/lib/protocol/keyParser.js
-index a276c1a..df123fd 100644
+index a276c1a..57a05d6 100644
 --- a/node_modules/ssh2/lib/protocol/keyParser.js
 +++ b/node_modules/ssh2/lib/protocol/keyParser.js
-@@ -1186,6 +1186,26 @@ function OpenSSH_Public(type, comment, pubPEM, pubSSH, algo) {
+@@ -35,6 +35,9 @@ const SYM_PRIV_PEM = Symbol('Private key PEM');
+ const SYM_PUB_PEM = Symbol('Public key PEM');
+ const SYM_PUB_SSH = Symbol('Public key SSH');
+ const SYM_DECRYPTED = Symbol('Decrypted Key');
++const SYM_SK_APP = Symbol('SK Application');
++const SYM_SK_HANDLE = Symbol('SK Key Handle');
++const SYM_SK_FLAGS = Symbol('SK Flags');
+ 
+ // Create OpenSSL cipher name -> SSH cipher name conversion table
+ const CIPHER_INFO_OPENSSL = Object.create(null);
+@@ -258,6 +261,55 @@ function genOpenSSHEdPub(pub) {
+   return publicKey;
+ }
+ 
++// FIDO/U2F (security key) SSH wire-format public keys.
++// See OpenSSH's PROTOCOL.u2f.
++function genOpenSSHSKEdPub(pub, application) {
++  const typeName = 'sk-ssh-ed25519@openssh.com';
++  const total =
++    4 + typeName.length + 4 + pub.length + 4 + application.length;
++  const publicKey = Buffer.allocUnsafe(total);
++
++  let i = 0;
++  writeUInt32BE(publicKey, typeName.length, i);
++  publicKey.utf8Write(typeName, i += 4, typeName.length);
++  i += typeName.length;
++
++  writeUInt32BE(publicKey, pub.length, i);
++  publicKey.set(pub, i += 4);
++  i += pub.length;
++
++  writeUInt32BE(publicKey, application.length, i);
++  publicKey.utf8Write(application, i += 4, application.length);
++
++  return publicKey;
++}
++
++function genOpenSSHSKECDSAPub(Q, application) {
++  const typeName = 'sk-ecdsa-sha2-nistp256@openssh.com';
++  const curveName = 'nistp256';
++  const total = 4 + typeName.length + 4 + curveName.length + 4 + Q.length
++                + 4 + application.length;
++  const publicKey = Buffer.allocUnsafe(total);
++
++  let i = 0;
++  writeUInt32BE(publicKey, typeName.length, i);
++  publicKey.utf8Write(typeName, i += 4, typeName.length);
++  i += typeName.length;
++
++  writeUInt32BE(publicKey, curveName.length, i);
++  publicKey.utf8Write(curveName, i += 4, curveName.length);
++  i += curveName.length;
++
++  writeUInt32BE(publicKey, Q.length, i);
++  publicKey.set(Q, i += 4);
++  i += Q.length;
++
++  writeUInt32BE(publicKey, application.length, i);
++  publicKey.utf8Write(application, i += 4, application.length);
++
++  return publicKey;
++}
++
+ function genOpenSSLEdPriv(priv) {
+   const asnWriter = new Ber.Writer();
+   asnWriter.startSequence();
+@@ -451,6 +503,82 @@ const BaseKey = {
+   },
+ };
+ 
++// Base for FIDO/U2F security key public keys (sk-ssh-ed25519@openssh.com,
++// sk-ecdsa-sha2-nistp256@openssh.com).
++//
++// Signing requires the actual hardware token (typically performed by
++// ssh-agent talking to libfido2), so sign() is not implemented locally.
++//
++// Verifying takes the original message ("data"); the SK signature blob
++// includes the device flags and counter that must be folded into the
++// signed payload as defined by OpenSSH PROTOCOL.u2f:
++//
++//     sha256(application) || flags || counter || sha256(message)
++const SKBaseKey = {
++  ...BaseKey,
++  sign: function sign() {
++    return new Error(
++      'Cannot sign locally with a security-key (SK) public key; '
++        + 'signing must be performed by the FIDO/U2F hardware token '
++        + '(e.g. via ssh-agent)'
++    );
++  },
++  verify: function verify(data, signature, algo) {
++    /*
++      The SK signature blob is:
++        string  raw_signature
++                  - sk-ssh-ed25519: 64 raw bytes
++                  - sk-ecdsa-sha2-nistp256: SSH ECDSA blob (string r, string s)
++        byte    flags
++        uint32  counter
++    */
++    const sigParser = makeBufferParser();
++    sigParser.init(signature, 0);
++    const rawSig = sigParser.readString();
++    if (rawSig === undefined) {
++      sigParser.clear();
++      return new Error('Malformed SK signature');
++    }
++    const pos = sigParser.pos();
++    sigParser.clear();
++    if (pos + 5 > signature.length)
++      return new Error('Malformed SK signature');
++    const flags = signature[pos];
++    const counter = readUInt32BE(signature, pos + 1);
++
++    const appHash = createHash('sha256').update(this[SYM_SK_APP]).digest();
++    const dataHash = createHash('sha256').update(data).digest();
++
++    const signedData = Buffer.allocUnsafe(
++      appHash.length + 1 + 4 + dataHash.length
++    );
++    let p = 0;
++    signedData.set(appHash, p);
++    p += appHash.length;
++    signedData[p++] = flags;
++    writeUInt32BE(signedData, counter, p);
++    p += 4;
++    signedData.set(dataHash, p);
++
++    let toVerify = rawSig;
++    if (getOpenSSHCertBaseType(this.type) === 'sk-ecdsa-sha2-nistp256@openssh.com') {
++      // Convert SSH ECDSA r,s blob to ASN.1 for OpenSSL
++      const { sigSSHToASN1 } = require('./utils.js');
++      toVerify = sigSSHToASN1(rawSig, 'ecdsa-sha2-nistp256');
++      if (!toVerify)
++        return new Error('Malformed SK ECDSA signature');
++    }
++
++    return BaseKey.verify.call(this, signedData, toVerify, algo);
++  },
++  getApplication: function getApplication() {
++    return this[SYM_SK_APP];
++  },
++  getKeyHandle: function getKeyHandle() {
++    return this[SYM_SK_HANDLE];
++  },
++};
++
+ 
+ function OpenSSH_Private(type, comment, privPEM, pubPEM, pubSSH, algo,
+                          decrypted) {
+@@ -463,6 +591,26 @@ function OpenSSH_Private(type, comment, privPEM, pubPEM, pubSSH, algo,
+   this[SYM_DECRYPTED] = decrypted;
+ }
+ OpenSSH_Private.prototype = BaseKey;
++
++// FIDO/U2F security key OpenSSH private-key entry. The "private" portion is
++// just the device key handle (used by the host to talk to the FIDO token);
++// the actual private key never leaves the hardware. Local sign() therefore
++// returns an error -- signing has to be performed by ssh-agent (or another
++// component talking to the device).
++function OpenSSH_SK_Private(type, comment, pubPEM, pubSSH, algo, decrypted,
++                            application, keyHandle, flags) {
++  this.type = type;
++  this.comment = comment;
++  this[SYM_PRIV_PEM] = null;
++  this[SYM_PUB_PEM] = pubPEM;
++  this[SYM_PUB_SSH] = pubSSH;
++  this[SYM_HASH_ALGO] = algo;
++  this[SYM_DECRYPTED] = decrypted;
++  this[SYM_SK_APP] = application;
++  this[SYM_SK_HANDLE] = keyHandle;
++  this[SYM_SK_FLAGS] = flags;
++}
++OpenSSH_SK_Private.prototype = SKBaseKey;
+ {
+   const regexp = /^-----BEGIN OPENSSH PRIVATE KEY-----(?:\r\n|\n)([\s\S]+)(?:\r\n|\n)-----END OPENSSH PRIVATE KEY-----$/;
+   OpenSSH_Private.parse = (str, passphrase) => {
+@@ -771,6 +919,87 @@ OpenSSH_Private.prototype = BaseKey;
+           privPEM = genOpenSSLECDSAPriv(oid, ecpub, ecpriv);
+           break;
+         }
++        case 'sk-ssh-ed25519@openssh.com': {
++          if (!eddsaSupported)
++            return new Error(`Unsupported OpenSSH private key type: ${type}`);
++          /*
++            string  public key
++            string  application
++            uint8   flags
++            string  key_handle
++            string  reserved
++          */
++          const edpub = readString(data, data._pos);
++          if (edpub === undefined || edpub.length !== 32)
++            return new Error('Malformed OpenSSH SK private key');
++          const application = readString(data, data._pos, true);
++          if (application === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          if (data._pos >= data.length)
++            return new Error('Malformed OpenSSH SK private key');
++          const flagsByte = data[data._pos];
++          data._pos += 1;
++          const keyHandle = readString(data, data._pos);
++          if (keyHandle === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          const reserved = readString(data, data._pos);
++          if (reserved === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++
++          pubPEM = genOpenSSLEdPub(edpub);
++          pubSSH = genOpenSSHSKEdPub(edpub, application);
++          algo = null;
++          const privComment = readString(data, data._pos, true);
++          if (privComment === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          const skKey = new OpenSSH_SK_Private(
++            type, privComment, pubPEM, pubSSH, algo, decrypted,
++            application, keyHandle, flagsByte
++          );
++          keys.push(skKey);
++          continue;
++        }
++        case 'sk-ecdsa-sha2-nistp256@openssh.com': {
++          /*
++            string  curve name ("nistp256")
++            string  Q -- public
++            string  application
++            uint8   flags
++            string  key_handle
++            string  reserved
++          */
++          if (!skipFields(data, 1)) // Skip curve name
++            return new Error('Malformed OpenSSH SK private key');
++          const ecpub = readString(data, data._pos);
++          if (ecpub === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          const application = readString(data, data._pos, true);
++          if (application === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          if (data._pos >= data.length)
++            return new Error('Malformed OpenSSH SK private key');
++          const flagsByte = data[data._pos];
++          data._pos += 1;
++          const keyHandle = readString(data, data._pos);
++          if (keyHandle === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          const reserved = readString(data, data._pos);
++          if (reserved === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++
++          pubPEM = genOpenSSLECDSAPub('1.2.840.10045.3.1.7', ecpub);
++          pubSSH = genOpenSSHSKECDSAPub(ecpub, application);
++          algo = 'sha256';
++          const privComment = readString(data, data._pos, true);
++          if (privComment === undefined)
++            return new Error('Malformed OpenSSH SK private key');
++          const skKey = new OpenSSH_SK_Private(
++            type, privComment, pubPEM, pubSSH, algo, decrypted,
++            application, keyHandle, flagsByte
++          );
++          keys.push(skKey);
++          continue;
++        }
+         default:
+           return new Error(`Unsupported OpenSSH private key type: ${type}`);
+       }
+@@ -1186,31 +1415,97 @@ function OpenSSH_Public(type, comment, pubPEM, pubSSH, algo) {
    this[SYM_DECRYPTED] = false;
  }
  OpenSSH_Public.prototype = BaseKey;
++
++// FIDO/U2F security key public key wrapper. See SKBaseKey.
++function OpenSSH_SK_Public(type, comment, pubPEM, pubSSH, algo, application) {
++  this.type = type;
++  this.comment = comment;
++  this[SYM_PRIV_PEM] = null;
++  this[SYM_PUB_PEM] = pubPEM;
++  this[SYM_PUB_SSH] = pubSSH;
++  this[SYM_HASH_ALGO] = algo;
++  this[SYM_DECRYPTED] = false;
++  this[SYM_SK_APP] = application;
++  this[SYM_SK_HANDLE] = null;
++  this[SYM_SK_FLAGS] = 0;
++}
++OpenSSH_SK_Public.prototype = SKBaseKey;
 +
 +function isOpenSSHCertType(type) {
 +  return (typeof type === 'string'
@@ -829,6 +1543,30 @@ index a276c1a..df123fd 100644
 +    case 'rsa-sha2-256':
 +    case 'rsa-sha2-512':
 +      return 'ssh-rsa';
++    // OpenSSH places `-cert-v01` before `@openssh.com` for SK certs
++    // (sk-ssh-ed25519-cert-v01@openssh.com), so strip leaves the bare algorithm.
++    case 'sk-ssh-ed25519':
++      return 'sk-ssh-ed25519@openssh.com';
++    case 'sk-ecdsa-sha2-nistp256':
++      return 'sk-ecdsa-sha2-nistp256@openssh.com';
++    default:
++      return baseType;
++  }
++}
++
++// Wire signature algorithm for a publickey/hostbased cert identity.
++// Unlike getOpenSSHCertBaseType, RSA SHA2 certs keep rsa-sha2-* (not ssh-rsa).
++// SK certs must restore the trailing @openssh.com required on the wire.
++function getOpenSSHCertSignatureAlgorithm(type) {
++  if (typeof type !== 'string' || !/-cert-v0[01]@openssh\.com$/.test(type))
++    return type;
++
++  const baseType = type.replace(/-cert-v0[01]@openssh\.com$/, '');
++  switch (baseType) {
++    case 'sk-ssh-ed25519':
++      return 'sk-ssh-ed25519@openssh.com';
++    case 'sk-ecdsa-sha2-nistp256':
++      return 'sk-ecdsa-sha2-nistp256@openssh.com';
 +    default:
 +      return baseType;
 +  }
@@ -836,9 +1574,38 @@ index a276c1a..df123fd 100644
 +
  {
    let regexp;
-   if (eddsaSupported)
-@@ -1210,7 +1230,13 @@ OpenSSH_Public.prototype = BaseKey;
-     if (type === undefined || type.indexOf(baseType) !== 0)
+-  if (eddsaSupported)
+-    regexp = /^(((?:ssh-(?:rsa|dss|ed25519))|ecdsa-sha2-nistp(?:256|384|521))(?:-cert-v0[01]@openssh.com)?) ([A-Z0-9a-z/+=]+)(?:$|\s+([\S].*)?)$/;
+-  else
+-    regexp = /^(((?:ssh-(?:rsa|dss))|ecdsa-sha2-nistp(?:256|384|521))(?:-cert-v0[01]@openssh.com)?) ([A-Z0-9a-z/+=]+)(?:$|\s+([\S].*)?)$/;
++  if (eddsaSupported) {
++    // SK cert names use `-cert-v01` before `@openssh.com`, unlike classic keys.
++    regexp = /^((((?:ssh-(?:rsa|dss|ed25519))|ecdsa-sha2-nistp(?:256|384|521))(?:-cert-v0[01]@openssh\.com)?)|(sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)(?:-cert-v0[01])?@openssh\.com)) ([A-Z0-9a-z/+=]+)(?:$|\s+([\S].*)?)$/;
++  } else {
++    regexp = /^((((?:ssh-(?:rsa|dss))|ecdsa-sha2-nistp(?:256|384|521))(?:-cert-v0[01]@openssh\.com)?)|(sk-ecdsa-sha2-nistp256(?:-cert-v0[01])?@openssh\.com)) ([A-Z0-9a-z/+=]+)(?:$|\s+([\S].*)?)$/;
++  }
+   OpenSSH_Public.parse = (str) => {
+     const m = regexp.exec(str);
+     if (m === null)
+       return null;
+     // m[1] = full type
+-    // m[2] = base type
+-    // m[3] = base64-encoded public key
+-    // m[4] = comment
++    // m[5] = base64-encoded public key
++    // m[6] = comment
+ 
+     const fullType = m[1];
+-    const baseType = m[2];
+-    const data = Buffer.from(m[3], 'base64');
+-    const comment = (m[4] || '');
++    const baseType = getOpenSSHCertBaseType(fullType);
++    const data = Buffer.from(m[5], 'base64');
++    const comment = (m[6] || '');
+ 
+     const type = readString(data, data._pos, true);
+-    if (type === undefined || type.indexOf(baseType) !== 0)
++    if (type === undefined || getOpenSSHCertBaseType(type) !== baseType)
        return new Error('Malformed OpenSSH public key');
  
 -    return parseDER(data, baseType, comment, fullType);
@@ -852,7 +1619,7 @@ index a276c1a..df123fd 100644
    };
  }
  
-@@ -1309,7 +1335,7 @@ RFC4716_Public.prototype = BaseKey;
+@@ -1309,7 +1604,7 @@ RFC4716_Public.prototype = BaseKey;
  }
  
  
@@ -861,7 +1628,7 @@ index a276c1a..df123fd 100644
    if (!isSupportedKeyType(baseType))
      return new Error(`Unsupported OpenSSH public key type: ${baseType}`);
  
-@@ -1317,6 +1343,10 @@ function parseDER(data, baseType, comment, fullType) {
+@@ -1317,6 +1612,10 @@ function parseDER(data, baseType, comment, fullType) {
    let oid;
    let pubPEM = null;
    let pubSSH = null;
@@ -872,7 +1639,60 @@ index a276c1a..df123fd 100644
  
    switch (baseType) {
      case 'ssh-rsa': {
-@@ -1387,7 +1417,13 @@ function parseDER(data, baseType, comment, fullType) {
+@@ -1383,11 +1682,66 @@ function parseDER(data, baseType, comment, fullType) {
+       pubSSH = genOpenSSHECDSAPub(oid, ecpub);
+       break;
+     }
++    case 'sk-ssh-ed25519@openssh.com': {
++      /*
++        string  public key  (32 raw bytes)
++        string  application
++      */
++      const edpub = readString(data, data._pos || 0);
++      if (edpub === undefined || edpub.length !== 32)
++        return new Error('Malformed OpenSSH SK public key');
++      const application = readString(data, data._pos, true);
++      if (application === undefined)
++        return new Error('Malformed OpenSSH SK public key');
++      pubPEM = genOpenSSLEdPub(edpub);
++      pubSSH = genOpenSSHSKEdPub(edpub, application);
++      algo = null;
++      return new OpenSSH_SK_Public(
++        fullType,
++        comment,
++        pubPEM,
++        isCertificate ? Buffer.from(originalPubSSH || data) : pubSSH,
++        algo,
++        application
++      );
++    }
++    case 'sk-ecdsa-sha2-nistp256@openssh.com': {
++      /*
++        string  curve name ("nistp256")
++        string  Q -- public
++        string  application
++      */
++      if (!skipFields(data, 1)) // Skip curve name
++        return new Error('Malformed OpenSSH SK public key');
++      const ecpub = readString(data, data._pos || 0);
++      if (ecpub === undefined)
++        return new Error('Malformed OpenSSH SK public key');
++      const application = readString(data, data._pos, true);
++      if (application === undefined)
++        return new Error('Malformed OpenSSH SK public key');
++      pubPEM = genOpenSSLECDSAPub('1.2.840.10045.3.1.7', ecpub);
++      pubSSH = genOpenSSHSKECDSAPub(ecpub, application);
++      algo = 'sha256';
++      return new OpenSSH_SK_Public(
++        fullType,
++        comment,
++        pubPEM,
++        isCertificate ? Buffer.from(originalPubSSH || data) : pubSSH,
++        algo,
++        application
++      );
++    }
+     default:
        return new Error(`Unsupported OpenSSH public key type: ${baseType}`);
    }
  
@@ -887,7 +1707,18 @@ index a276c1a..df123fd 100644
  }
  
  function isSupportedKeyType(type) {
-@@ -1460,7 +1496,13 @@ function parseKey(data, passphrase) {
+@@ -1397,8 +1751,10 @@ function isSupportedKeyType(type) {
+     case 'ecdsa-sha2-nistp256':
+     case 'ecdsa-sha2-nistp384':
+     case 'ecdsa-sha2-nistp521':
++    case 'sk-ecdsa-sha2-nistp256@openssh.com':
+       return true;
+     case 'ssh-ed25519':
++    case 'sk-ssh-ed25519@openssh.com':
+       if (eddsaSupported)
+         return true;
+     // FALLTHROUGH
+@@ -1460,7 +1816,13 @@ function parseKey(data, passphrase) {
      if (type !== undefined) {
        data = binaryKeyParser.readRaw();
        if (data !== undefined) {
@@ -902,3 +1733,12 @@ index a276c1a..df123fd 100644
          // Ignore potentially useless errors in case the data was not actually
          // in the binary format
          if (ret instanceof Error)
+@@ -1479,6 +1841,7 @@ function parseKey(data, passphrase) {
+ module.exports = {
+   isParsedKey,
+   isSupportedKeyType,
+-  parseDERKey: (data, type) => parseDER(data, type, '', type),
++  getOpenSSHCertSignatureAlgorithm,
++  parseDERKey: (data, type) => parseDER(data, getOpenSSHCertBaseType(type), '', type),
+   parseKey,
+ };

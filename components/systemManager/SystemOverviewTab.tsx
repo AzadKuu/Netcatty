@@ -12,6 +12,7 @@ import { aggregateMountedDiskUsage } from '../../domain/systemDiskUsage';
 import { cn } from '../../lib/utils';
 import { useServerStats } from '../../application/state/useServerStats';
 import { ResourceBar } from './ResourceBar';
+import { DiskIoSummary } from './DiskIoSummary';
 import {
   SystemPanelEmpty,
   SystemPanelError,
@@ -335,6 +336,8 @@ export const SystemOverviewTab = memo(function SystemOverviewTab({
             />
           </div>
 
+          <div className="mt-3"><DiskIoSummary stats={stats} /></div>
+
           <div className="mt-3 grid grid-cols-2 gap-2">
             <InfoPill label={t('systemManager.overview.load')} value={formatLoad(stats.loadAverage)} />
             <InfoPill label={t('systemManager.overview.uptime')} value={formatDuration(stats.uptimeSeconds, t)} />
@@ -355,8 +358,8 @@ export const SystemOverviewTab = memo(function SystemOverviewTab({
               </span>
             </div>
             {stats.cpuPerCore.length > 0 ? (
-              <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-                {stats.cpuPerCore.slice(0, 12).map((core, index) => (
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 max-h-[260px] overflow-y-auto pr-1 overscroll-contain">
+                {stats.cpuPerCore.map((core, index) => (
                   <ResourceBar key={`core-${index}`} label={`C${index + 1}`} value={core} />
                 ))}
               </div>

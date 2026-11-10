@@ -1,5 +1,8 @@
+import type { TerminalSession } from "./models";
+
 export const TERMINAL_SIDE_PANEL_AUTO_OPEN_TABS = [
   "sftp",
+  "browser",
   "scripts",
   "history",
   "theme",
@@ -30,6 +33,33 @@ export function resolveTerminalSidePanelAutoOpen({
   sftpAvailable: boolean;
 }): TerminalSidePanelAutoOpenTab | null {
   if (!enabled) return null;
-  if (selectedTab === "sftp" && !sftpAvailable) return null;
+  if ((selectedTab === "sftp" || selectedTab === "browser") && !sftpAvailable) return null;
   return selectedTab;
+}
+
+/** Resolve local preferences separately; legacy SFTP auto-open remains remote-only. */
+export function resolveSessionSidePanelAutoOpen({
+  session,
+  terminalEnabled,
+  terminalTab,
+  localEnabled,
+  localTab,
+  legacySftpEnabled,
+}: {
+  session: Pick<TerminalSession, "protocol" | "autoOpenSidePanel">;
+  terminalEnabled: boolean;
+  terminalTab: TerminalSidePanelAutoOpenTab;
+  localEnabled: boolean;
+  localTab: TerminalSidePanelAutoOpenTab;
+  legacySftpEnabled: boolean;
+}): TerminalSidePanelAutoOpenTab | null {
+  const protocol = session.protocol ?? "ssh";
+  const isLocal = protocol === "local";
+  const sftpAvailable = isLocal || protocol === "ssh" || protocol === "mosh";
+  if (session.autoOpenSidePanel === "sftp" && sftpAvailable) return "sftp";
+  return resolveTerminalSidePanelAutoOpen({
+    enabled: isLocal ? localEnabled : terminalEnabled,
+    selectedTab: isLocal ? localTab : terminalTab,
+    sftpAvailable,
+  }) ?? (legacySftpEnabled && !isLocal && sftpAvailable ? "sftp" : null);
 }

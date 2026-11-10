@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { DEFAULT_AUTOCOMPLETE_SETTINGS, reconcileAutocompletePopupState } from "./autocomplete/useTerminalAutocomplete.ts";
+import type { AutocompleteState } from "./autocomplete/useTerminalAutocomplete.ts";
 import { handleTerminalAutocompleteKeyEvent } from "./autocomplete/terminalAutocompleteKeyEvent.ts";
 
 const suggestion = (text: string) => ({
@@ -56,6 +58,7 @@ function createContext(overrides: Record<string, unknown> = {}) {
     context: {
       settingsRef: {
         current: {
+          ...DEFAULT_AUTOCOMPLETE_SETTINGS,
           enabled: true,
           showGhostText: false,
           showPopupMenu: true,
@@ -348,3 +351,48 @@ test("subdir Escape does not arm Meta prefix", () => {
   assert.equal(context.escMetaPrefixUntilRef.current, 0);
 });
 
+
+for (const edited of [false, true]) {
+  test(`snippet navigation before provider refresh: edited=${edited}`, () => {
+    let runs = 0;
+    const initial: AutocompleteState = {
+      suggestions: [{
+        text: "deploy", displayText: "deploy", source: "snippet", score: 2000,
+        snippet: { id: "deploy", label: "deploy", command: "echo deploy" },
+      }],
+      selectedIndex: -1, popupVisible: true,
+      popupAnchorViewport: { left: 0, top: 0, bottom: 0 },
+      expandUpward: false, subDirPanels: [], subDirFocusLevel: -1,
+    };
+    const stateRef = { current: edited ? reconcileAutocompletePopupState(initial, "git pull xyz") : initial };
+    const { context } = createContext({
+      stateRef,
+      setState(update: AutocompleteState | ((prev: AutocompleteState) => AutocompleteState)) {
+        stateRef.current = typeof update === "function" ? update(stateRef.current) : update;
+      },
+      acceptSnippet() { runs++; return true; },
+    });
+    // An unselected snippet does not execute on direct Enter.
+    handleTerminalAutocompleteKeyEvent(keyEvent("Enter"), context);
+    assert.equal(runs, 0);
+    handleTerminalAutocompleteKeyEvent(keyEvent("ArrowDown"), context);
+    handleTerminalAutocompleteKeyEvent(keyEvent("Enter"), context);
+    assert.equal(runs, edited ? 0 : 1);
+  });
+}
+
+for (const key of ['Enter', 'ArrowUp', 'ArrowDown', 'ArrowRight', 'Escape', 'Tab']) {
+  for (const sentinel of ['isComposing', 'keyCode'] as const) {
+    test(`IME ${sentinel} ${key} passes through autocomplete without accepting or rewriting input`, () => {
+      const { context, writes, previews, accepted, clears } = createContext();
+      context.stateRef.current.selectedIndex = 0;
+      const original = context.stateRef.current;
+      const event = keyEvent(key);
+      Object.defineProperty(event, sentinel, { value: sentinel === 'isComposing' ? true : 229 });
+      assert.equal(handleTerminalAutocompleteKeyEvent(event, context), true);
+      assert.equal(event.defaultPrevented, false);
+      assert.equal(context.stateRef.current, original);
+      assert.deepEqual([...writes, ...previews, ...accepted, ...clears], []);
+    });
+  }
+}

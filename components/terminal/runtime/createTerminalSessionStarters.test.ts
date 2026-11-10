@@ -357,6 +357,34 @@ test("startPluginConnection displays status diagnostics when a Provider exits wi
   ]);
 });
 
+test("startSSH forwards a saved ChaCha20-only host setting to the transport", async () => {
+  const host = JSON.parse(JSON.stringify({
+    id: "host-chacha",
+    label: "Synthetic ChaCha20 server",
+    hostname: "127.0.0.1",
+    username: "synthetic",
+    algorithms: { cipher: ["chacha20-poly1305@openssh.com"] },
+  }));
+  let captured: Record<string, unknown> | undefined;
+  const ctx = createStarterContext({
+    host,
+    terminalBackend: {
+      backendAvailable: () => true,
+      startSSHSession: async (options: Record<string, unknown>) => {
+        captured = options;
+        return "ssh-session";
+      },
+      onSessionData: () => noop,
+      onSessionExit: () => noop,
+      onChainProgress: () => noop,
+      writeToSession: noop,
+      resizeSession: noop,
+    },
+  });
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+  assert.deepEqual(captured?.algorithmOverrides, host.algorithms);
+});
+
 test("startSSH forwards imported system agent authentication settings", async () => {
   let capturedOptions: Record<string, unknown> | null = null;
   const terminalBackend = {
@@ -426,6 +454,13 @@ test("startSSH tells the bridge to skip shell discovery for network devices", as
   };
   const ctx = createStarterContext({
     isNetworkDevice: true,
+    host: {
+      id: "host-1",
+      label: "Target",
+      hostname: "target.example.test",
+      username: "alice",
+      deviceType: "network",
+    },
     reuseConnectionFromSessionIdRef: { current: "source-session" },
     terminalBackend,
   });
@@ -434,6 +469,39 @@ test("startSSH tells the bridge to skip shell discovery for network devices", as
 
   assert.equal(capturedOptions?.sourceSessionId, "source-session");
   assert.equal(capturedOptions?.skipShellPidDiscovery, true);
+  assert.equal(capturedOptions?.singleChannelSsh, undefined);
+});
+
+test("startSSH ignores a legacy single-channel host field when copying a tab", async () => {
+  let capturedOptions: Record<string, unknown> | null = null;
+  const terminalBackend = {
+    backendAvailable: () => true,
+    startSSHSession: async (options: Record<string, unknown>) => {
+      capturedOptions = options;
+      return "ssh-session";
+    },
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: noop,
+    resizeSession: noop,
+  };
+  const ctx = createStarterContext({
+    host: {
+      id: "host-1",
+      label: "Target",
+      hostname: "target.example.test",
+      username: "alice",
+      singleChannelSsh: true,
+    },
+    reuseConnectionFromSessionIdRef: { current: "source-session" },
+    terminalBackend,
+  });
+
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+
+  assert.equal(capturedOptions?.sourceSessionId, "source-session");
+  assert.equal(capturedOptions?.singleChannelSsh, undefined);
 });
 
 test("startSSH requests a fresh transport for ordinary opens with connection automation", async () => {
@@ -2811,6 +2879,7 @@ test("startSSH enables sudo autofill only with the host saved password", async (
 test("startSSH does not use unsaved retry passwords for sudo autofill", async () => {
   let onData: ((data: string) => void) | null = null;
   const sent: string[] = [];
+  let captured: NetcattySSHOptions | undefined;
   const terminalBackend = {
     backendAvailable: () => true,
     telnetAvailable: () => true,
@@ -2818,7 +2887,7 @@ test("startSSH does not use unsaved retry passwords for sudo autofill", async ()
     localAvailable: () => true,
     serialAvailable: () => true,
     execAvailable: () => true,
-    startSSHSession: async () => "ssh-session",
+    startSSHSession: async (options: NetcattySSHOptions) => { captured = options; return "ssh-session"; },
     startTelnetSession: async () => "telnet-session",
     startMoshSession: async () => "mosh-session",
     startLocalSession: async () => "local-session",
@@ -2856,6 +2925,26 @@ test("startSSH does not use unsaved retry passwords for sudo autofill", async ()
   onData?.("[sudo] password for alice: ");
 
   assert.deepEqual(sent, []);
+  assert.equal(captured?.password, "temporary-secret");
+  assert.equal(captured?.sftpReuseOptions?.hostId, "host-1");
+  assert.equal(captured?.sftpReuseOptions?.password, undefined);
+  assert.equal(JSON.stringify(captured?.sftpReuseOptions).includes("temporary-secret"), false);
+  assert.equal("password" in ctx.host, false);
+
+  // An unreadable saved credential must not block a manual password override.
+  Object.assign(ctx.host, { password: ENCRYPTED_CREDENTIAL_PLACEHOLDER });
+  captured = undefined;
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+  assert.equal(captured?.password, "temporary-secret");
+  assert.equal(captured?.sftpReuseOptions, undefined);
+
+  // A different login user must never alias the original profile to SFTP.
+  Object.assign(ctx.host, { password: undefined });
+  ctx.pendingAuthRef.current.username = "deploy";
+  captured = undefined;
+  await createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+  assert.equal(captured?.username, "deploy");
+  assert.equal(captured?.sftpReuseOptions, undefined);
 });
 
 test("startSSH uses pending saved auth for sudo autofill on the first saved connection", async () => {
@@ -3592,7 +3681,214 @@ test("restored local reconnect runs the host startup command while automatic ret
   assert.deepEqual(sessionWrites, []);
 });
 
-test("local session start uses per-session directory before global default", async () => {
+test("restored SSH attach runs the live host startup command when the boot snapshot predates vault hydration", async () => {
+  const sessionWrites: Array<{ id: string; data: string; automated?: boolean }> = [];
+  // Session restore mounts the pane before the vault host (and group defaults)
+  // replace the fallback snapshot. The dial can still succeed from that
+  // snapshot; the startup command is only known on the effective host by the
+  // time the shell is attached.
+  const bootHost = {
+    id: "host-1",
+    label: "Target",
+    hostname: "target.example.test",
+    username: "alice",
+    port: 22,
+    protocol: "ssh" as const,
+    password: "secret",
+  };
+  const effectiveHost = {
+    ...bootHost,
+    startupCommand: "echo restored-startup",
+    startupCommandRunMode: "paste" as const,
+  };
+  const hostRef = { current: bootHost };
+  let releaseDial: (() => void) | undefined;
+  const dialStarted = new Promise<void>((resolve) => {
+    releaseDial = resolve;
+  });
+  const terminalBackend = {
+    backendAvailable: () => true,
+    startSSHSession: async () => {
+      await dialStarted;
+      return "ssh-session";
+    },
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: (id: string, data: string, options?: { automated?: boolean }) => {
+      sessionWrites.push({ id, data, automated: options?.automated });
+    },
+    resizeSession: noop,
+    closeSession: noop,
+  };
+  const ctx = createStarterContext({
+    host: bootHost,
+    hostRef,
+    terminalSettings: { startupCommandDelayMs: 0 },
+    terminalBackend,
+    startupCommand: undefined,
+    suppressHostStartupCommandRef: {
+      current: shouldSuppressHostStartupCommandOnReconnect("restored"),
+    },
+    promptLineBreakStateRef: undefined,
+  });
+
+  const started = createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+  hostRef.current = effectiveHost;
+  releaseDial?.();
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(sessionWrites, [
+    { id: "ssh-session", data: "echo restored-startup\r", automated: true },
+  ]);
+
+  sessionWrites.length = 0;
+  hostRef.current = effectiveHost;
+  const automaticCtx = createStarterContext({
+    ...ctx,
+    sessionRef: { current: null },
+    hasRunStartupCommandRef: { current: false },
+    suppressHostStartupCommandRef: {
+      current: shouldSuppressHostStartupCommandOnReconnect("automatic"),
+    },
+  });
+  await createTerminalSessionStarters(automaticCtx as never).startSSH(createTermStub() as never);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(sessionWrites, []);
+});
+
+test("restored SSH attach ignores a live startup command for a different dial target", async () => {
+  const bootHost = {
+    id: "host-1",
+    label: "Target",
+    hostname: "target.example.test",
+    username: "alice",
+    port: 22,
+    protocol: "ssh" as const,
+    password: "secret",
+  };
+  const mismatches = [
+    { label: "hostname", patch: { hostname: "moved.example.test" } },
+    { label: "port", patch: { port: 2222 } },
+    { label: "username", patch: { username: "bob" } },
+    { label: "protocol", patch: { protocol: "telnet" as const } },
+  ];
+
+  for (const { label, patch } of mismatches) {
+    const sessionWrites: Array<{ id: string; data: string; automated?: boolean }> = [];
+    const hostRef = { current: bootHost };
+    let releaseDial: (() => void) | undefined;
+    const dialStarted = new Promise<void>((resolve) => {
+      releaseDial = resolve;
+    });
+    const terminalBackend = {
+      backendAvailable: () => true,
+      startSSHSession: async () => {
+        await dialStarted;
+        return "ssh-session";
+      },
+      onSessionData: () => noop,
+      onSessionExit: () => noop,
+      onChainProgress: () => noop,
+      writeToSession: (id: string, data: string, options?: { automated?: boolean }) => {
+        sessionWrites.push({ id, data, automated: options?.automated });
+      },
+      resizeSession: noop,
+      closeSession: noop,
+    };
+    const ctx = createStarterContext({
+      host: bootHost,
+      hostRef,
+      terminalSettings: { startupCommandDelayMs: 0 },
+      terminalBackend,
+      startupCommand: undefined,
+      suppressHostStartupCommandRef: {
+        current: shouldSuppressHostStartupCommandOnReconnect("restored"),
+      },
+      promptLineBreakStateRef: undefined,
+    });
+
+    const started = createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+    hostRef.current = {
+      ...bootHost,
+      ...patch,
+      startupCommand: "echo moved-startup",
+    };
+    releaseDial?.();
+    await started;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(ctx.hasRunStartupCommandRef.current, false, label);
+    assert.deepEqual(sessionWrites, [], label);
+  }
+});
+
+test("restored SSH attach still runs a hydrated startup command when only the default port is materialized", async () => {
+  const sessionWrites: Array<{ id: string; data: string; automated?: boolean }> = [];
+  const bootHost = {
+    id: "host-1",
+    label: "Target",
+    hostname: "target.example.test",
+    username: "alice",
+    port: 22,
+    protocol: "ssh" as const,
+    password: "secret",
+  };
+  const hostRef = { current: bootHost };
+  let releaseDial: (() => void) | undefined;
+  const dialStarted = new Promise<void>((resolve) => {
+    releaseDial = resolve;
+  });
+  const terminalBackend = {
+    backendAvailable: () => true,
+    startSSHSession: async () => {
+      await dialStarted;
+      return "ssh-session";
+    },
+    onSessionData: () => noop,
+    onSessionExit: () => noop,
+    onChainProgress: () => noop,
+    writeToSession: (id: string, data: string, options?: { automated?: boolean }) => {
+      sessionWrites.push({ id, data, automated: options?.automated });
+    },
+    resizeSession: noop,
+    closeSession: noop,
+  };
+  const ctx = createStarterContext({
+    host: bootHost,
+    hostRef,
+    terminalSettings: { startupCommandDelayMs: 0 },
+    terminalBackend,
+    startupCommand: undefined,
+    suppressHostStartupCommandRef: {
+      current: shouldSuppressHostStartupCommandOnReconnect("restored"),
+    },
+    promptLineBreakStateRef: undefined,
+  });
+
+  const started = createTerminalSessionStarters(ctx as never).startSSH(createTermStub() as never);
+  hostRef.current = {
+    ...bootHost,
+    port: undefined,
+    startupCommand: "echo restored-startup",
+  };
+  releaseDial?.();
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(sessionWrites, [
+    { id: "ssh-session", data: "echo restored-startup\r", automated: true },
+  ]);
+});
+
+for (const { name, hostDirectory, globalDirectory, expectedDirectory } of [
+  { name: "uses saved directory before global default", hostDirectory: "/Users/alice/project", globalDirectory: "/Users/alice/default", expectedDirectory: "/Users/alice/project" },
+  { name: "inherits global directory when unset", hostDirectory: undefined, globalDirectory: "/Users/alice/default", expectedDirectory: "/Users/alice/default" },
+  { name: "inherits global directory when cleared", hostDirectory: "", globalDirectory: "/Users/alice/default", expectedDirectory: "/Users/alice/default" },
+  { name: "leaves directory unset for backend home default", hostDirectory: undefined, globalDirectory: undefined, expectedDirectory: undefined },
+]) {
+test(`local session start ${name}`, async () => {
   let capturedOptions: Record<string, unknown> | null = null;
   const terminalBackend = {
     backendAvailable: () => true,
@@ -3624,16 +3920,17 @@ test("local session start uses per-session directory before global default", asy
       hostname: "local",
       username: "",
       protocol: "local",
-      localStartDir: "/Users/alice/project",
+      localStartDir: hostDirectory,
     },
-    terminalSettings: { localStartDir: "/Users/alice/default" },
+    terminalSettings: { localStartDir: globalDirectory },
     terminalBackend,
   });
 
   await createTerminalSessionStarters(ctx as never).startLocal(createTermStub() as never);
 
-  assert.equal(capturedOptions?.cwd, "/Users/alice/project");
+  assert.equal(capturedOptions?.cwd, expectedDirectory);
 });
+}
 
 test("local session restores cwd before startup command after attaching", async () => {
   const sessionWrites: Array<{ id: string; data: string; automated?: boolean }> = [];

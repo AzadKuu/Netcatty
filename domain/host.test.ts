@@ -16,6 +16,7 @@ import {
   resolveTelnetPassword,
   resolveTelnetUsername,
   sanitizeHost,
+  hostRestrictsExtraSshChannels,
   shouldProbeSessionCwd,
   shouldSuggestNetworkDeviceMode,
   upsertHostById,
@@ -296,12 +297,22 @@ test("sanitizeHost removes hidden built-in credentials and transport state from 
     "identitiesOnly", "addKeysToAgent", "useKeychain", "agentForwarding", "x11Forwarding",
     "proxyProfileId", "proxyConfig", "hostChain", "moshEnabled", "moshServerPath", "etEnabled",
     "etPort", "telnetEnabled", "telnetPort", "telnetIdentityId", "telnetUsername",
-    "telnetPassword", "sftpSudo", "legacyAlgorithms", "skipEcdsaHostKey", "algorithms",
+    "telnetPassword", "sftpSudo", "singleChannelSsh", "legacyAlgorithms", "skipEcdsaHostKey", "algorithms",
     "keepaliveOverride", "keepaliveInterval", "keepaliveCountMax", "sshTcpConnectTimeoutSeconds",
     "sshAuthReadyTimeoutSeconds",
   ]) {
     assert.equal(field in sanitized, false, `${field} should be removed`);
   }
+});
+
+test("sanitizeHost drops a legacy single-channel SSH flag", () => {
+  const sanitized = sanitizeHost({
+    ...makeHost(),
+    singleChannelSsh: true,
+  } as Host);
+
+  assert.equal("singleChannelSsh" in sanitized, false);
+  assert.equal(sanitized.hostname, "127.0.0.1");
 });
 
 test("sanitizeHost keeps legacy empty-password hosts on automatic authentication", () => {
@@ -644,6 +655,40 @@ test("shouldProbeSessionCwd skips the probe when the SSH banner reveals a networ
   );
 });
 
+test("hostRestrictsExtraSshChannels follows network-device mode only", () => {
+  assert.equal(hostRestrictsExtraSshChannels({ deviceType: "network" }), true);
+  assert.equal(hostRestrictsExtraSshChannels({ deviceType: "general" }), false);
+  assert.equal(hostRestrictsExtraSshChannels({ singleChannelSsh: true } as never), false);
+  assert.equal(hostRestrictsExtraSshChannels(undefined), false);
+});
+
+test("shouldProbeSessionCwd skips the probe when extra SSH channels are restricted", () => {
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "OpenSSH_9.6", restrictExtraSshChannels: true }),
+    false,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "CLOUDBILITY-4.14" }),
+    false,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "BHostSSH_7.0" }),
+    false,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "SSH-2.0-TERM-SSHD" }),
+    false,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "JumpServer" }),
+    true,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "superterm-sshd" }),
+    true,
+  );
+});
+
 const GLOBAL_KEEPALIVE = { keepaliveInterval: 30, keepaliveCountMax: 10 };
 
 test("resolveHostKeepalive falls back to global when override is not set", () => {
@@ -726,4 +771,37 @@ test("getHostAddressForClipboard omits synthesized plugin hostnames", () => {
     ),
     "",
   );
+});
+
+test("CloudLinker skips the cwd probe without restricting generic Go servers", () => {
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "SSH-2.0-CloudLinker" }),
+    false,
+  );
+  assert.equal(
+    shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: "SSH-2.0-Go" }),
+    true,
+  );
+});
+
+test("sanitizeHost preserves named-pipe spaces and restores the authoritative serial path", () => {
+  const path = String.raw`\\.\pipe\VM console`;
+  const host = makeHost({ protocol: 'serial', hostname: String.raw`\\.\pipe\VM`, serialConfig: {
+    path, baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none',
+  } });
+  assert.equal(sanitizeHost(host).hostname, path);
+  assert.equal(sanitizeHost(host).serialConfig?.path, path);
+  assert.equal(sanitizeHost(makeHost({ hostname: 'example.com extra' })).hostname, 'example.com');
+});
+
+
+test("SSH input compatibility migrates legacy hosts once and preserves later choices", () => {
+  const legacy = { id: "legacy", label: "Legacy", hostname: "localhost", username: "user", tags: [], os: "linux" } as Host;
+  for (const protocol of [undefined, "ssh"] as const) {
+    const migrated = sanitizeHost({ ...legacy, protocol });
+    assert.equal(migrated.sshInputCompatibility, true);
+    assert.equal(sanitizeHost(migrated).sshInputCompatibility, true);
+    assert.equal(sanitizeHost({ ...migrated, sshInputCompatibility: false }).sshInputCompatibility, false);
+  }
+  assert.equal(sanitizeHost({ ...legacy, protocol: "telnet" }).sshInputCompatibility, undefined);
 });

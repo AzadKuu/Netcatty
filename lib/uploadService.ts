@@ -768,7 +768,8 @@ async function uploadEntries(
     entryTargetPath: string,
     standaloneTransferId: string,
     fileTotalBytes: number,
-  ): Promise<{ cancelled?: boolean; error?: string }> => {
+  ): Promise<{ cancelled?: boolean; error?: string; warning?: string }> => {
+    if (controller?.isCancelled(standaloneTransferId)) return { cancelled: true };
     let localFilePath = getDropEntryLocalPath(entry);
     let ownedTempPath: string | undefined;
 
@@ -784,13 +785,13 @@ async function uploadEntries(
         ownedTempPath = await bridge.stageUploadFile(entry.file, standaloneTransferId);
       } catch (error) {
         controller?.removeActiveTransfer(standaloneTransferId);
-        if (controller?.isCancelled() || /cancel/i.test(error instanceof Error ? error.message : String(error))) {
+        if (controller?.isCancelled(standaloneTransferId) || /cancel/i.test(error instanceof Error ? error.message : String(error))) {
           return { cancelled: true };
         }
         throw error;
       }
       localFilePath = ownedTempPath;
-      if (controller?.isCancelled()) {
+      if (controller?.isCancelled(standaloneTransferId)) {
         await bridge.deleteTempFile(ownedTempPath).catch(() => {});
         return { cancelled: true };
       }
@@ -801,7 +802,7 @@ async function uploadEntries(
         const fileTransferId = standaloneTransferId;
         controller?.addActiveTransfer(fileTransferId);
 
-        let streamResult: { transferId: string; totalBytes?: number; error?: string; cancelled?: boolean } | undefined;
+        let streamResult: { transferId: string; totalBytes?: number; error?: string; cancelled?: boolean; warning?: string } | undefined;
         try {
           streamResult = await bridge.startStreamTransfer({
               transferId: fileTransferId,
@@ -825,6 +826,7 @@ async function uploadEntries(
         if (streamResult?.error) {
           return { error: streamResult.error };
         }
+        return streamResult?.warning ? { warning: streamResult.warning } : {};
       } else {
         if (!entry.file) {
           return { error: "No local file data available" };
@@ -956,6 +958,11 @@ async function uploadEntries(
           );
 
           if (uploadResult.cancelled) {
+            if (!bundleTaskId && !controller?.isCancelled()) {
+              settleFileTask(standaloneTransferId, lifecycleManaged, (taskId) => callbacks?.onTaskCancelled?.(taskId));
+              results.push({ fileName: entry.relativePath, success: false, cancelled: true });
+              continue;
+            }
             wasCancelled = true;
             settleFileTask(bundledChildTaskId, lifecycleManaged, (taskId) => callbacks?.onTaskCancelled?.(taskId));
             settleTask(bundleTaskId ?? "", (taskId) => callbacks?.onTaskCancelled?.(taskId));
@@ -967,7 +974,10 @@ async function uploadEntries(
             throw new Error(uploadResult.error);
           }
 
-          results.push({ fileName: entry.relativePath, success: true });
+          if (uploadResult.warning) {
+            callbacks?.onTaskWarning?.(bundledChildTaskId || standaloneTransferId, uploadResult.warning);
+          }
+          results.push({ fileName: entry.relativePath, success: true, ...(uploadResult.warning ? { warning: uploadResult.warning } : {}) });
 
           // Update progress tracking
           if (bundleTaskId) {

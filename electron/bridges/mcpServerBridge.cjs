@@ -10,9 +10,11 @@ const net = require("node:net");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { PluginAgentMcpDelegations } = require("../plugins/agent/mcpDelegation.cjs");
+const pluginAgentDelegations = new PluginAgentMcpDelegations();
 const { existsSync } = require("node:fs");
 
-const { toUnpackedAsarPath, getFreshIdlePrompt, formatSyntheticEcho } = require("./ai/shellUtils.cjs");
+const { toUnpackedAsarPath, getFreshIdlePrompt, getVisibleIdlePrompt, formatSyntheticEcho } = require("./ai/shellUtils.cjs");
 const { appendVaultAgentGuidance } = require("../shared/vaultAgentGuidance.cjs");
 const {
   checkBlocklistForShell,
@@ -20,9 +22,12 @@ const {
   resolveSessionBlocklistShellKind,
 } = require("./ai/commandSafety.cjs");
 const { execViaPty, startPtyJob, execViaChannel, execViaRawPty } = require("./ai/ptyExec.cjs");
+const { emitJobDiag } = require("./ai/jobStartupDiagnostics.cjs");
 const { safeSend } = require("./ipcUtils.cjs");
+const { emitTerminalSessionData } = require("./emitTerminalSessionData.cjs");
 const { getCliDiscoveryFilePath } = require("../cli/discoveryPath.cjs");
 const { EXTERNAL_MCP_CHAT_SESSION_ID } = require("../cli/externalMcpDiscoveryPath.cjs");
+const { syncExternalMcpApprovalAttention } = require("./windowAttention.cjs");
 const sftpBridge = require("./sftpBridge.cjs");
 const portForwardingBridge = require("./portForwardingBridge.cjs");
 
@@ -48,12 +53,24 @@ let authToken = null;  // Random token generated when TCP server starts
 let externalAuthToken = null;
 let pendingHostStart = null; // { promise, server, cancel }
 let electronModule = null;
-let cliDiscoveryFilePath = getCliDiscoveryFilePath();
+// Resolved on demand rather than frozen at load time. The path used to be
+// captured here, so merely requiring this module (including from `node --test`)
+// inherited the INSTALLED app's live discovery file and `cleanup()` deleted it.
+let cliDiscoveryFilePathOverride = null;
+function getActiveCliDiscoveryFilePath() {
+  return cliDiscoveryFilePathOverride || getCliDiscoveryFilePath();
+}
+let discoverySelfHealTimer = null;
+const DISCOVERY_SELF_HEAL_INTERVAL_MS = 15000;
 
 // Track which sockets have completed authentication
 const authenticatedSockets = new WeakSet();
+const managedPrivacyScopes = new WeakMap();
+const aiPrivacyService = require("../shared/aiPrivacyService.cjs");
+const { createManagedPrivacyBoundary } = require("../shared/managedPrivacyBoundary.cjs");
 // Sockets authenticated with the External MCP token (or that used the reserved scope).
 const externalMcpSockets = new Set();
+const sessionApprovedExternalSockets = new WeakSet();
 
 function markExternalMcpSocket(socket) {
   if (!socket || socket.destroyed) return;
@@ -62,11 +79,26 @@ function markExternalMcpSocket(socket) {
     socket.__netcattyExternalMcpCleanupBound = true;
     const cleanup = () => {
       externalMcpSockets.delete(socket);
+      sessionApprovedExternalSockets.delete(socket);
+      clearPendingApprovalsForSocket(socket);
     };
     socket.once("close", cleanup);
     socket.once("end", cleanup);
     socket.once("error", cleanup);
   }
+}
+
+function attachExternalMcpClient(client) {
+  markExternalMcpSocket(client);
+  return () => {
+    if (!client || client.destroyed) return;
+    client.destroyed = true;
+    try {
+      client.emit?.("close");
+    } catch {
+      // Synthetic HTTP clients may not be emitters.
+    }
+  };
 }
 
 function issueExternalMcpAuthToken() {
@@ -76,6 +108,9 @@ function issueExternalMcpAuthToken() {
 
 function revokeExternalMcpAuthToken() {
   externalAuthToken = null;
+  for (const socket of externalMcpSockets) {
+    sessionApprovedExternalSockets.delete(socket);
+  }
 }
 
 function getExternalMcpAuthToken() {
@@ -88,6 +123,7 @@ function disconnectExternalMcpClients() {
   // is reserved for process shutdown paths that call this intentionally.
   for (const socket of Array.from(externalMcpSockets)) {
     externalMcpSockets.delete(socket);
+    sessionApprovedExternalSockets.delete(socket);
     try {
       if (!socket.destroyed) socket.destroy();
     } catch {
@@ -198,7 +234,7 @@ function broadcastApprovalEvent(channel, payload) {
   }
 }
 
-function requestApprovalFromRenderer(toolName, args, chatSessionId) {
+function requestApprovalFromRenderer(toolName, args, chatSessionId, approvalContext = {}) {
   return new Promise((resolve) => {
     debugLog("requestApprovalFromRenderer", { toolName, args, chatSessionId });
     const targets = listApprovalTargetWindows();
@@ -219,6 +255,7 @@ function requestApprovalFromRenderer(toolName, args, chatSessionId) {
       resolve(false);
       // Notify renderer(s) to remove the stale approval card
       broadcastApprovalEvent('netcatty:ai:mcp:approval-cleared', { approvalIds: [approvalId] });
+      syncExternalApprovalAttention();
     };
 
     const clearTimer = () => {
@@ -252,25 +289,60 @@ function requestApprovalFromRenderer(toolName, args, chatSessionId) {
       absoluteExpiresAt,
       idleCancelled: false,
       chatSessionId: chatSessionId || null,
+      externalSocket: approvalContext.externalSocket || null,
     });
     broadcastApprovalEvent('netcatty:ai:mcp:approval-request', {
       approvalId,
       toolName,
       args,
       chatSessionId: chatSessionId || undefined,
+      target: approvalContext.target || undefined,
+      allowSession: chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID
+        && externalMcpSockets.has(approvalContext.externalSocket),
     });
+    syncExternalApprovalAttention();
   });
 }
 
-function resolveApprovalFromRenderer(approvalId, approved) {
+function resolveApprovalFromRenderer(approvalId, approved, scope = 'once') {
   debugLog("resolveApprovalFromRenderer", { approvalId, approved });
   const entry = pendingApprovals.get(approvalId);
-  if (entry) {
-    pendingApprovals.delete(approvalId);
-    entry.resolve(approved);
-    // Main + settings both receive approval requests; clear the sibling card.
-    notifyRendererApprovalCleared([approvalId]);
+  if (!entry) return false;
+  pendingApprovals.delete(approvalId);
+  const externalSocket = entry.chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID
+    ? entry.externalSocket
+    : null;
+  const socketValid = entry.chatSessionId !== EXTERNAL_MCP_CHAT_SESSION_ID
+    || Boolean(externalSocket
+      && !externalSocket.destroyed
+      && externalMcpSockets.has(externalSocket)
+      && externalMcpActivityHook?.isEnabled?.());
+  const accepted = approved === true && socketValid;
+  const clearedIds = [approvalId];
+  if (accepted && scope === 'session' && externalSocket) {
+    sessionApprovedExternalSockets.add(externalSocket);
+    for (const [id, pending] of pendingApprovals) {
+      if (pending.externalSocket !== externalSocket) continue;
+      pendingApprovals.delete(id);
+      pending.resolve(true);
+      clearedIds.push(id);
+    }
   }
+  entry.resolve(accepted);
+  // Main + settings both receive approval requests; clear sibling cards.
+  notifyRendererApprovalCleared(clearedIds);
+  return socketValid;
+}
+
+function clearPendingApprovalsForSocket(socket) {
+  const clearedIds = [];
+  for (const [id, entry] of pendingApprovals) {
+    if (entry.externalSocket !== socket) continue;
+    pendingApprovals.delete(id);
+    entry.resolve(false);
+    clearedIds.push(id);
+  }
+  notifyRendererApprovalCleared(clearedIds);
 }
 
 /**
@@ -287,9 +359,24 @@ function cancelApprovalTimeoutFromRenderer(approvalId) {
   return true;
 }
 
+function countExternalMcpApprovals() {
+  let pending = 0;
+  for (const entry of pendingApprovals.values()) {
+    if (entry.chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID) pending += 1;
+  }
+  return pending;
+}
+
+function syncExternalApprovalAttention() {
+  try {
+    syncExternalMcpApprovalAttention(countExternalMcpApprovals());
+  } catch { /* attention must not change approval results */ }
+}
+
 function notifyRendererApprovalCleared(approvalIds) {
   if (!Array.isArray(approvalIds) || approvalIds.length === 0) return;
   broadcastApprovalEvent("netcatty:ai:mcp:approval-cleared", { approvalIds });
+  syncExternalApprovalAttention();
 }
 
 /**
@@ -384,7 +471,7 @@ function init(deps) {
   terminalWorkerManager = deps.terminalWorkerManager || null;
   fileTransferBridge = deps.transferBridge || null;
   electronModule = deps.electronModule || null;
-  cliDiscoveryFilePath = deps.cliDiscoveryFilePath || getCliDiscoveryFilePath();
+  cliDiscoveryFilePathOverride = deps.cliDiscoveryFilePath || null;
   debugLog("init", { hasSessions: Boolean(sessions), hasElectron: Boolean(electronModule) });
   if (deps.commandBlocklist) {
     commandBlocklist = deps.commandBlocklist;
@@ -422,6 +509,7 @@ async function listActivePortForwards() {
 }
 
 function writeCliDiscoveryFile() {
+  const cliDiscoveryFilePath = getActiveCliDiscoveryFilePath();
   if (!tcpPort || !authToken || !cliDiscoveryFilePath) return;
   const payload = {
     port: tcpPort,
@@ -439,6 +527,7 @@ function writeCliDiscoveryFile() {
 }
 
 function removeCliDiscoveryFile() {
+  const cliDiscoveryFilePath = getActiveCliDiscoveryFilePath();
   if (!cliDiscoveryFilePath) return;
   try {
     fs.rmSync(cliDiscoveryFilePath, { force: true });
@@ -447,7 +536,57 @@ function removeCliDiscoveryFile() {
   }
 }
 
+function isCliDiscoveryFileCurrent() {
+  const cliDiscoveryFilePath = getActiveCliDiscoveryFilePath();
+  if (!cliDiscoveryFilePath) return true;
+  let raw;
+  try {
+    raw = fs.readFileSync(cliDiscoveryFilePath, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed?.port === tcpPort
+      && parsed?.token === authToken
+      && parsed?.pid === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+// Self-heal: the discovery file is a runtime pointer that can be deleted
+// out-of-band (cleanup tools, agent shells) while the TCP bridge is still
+// listening. Rewrite it from the in-memory port/token so tool CLI does not
+// report a misleading APP_NOT_RUNNING / "sessions gone" error.
+function ensureCliDiscoveryFile() {
+  const cliDiscoveryFilePath = getActiveCliDiscoveryFilePath();
+  if (!tcpPort || !authToken || !cliDiscoveryFilePath) return;
+  if (isCliDiscoveryFileCurrent()) return;
+  debugLog("self-healing CLI discovery file");
+  writeCliDiscoveryFile();
+}
+
+function startDiscoverySelfHeal() {
+  stopDiscoverySelfHeal();
+  discoverySelfHealTimer = setInterval(() => {
+    try {
+      ensureCliDiscoveryFile();
+    } catch {
+      // Self-heal is best-effort.
+    }
+  }, DISCOVERY_SELF_HEAL_INTERVAL_MS);
+  if (typeof discoverySelfHealTimer.unref === "function") discoverySelfHealTimer.unref();
+}
+
+function stopDiscoverySelfHeal() {
+  if (!discoverySelfHealTimer) return;
+  clearInterval(discoverySelfHealTimer);
+  discoverySelfHealTimer = null;
+}
+
 function shutdownHost({ preserveScopedMetadata = false } = {}) {
+  stopDiscoverySelfHeal();
   removeCliDiscoveryFile();
   authToken = null;
   if (pendingHostStart?.server && pendingHostStart.server !== tcpServer) {
@@ -487,6 +626,10 @@ function shutdownHost({ preserveScopedMetadata = false } = {}) {
 function echoCommandToSession(session, sessionId, command, { syntheticEcho = true } = {}) {
   if (!electronModule || !session?.webContentsId || !command) return;
   const contents = electronModule.webContents?.fromId?.(session.webContentsId);
+  if (!syntheticEcho) {
+    emitTerminalSessionData(contents, sessionId, formatSyntheticEcho(command), { session });
+    return;
+  }
   safeSend(contents, "netcatty:data", {
     sessionId,
     data: formatSyntheticEcho(command),
@@ -577,6 +720,7 @@ function syncLiveSessionsToExternalScope(chatSessionId = EXTERNAL_MCP_CHAT_SESSI
       sessionList.push({
         sessionId,
         hostId: session.hostId || previous.hostId || "",
+        savedHostId: session.savedHostId || previous.savedHostId || "",
         hostname: session.hostname || session.host || previous.hostname || "",
         label: session.label || session.hostname || previous.label || sessionId,
         os: session.os || previous.os || "",
@@ -620,6 +764,15 @@ function syncLiveSessionsToExternalScope(chatSessionId = EXTERNAL_MCP_CHAT_SESSI
     }
     return { ok: true, count: 0, chatSessionId };
   }
+  // A reconnecting renderer tab can be absent from the backend map while
+  // another terminal is still live. Preserve its already scoped metadata;
+  // authoritative renderer updates remove it when the tab actually closes.
+  const liveIds = new Set(sessionList.map((entry) => entry.sessionId));
+  for (const [sessionId, meta] of existingMeta) {
+    if (!liveIds.has(sessionId) && meta.connected === false) {
+      sessionList.push({ sessionId, ...meta });
+    }
+  }
   updateSessionMetadata(sessionList, chatSessionId);
   return { ok: true, count: sessionList.length, chatSessionId };
 }
@@ -651,6 +804,7 @@ function updateLiveSessionMetadata(sessionList) {
   const next = new Map();
   for (const entry of incoming) {
     if (!entry || typeof entry !== "object" || !entry.sessionId) continue;
+    if (entry.connected === true) sessionService?.forgetReconnect(entry.sessionId);
     next.set(entry.sessionId, {
       hostname: entry.hostname || "",
       label: entry.label || "",
@@ -661,6 +815,7 @@ function updateLiveSessionMetadata(sessionList) {
       deviceType: entry.deviceType || "",
       connected: entry.connected !== false,
       hostId: entry.hostId || "",
+      savedHostId: entry.savedHostId || "",
       hostChain: Array.isArray(entry.hostChain) ? entry.hostChain : [],
       activePortForwards: Array.isArray(entry.activePortForwards) ? entry.activePortForwards : [],
       _revision: updateRevision,
@@ -785,6 +940,7 @@ function updateSessionMetadata(sessionList, chatSessionId) {
       deviceType: s.deviceType || "",
       connected: s.connected !== false,
       hostId: s.hostId || "",
+      savedHostId: s.savedHostId || "",
       hostChain: Array.isArray(s.hostChain) ? s.hostChain : [],
       activePortForwards: Array.isArray(s.activePortForwards) ? s.activePortForwards : [],
       _revision: Number.isSafeInteger(s._revision) ? s._revision : updateRevision,
@@ -825,6 +981,9 @@ function mergeSessionMetadata(sessionList, chatSessionId) {
       deviceType: entry.deviceType || previous.deviceType || "",
       connected: entry.connected !== undefined ? entry.connected !== false : previous.connected !== false,
       hostId: entry.hostId || previous.hostId || "",
+      savedHostId: Object.prototype.hasOwnProperty.call(entry, "savedHostId")
+        ? entry.savedHostId || ""
+        : previous.savedHostId || "",
       hostChain: Array.isArray(entry.hostChain)
         ? entry.hostChain
         : (Array.isArray(previous.hostChain) ? previous.hostChain : []),
@@ -941,16 +1100,44 @@ function handleReadAttachment(params) {
   const found = findRegisteredAttachment(params);
   if (found.error) return { ok: false, error: found.error };
   const attachment = found.attachment;
+  const maxBytes = Number.isSafeInteger(params?.maxBytes) && params.maxBytes >= 0
+    ? params.maxBytes
+    : null;
   let base64Data = attachment.base64Data;
+  if (maxBytes !== null && base64Data && Buffer.byteLength(base64Data, "base64") > maxBytes) {
+    return { ok: false, error: "Attachment exceeds the requested size limit." };
+  }
   if (!base64Data && attachment.filePath) {
     try {
-      base64Data = fs.readFileSync(attachment.filePath).toString("base64");
+      if (maxBytes === null) {
+        base64Data = fs.readFileSync(attachment.filePath).toString("base64");
+      } else {
+        const fd = fs.openSync(attachment.filePath, "r");
+        try {
+          const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1));
+          const chunks = [];
+          let total = 0;
+          while (total <= maxBytes) {
+            const read = fs.readSync(fd, chunk, 0, Math.min(chunk.length, maxBytes + 1 - total), null);
+            if (read === 0) break;
+            chunks.push(Buffer.from(chunk.subarray(0, read)));
+            total += read;
+          }
+          if (total > maxBytes) return { ok: false, error: "Attachment exceeds the requested size limit." };
+          base64Data = Buffer.concat(chunks, total).toString("base64");
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
     } catch (err) {
       return { ok: false, error: err?.message || "Failed to read attachment." };
     }
   }
-  if (!base64Data) return { ok: false, error: "Attachment content is unavailable." };
+  if (!base64Data && !attachment.filePath) return { ok: false, error: "Attachment content is unavailable." };
   const buffer = Buffer.from(base64Data, "base64");
+  if (maxBytes !== null && buffer.length > maxBytes) {
+    return { ok: false, error: "Attachment exceeds the requested size limit." };
+  }
   const result = {
     ok: true,
     filename: attachment.filename,
@@ -1037,6 +1224,18 @@ function toPublicSessionMeta(meta) {
   return publicMeta;
 }
 
+function getApprovalTarget(params) {
+  if (typeof params?.sessionId !== 'string' || !params.sessionId) return null;
+  const meta = getSessionMeta(params.sessionId, params.chatSessionId);
+  if (!meta) return null;
+  return {
+    sessionId: params.sessionId,
+    hostId: meta.savedHostId || '',
+    label: meta.label || meta.hostname || params.sessionId,
+    hostname: meta.hostname || '',
+  };
+}
+
 function buildOpenedSessionMeta(result, sessionId) {
   const host = result?.host && typeof result.host === "object" ? result.host : {};
   return {
@@ -1050,6 +1249,9 @@ function buildOpenedSessionMeta(result, sessionId) {
     deviceType: host.deviceType || "",
     connected: result?.status === "connected",
     hostId: result?.hostId || host.id || "",
+    savedHostId: result?.savedHostId && result.savedHostId === (result?.hostId || host.id)
+      ? result.savedHostId
+      : "",
     hostChain: [],
     activePortForwards: [],
   };
@@ -1070,6 +1272,8 @@ function ensureOpenedSessionMetadata(chatSessionId, sessionId, result) {
  */
 function forgetClosedTerminalSession(sessionId) {
   if (!sessionId) return;
+  sessionService?.forgetReconnect(sessionId);
+  sessionService?.forgetRecovery(sessionId);
   terminalSessionCloseRevision += 1;
   closedTerminalSessionRevisions.delete(sessionId);
   closedTerminalSessionRevisions.set(sessionId, terminalSessionCloseRevision);
@@ -1119,7 +1323,11 @@ function checkCommandSafetyCommonOnly(command) {
 // ── TCP Server ──
 
 function getOrCreateHost() {
-  if (tcpServer && tcpPort) return Promise.resolve(tcpPort);
+  if (tcpServer && tcpPort) {
+    // Host is alive; repair the discovery file if it was removed out-of-band.
+    ensureCliDiscoveryFile();
+    return Promise.resolve(tcpPort);
+  }
   if (pendingHostStart?.promise) return pendingHostStart.promise;
 
   // Generate a random auth token for this server instance
@@ -1178,6 +1386,7 @@ function getOrCreateHost() {
       tcpServer = server;
       debugLog("TCP server listening", { port: tcpPort });
       writeCliDiscoveryFile();
+      startDiscoverySelfHeal();
       try {
         externalMcpHostReadyHook?.({ port: tcpPort, token: authToken });
       } catch {
@@ -1219,7 +1428,7 @@ function handleConnection(socket) {
       consumedUntil = newlineIdx + 1;
       searchFrom = consumedUntil;
       if (!line.trim()) continue;
-      debugLog("Incoming line", line);
+      debugLog("Incoming message", { bytes: Buffer.byteLength(line) });
       handleMessage(socket, line);
     }
     if (consumedUntil > 0) buffer = buffer.slice(consumedUntil);
@@ -1239,7 +1448,7 @@ async function handleMessage(socket, line) {
   }
 
   const { id, method, params } = msg;
-  debugLog("handleMessage", { id, method, params });
+  debugLog("handleMessage", { id, method });
   if (id == null || !method) return;
 
   // ── Authentication gate ──
@@ -1251,7 +1460,8 @@ async function handleMessage(socket, line) {
     const isExternalToken = Boolean(
       presentedToken && externalAuthToken && presentedToken === externalAuthToken,
     );
-    if (method === "auth/verify" && (isCattyToken || isExternalToken)) {
+    const isDelegatedToken = method === "auth/verify" && pluginAgentDelegations.authenticate(presentedToken, socket);
+    if (method === "auth/verify" && (isCattyToken || isExternalToken || isDelegatedToken)) {
       if (isExternalToken && !externalMcpActivityHook?.isEnabled?.()) {
         const response = JSON.stringify({
           jsonrpc: "2.0",
@@ -1292,6 +1502,13 @@ async function handleMessage(socket, line) {
 
   try {
     const callParams = { ...(params || {}) };
+    const delegatedChat = pluginAgentDelegations.boundChat(socket);
+    if (delegatedChat) {
+      if (callParams.chatSessionId && callParams.chatSessionId !== delegatedChat) throw Error("Agent connection cannot change its session");
+      callParams.chatSessionId = delegatedChat;
+    } else if (pluginAgentDelegations.isReserved(callParams.chatSessionId)) {
+      throw Error("Delegated Agent credentials required");
+    }
     // External-token sockets always operate under the reserved app-wide scope so
     // callers cannot omit chatSessionId and widen access via scopedSessionIds.
     if (externalMcpSockets.has(socket)) {
@@ -1312,7 +1529,25 @@ async function handleMessage(socket, line) {
       );
     }
     notifyExternalMcpActivity(method, callParams);
-    const result = await dispatch(method, callParams);
+    let result;
+    if (isExternalScope || externalMcpSockets.has(socket)) {
+      result = await dispatch(method, callParams, {
+        externalSocket: socket,
+        beforeExecute: aiPrivacyService.createPolicyGuard(),
+      });
+    } else {
+      const boundScope = managedPrivacyScopes.get(socket);
+      if (boundScope && boundScope !== callParams.chatSessionId) {
+        throw new Error("Managed agent connection cannot change its chat session.");
+      }
+      if (aiPrivacyService.isEnabled() && callParams.chatSessionId) {
+        managedPrivacyScopes.set(socket, callParams.chatSessionId);
+      }
+      result = await createManagedPrivacyBoundary(
+        (rpcMethod, rpcParams, context) => dispatch(rpcMethod, rpcParams, { ...context, externalSocket: socket }),
+        aiPrivacyService,
+      )(method, callParams);
+    }
     const response = JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n";
     if (!socket.destroyed) socket.write(response);
   } catch (err) {
@@ -1382,7 +1617,74 @@ function reportOpenedSessionActivity(event = {}) {
   return sessionIdleManager.touch(null, sessionId);
 }
 
+// In the default terminal worker path the SSH runtime (and its prompt
+// tracking state) lives in the worker, so the main-process `sessions` map is
+// empty for it. Ask the owning worker for read-only prompt readiness. A miss
+// or a worker failure yields null: an unknown state must never report ready.
+// The probe is bounded well below the 20s recovery budget so a live-but-
+// unresponsive worker cannot hang inspectRecovery past the recovery loop's
+// deadline/cancel machinery.
+const WORKER_SHELL_READINESS_TIMEOUT_MS = 2000;
+
+async function queryWorkerShellReadiness(sessionId, status) {
+  if (status !== "connected" || !terminalWorkerManager?.request) return null;
+  // terminalWorkerManager.request has no cancellation support, so the probe
+  // cannot be aborted once posted. Race it against a timeout instead: a late
+  // worker response settles into an abandoned promise (fire-and-forget) and
+  // never mutates state after the timeout decision.
+  let timeoutId;
+  try {
+    const result = await Promise.race([
+      terminalWorkerManager.request("netcatty:ai:shellReadiness", { sessionId }, {}),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(
+          () => resolve(null),
+          WORKER_SHELL_READINESS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (result?.ok !== true || result.found !== true) return null;
+    return {
+      trackedShell: result.trackedShell === true,
+      ready: Boolean(result.freshIdlePrompt || result.visibleIdlePrompt),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 sessionService = createSessionService({
+  validateReconnect: (params = {}) => {
+    const scopeErr = validateSessionScope(params.sessionId, params.chatSessionId, params.scopedSessionIds);
+    if (scopeErr) return { ok: false, error: scopeErr };
+    if (isChatSessionCancelled(params.chatSessionId)) return { ok: false, error: "Chat session is cancelled." };
+    if (permissionMode === "observer") return { ok: false, error: "Recovery is unavailable in observer mode." };
+    if (sessionIdleManager.isClosing(params.sessionId)) return { ok: false, error: "Session is closing." };
+    return { ok: true };
+  },
+  inspectRecovery: async (params, timeoutMs) => {
+    if (typeof invokeVaultAgentFn !== "function") return { ok: false, error: "Session recovery bridge is unavailable." };
+    sessionIdleManager.touch(null, params.sessionId);
+    const state = await invokeVaultAgentFn("session.inspectRecovery", { sessionId: params.sessionId }, { timeoutMs });
+    if (state?.ok !== true) return state;
+    const runtime = sessions?.get(params.sessionId);
+    const meta = getSessionMeta(params.sessionId, params.chatSessionId);
+    const probe = runtime ? {
+      trackedShell: typeof runtime._promptTrackTail === "string",
+      ready: Boolean(getFreshIdlePrompt(runtime) || getVisibleIdlePrompt(runtime)),
+    } : await queryWorkerShellReadiness(params.sessionId, state.status);
+    const trackedShell = Boolean(probe?.trackedShell) && !isNetworkDeviceLikeMeta(meta);
+    // shellReady semantics: transport not connected → false; connected but
+    // the shell is untracked or the probe missed/timed out → null (unknown);
+    // a tracked shell reports its observed readiness. It is advisory for
+    // callers: recovery never writes to the PTY, so an unknown or false
+    // readiness only asks for an inspect_shell step, never blocks.
+    const shellReady = state.status !== "connected" ? false : !probe ? null : trackedShell
+      ? Boolean(probe.ready) : null;
+    return { ...state, shellReady, busy: Boolean(getSessionBusyError(params.sessionId)) };
+  },
   invokeSessionAgent: (...args) => {
     if (typeof invokeVaultAgentFn !== "function") {
       return Promise.resolve({ ok: false, error: "Vault agent bridge is unavailable." });
@@ -1431,6 +1733,7 @@ const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
     return invokeVaultAgentFn(...args);
   },
   evaluatePermissionWithGrants,
+  isDelegatedApproval: (context) => pluginAgentDelegations.isApproved(context),
   get permissionMode() {
     return permissionMode;
   },
@@ -1439,6 +1742,8 @@ const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
   },
   isChatSessionCancelled,
   requestApprovalFromRenderer,
+  getApprovalTarget,
+  hasSessionApproval: (socket) => Boolean(socket && sessionApprovedExternalSockets.has(socket)),
   USER_DENIED_MESSAGE,
   listPortForwards: () => listActivePortForwards(),
   sessionService,
@@ -1450,7 +1755,18 @@ const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
     // The renderer creates the tab before replying to host_open. If the user
     // explicitly closes it while that reply is still in flight, the eventual
     // result must not revive ownership or scope metadata for the closed tab.
-    if ((closedTerminalSessionRevisions.get(sessionId) || 0) > generation?.closeRevision) return;
+    if ((closedTerminalSessionRevisions.get(sessionId) || 0) > generation?.closeRevision) return false;
+    // Reuse adds visibility only: never grant ownership or change the original
+    // owner's idle lifecycle merely because another chat referenced the tab.
+    if (result?.reused === true) {
+      if (generation?.ownershipGeneration?.revoked) {
+        // A late renderer merge must not recreate a deleted chat's scope.
+        scopedMetadata.delete(chatSessionId);
+        return false;
+      }
+      ensureOpenedSessionMetadata(chatSessionId, sessionId, result);
+      return true;
+    }
     if (!openedSessionOwnership.register(
       chatSessionId,
       sessionId,
@@ -1469,7 +1785,7 @@ const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
       // again. Remove only scope/live metadata here so a deleted chat cannot be
       // recreated by the renderer's late merge.
       forgetUnownedTerminalSessionMetadata(sessionId);
-      return;
+      return false;
     }
     closedTerminalSessionRevisions.delete(sessionId);
     // A full empty scope replace can land after the renderer's best-effort
@@ -1477,6 +1793,7 @@ const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
     // succeeds, restore the returned session atomically with its ownership.
     ensureOpenedSessionMetadata(chatSessionId, sessionId, result);
     sessionIdleManager.track(chatSessionId, sessionId);
+    return true;
   },
 });
 
@@ -1573,7 +1890,7 @@ function buildTerminalToolGuidance(toolHints) {
   return "";
 }
 
-async function handleWorkerTerminalExec(params = {}) {
+async function handleWorkerTerminalExec(params = {}, beforeExecute) {
   const { sessionId, command } = params;
   if (!sessionId || !command) throw new Error("sessionId and command are required");
   if (typeof command !== "string" || !command.trim()) {
@@ -1621,7 +1938,7 @@ async function handleWorkerTerminalExec(params = {}) {
       sessionMeta: meta,
       enforceWallTimeout: true,
       commandBlocklist,
-    }, {});
+    }, typeof beforeExecute === "function" ? { beforeExecute } : {});
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
   } finally {
@@ -1630,7 +1947,7 @@ async function handleWorkerTerminalExec(params = {}) {
   }
 }
 
-async function handleWorkerJobStart(params = {}) {
+async function handleWorkerJobStart(params = {}, beforeExecute) {
   const { sessionId, command } = params;
   if (!sessionId || !command) throw new Error("sessionId and command are required");
   if (typeof command !== "string" || !command.trim()) {
@@ -1672,7 +1989,7 @@ async function handleWorkerJobStart(params = {}) {
       commandTimeoutMs,
       sessionMeta: meta,
       commandBlocklist,
-    }, {});
+    }, typeof beforeExecute === "function" ? { beforeExecute } : {});
     if (result?.ok && result.jobId) {
       if (pendingStart.cancelled || closingTerminalSessions.has(sessionId)) {
         await waitForWorkerCleanup(terminalWorkerManager.request("netcatty:ai:jobStop", {
@@ -1696,6 +2013,30 @@ async function handleWorkerJobStart(params = {}) {
   }
 }
 
+// Every removal from the worker route map goes through here so a later
+// poll/stop miss can be explained by a matching route-removed event.
+function deleteWorkerRoute(jobId, job, via) {
+  // A concurrent path may already have removed (or replaced) this route; only
+  // the call that really deletes it reports the removal.
+  if (workerBackgroundJobs.get(jobId) !== job) return;
+  emitJobDiag("route-removed", {
+    jobId,
+    sessionId: job?.sessionId ?? null,
+    chatSessionId: job?.chatSessionId || null,
+    via,
+  });
+  workerBackgroundJobs.delete(jobId);
+}
+
+// Why getWorkerJob/terminalWorkerManager could not serve a poll or stop:
+// the route is gone, the caller's chat scope does not own it, or the worker
+// manager is unavailable. These are different failures and must not share a label.
+function describeWorkerRouteMiss(jobId) {
+  if (!workerBackgroundJobs.has(jobId)) return "route-missing";
+  if (!terminalWorkerManager?.request) return "worker-unavailable";
+  return "scope-mismatch";
+}
+
 function getWorkerJob(jobId, chatSessionId) {
   const job = workerBackgroundJobs.get(jobId);
   if (!job) return null;
@@ -1705,37 +2046,49 @@ function getWorkerJob(jobId, chatSessionId) {
   return job;
 }
 
-async function handleWorkerJobPoll(params = {}) {
+const WORKER_JOB_NOT_FOUND_ERROR = "Background job not found";
+
+async function handleWorkerJobPoll(params = {}, beforeExecute) {
   const { jobId, chatSessionId, scopedSessionIds } = params || {};
   if (!jobId) throw new Error("jobId is required");
   const job = getWorkerJob(jobId, chatSessionId || null);
   if (!job || !terminalWorkerManager?.request) {
+    emitJobDiag("job-stop-miss", { jobId, chatSessionId: chatSessionId || null, op: "poll", reason: describeWorkerRouteMiss(jobId) });
     return { ok: false, error: "Background job not found" };
   }
   if (job.sessionId) {
     const scopeErr = validateSessionScope(job.sessionId, chatSessionId || null, scopedSessionIds);
     if (scopeErr) return { ok: false, error: scopeErr };
   }
-  const result = await terminalWorkerManager.request("netcatty:ai:jobPoll", params, {});
+  const result = await terminalWorkerManager.request("netcatty:ai:jobPoll", params, typeof beforeExecute === "function" ? { beforeExecute } : {});
+  if (result?.ok === false && result.error === WORKER_JOB_NOT_FOUND_ERROR) {
+    // The route is still here but the worker no longer knows the job (pruned or restarted).
+    emitJobDiag("job-stop-miss", { jobId, chatSessionId: chatSessionId || null, op: "poll", reason: "worker-job-missing" });
+  }
   if (result?.completed) {
-    workerBackgroundJobs.delete(jobId);
+    deleteWorkerRoute(jobId, job, "poll-completed");
   }
   return result;
 }
 
-async function handleWorkerJobStop(params = {}) {
+async function handleWorkerJobStop(params = {}, beforeExecute) {
   const { jobId, chatSessionId, scopedSessionIds } = params || {};
   if (!jobId) throw new Error("jobId is required");
   const job = getWorkerJob(jobId, chatSessionId || null);
   if (!job || !terminalWorkerManager?.request) {
+    emitJobDiag("job-stop-miss", { jobId, chatSessionId: chatSessionId || null, op: "stop", reason: describeWorkerRouteMiss(jobId) });
     return { ok: false, error: "Background job not found" };
   }
   if (Array.isArray(scopedSessionIds) && job.sessionId && !scopedSessionIds.includes(job.sessionId)) {
     return { ok: false, error: `Session "${job.sessionId}" is not in the current scope.` };
   }
-  const result = await terminalWorkerManager.request("netcatty:ai:jobStop", params, {});
+  const result = await terminalWorkerManager.request("netcatty:ai:jobStop", params, typeof beforeExecute === "function" ? { beforeExecute } : {});
+  if (result?.ok === false && result.error === WORKER_JOB_NOT_FOUND_ERROR) {
+    // The route is still here but the worker no longer knows the job (pruned or restarted).
+    emitJobDiag("job-stop-miss", { jobId, chatSessionId: chatSessionId || null, op: "stop", reason: "worker-job-missing" });
+  }
   if (result?.completed) {
-    workerBackgroundJobs.delete(jobId);
+    deleteWorkerRoute(jobId, job, "stop-completed");
   }
   return result;
 }
@@ -1753,7 +2106,7 @@ async function hasActiveWorkerJobForTerminalSession(sessionId) {
         offset: 0,
       }, {});
       if (result?.completed || (result?.ok === false && /not found/i.test(result?.error || ""))) {
-        workerBackgroundJobs.delete(jobId);
+        deleteWorkerRoute(jobId, job, "stale-check");
         continue;
       }
       return true;
@@ -1774,7 +2127,7 @@ function cancelWorkerBackgroundJobsForSession(chatSessionId) {
   }
   for (const [jobId, job] of workerBackgroundJobs) {
     if (job.chatSessionId === chatSessionId) {
-      workerBackgroundJobs.delete(jobId);
+      deleteWorkerRoute(jobId, job, "chat-session-cancel");
     }
   }
   try {
@@ -1804,7 +2157,7 @@ async function cancelWorkerBackgroundJobsForTerminalSession(sessionId) {
   const pending = [];
   for (const [jobId, job] of workerBackgroundJobs) {
     if (job.sessionId !== sessionId) continue;
-    matchingJobs.push(jobId);
+    matchingJobs.push([jobId, job]);
     if (terminalWorkerManager?.request) {
       pending.push(waitForWorkerCleanup(terminalWorkerManager.request("netcatty:ai:jobStop", {
         jobId,
@@ -1814,7 +2167,34 @@ async function cancelWorkerBackgroundJobsForTerminalSession(sessionId) {
     }
   }
   if (pending.length) await Promise.allSettled(pending);
-  for (const jobId of matchingJobs) workerBackgroundJobs.delete(jobId);
+  for (const [jobId, job] of matchingJobs) deleteWorkerRoute(jobId, job, "terminal-session-cancel");
+}
+
+// Read via the existing renderer bridge and the sidebar's bounded reader.
+async function handleReadContext(params = {}) {
+  const scopedIds = resolveScopedSessionIds(params.chatSessionId, params.scopedSessionIds);
+  const sessionId = typeof params.sessionId === "string" && params.sessionId.trim()
+    ? params.sessionId.trim()
+    : scopedIds?.length === 1 ? scopedIds[0] : null;
+  if (!sessionId) return { ok: false, error: "sessionId is required when the scope does not contain exactly one terminal." };
+  const scopeError = validateSessionScope(sessionId, params.chatSessionId, params.scopedSessionIds);
+  if (scopeError) return { ok: false, error: scopeError };
+  if (!invokeVaultAgentFn) return { ok: false, error: "Terminal context reader is unavailable." };
+  const ownerId = terminalWorkerManager?.getSessionOwnerWebContentsId?.(sessionId)
+    ?? sessions?.get(sessionId)?.webContentsId;
+  const owner = ownerId == null ? undefined : electronModule?.webContents?.fromId?.(ownerId);
+  if (ownerId != null && (!owner || owner.isDestroyed?.())) {
+    return { ok: false, error: "Terminal window is unavailable." };
+  }
+  const result = await invokeVaultAgentFn("terminal.readContext", {
+    sessionId,
+    range: params.range,
+    startLine: params.startLine,
+    maxLines: params.maxLines,
+  }, { webContents: owner });
+  // Scope can change while the renderer drains pending terminal output.
+  const currentScopeError = validateSessionScope(sessionId, params.chatSessionId, params.scopedSessionIds);
+  return currentScopeError ? { ok: false, error: currentScopeError } : result;
 }
 
 let builtinRpcHandlerRegistry = null;
@@ -1826,6 +2206,7 @@ function getBuiltinRpcHandlerRegistry() {
       "meta.status": handleGetStatus,
       "attachment.list": handleListAttachments,
       "attachment.read": handleReadAttachment,
+      "harness.terminal.read_context": handleReadContext,
       "terminal.execute": handleExec,
       "sftp.list": handleSftpList,
       "sftp.read": handleSftpRead,
@@ -1847,11 +2228,21 @@ function getBuiltinRpcHandlerRegistry() {
   return builtinRpcHandlerRegistry;
 }
 
-async function dispatch(method, params) {
-  debugLog("dispatch", { method, params, permissionMode });
+async function dispatch(method, params, approvalContext = {}) {
+  if (pluginAgentDelegations.isReserved(params?.chatSessionId)) {
+    return pluginAgentDelegations.dispatch(method, params, approvalContext,
+      (approved) => dispatchCore(method, params, approved));
+  }
+  return dispatchCore(method, params, approvalContext);
+}
+
+async function dispatchCore(method, params, approvalContext = {}) {
+  const delegated = pluginAgentDelegations.isApproved(approvalContext);
+  if (delegated) debugLog("Delegated dispatch", { method });
+  else debugLog("dispatch", { method, params, permissionMode });
 
   if (!method.startsWith("netcatty/")) {
-    const capabilityResult = await dispatchCapabilityRpc(method, params || {});
+    const capabilityResult = await dispatchCapabilityRpc(method, params || {}, approvalContext);
     if (capabilityResult !== UNROUTED) {
       return capabilityResult;
     }
@@ -1863,13 +2254,16 @@ async function dispatch(method, params) {
     : null;
   pruneCompletedBackgroundJobs();
 
-  const permission = evaluatePermissionWithGrants({
+  const approvalTarget = getApprovalTarget(params);
+  const permission = delegated ? { allowed: !isChatSessionCancelled(params?.chatSessionId), requiresApproval: false }
+    : evaluatePermissionWithGrants({
     rpcMethod: method,
     surface: CAPABILITY_SURFACES.BUILTIN,
     permissionMode,
     params,
     context: {
       chatSessionCancelled: isChatSessionCancelled(params?.chatSessionId),
+      hostId: approvalTarget?.hostId,
     },
   }, permissionGrantsSnapshot);
   if (!permission.allowed) {
@@ -1925,9 +2319,13 @@ async function dispatch(method, params) {
     // netcatty/jobStop bypasses approval — it's a stop/cancel action that
     // must remain available even if the renderer is unavailable; otherwise
     // a runaway terminal_start job could not be interrupted at all.
-    if (permission.requiresApproval) {
+    if (permission.requiresApproval
+      && !sessionApprovedExternalSockets.has(approvalContext.externalSocket)) {
       const { chatSessionId, ...toolArgs } = params || {};
-      const approved = await requestApprovalFromRenderer(method, toolArgs, chatSessionId);
+      const approved = await requestApprovalFromRenderer(method, toolArgs, chatSessionId, {
+        ...approvalContext,
+        target: approvalTarget,
+      });
       if (!approved) {
         return { ok: false, error: USER_DENIED_MESSAGE };
       }
@@ -1950,19 +2348,22 @@ async function dispatch(method, params) {
     if (!handler) {
       throw new Error(`Unknown method: ${method}`);
     }
+    // Approval may have waited across a privacy-policy change. Check at execution,
+    // not only when the managed request entered the dispatcher.
+    approvalContext.beforeExecute?.();
     if (capability?.id === "terminal.execute" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
-      return await handleWorkerTerminalExec(params);
+      return await handleWorkerTerminalExec(params, approvalContext.beforeExecute);
     }
     if (capability?.id === "terminal.start" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
-      return await handleWorkerJobStart(params);
+      return await handleWorkerJobStart(params, approvalContext.beforeExecute);
     }
     if (capability?.id === "terminal.poll" && workerBackgroundJobs.has(params?.jobId)) {
-      return await handleWorkerJobPoll(params);
+      return await handleWorkerJobPoll(params, approvalContext.beforeExecute);
     }
     if (capability?.id === "terminal.stop" && workerBackgroundJobs.has(params?.jobId)) {
-      return await handleWorkerJobStop(params);
+      return await handleWorkerJobStop(params, approvalContext.beforeExecute);
     }
-    return await handler(params);
+    return await handler(params, approvalContext);
   } finally {
     if (activityStarted) {
       sessionIdleManager.endActivity(params?.chatSessionId, params.sessionId);
@@ -1975,10 +2376,12 @@ async function dispatch(method, params) {
 
 // ── Handler: getContext ──
 
-async function handleGetContext(params) {
-  debugLog("handleGetContext:start", { params, sessionCount: sessions?.size || 0 });
-  const toolHints = buildMcpToolHints();
+async function handleGetContext(params, approvalContext) {
+  const delegated = pluginAgentDelegations.isApproved(approvalContext);
+  debugLog("handleGetContext:start", delegated ? { delegated: true } : { params, sessionCount: sessions?.size || 0 });
+  const toolHints = delegated ? null : buildMcpToolHints();
   if (!sessions) {
+    if (delegated) return { environment: "netcatty-terminal", description: "No host-selected terminal sessions are available.", hosts: [], hostCount: 0 };
     return {
       hosts: [],
       instructions: "No sessions available.",
@@ -2024,7 +2427,7 @@ async function handleGetContext(params) {
       description: "No hosts are available in the current scope.",
       hosts: [],
       hostCount: 0,
-      tools: toolHints,
+      ...(delegated ? {} : { tools: toolHints }),
     };
   }
   for (const [sessionId, session] of sessions.entries()) {
@@ -2034,10 +2437,16 @@ async function handleGetContext(params) {
     const hasCommandablePty = ptyStream && typeof ptyStream.write === "function";
     const hasSshExec = sshClient && typeof sshClient.exec === "function";
     const hasSerialPort = session.serialPort && typeof session.serialPort.write === "function";
-    if (!hasCommandablePty && !hasSshExec && !hasSerialPort) continue;
-
-    // Look up metadata scoped to this chat session
-    const meta = getSessionMeta(sessionId, chatSessionId) || {};
+    const hasTransport = hasCommandablePty || hasSshExec || hasSerialPort;
+    // Look up metadata scoped to this chat session.
+    const scopeMeta = getSessionMeta(sessionId, chatSessionId);
+    // Disconnected/reconnecting tabs keep their session entry (SSH
+    // auto-reconnect reuses the sessionId), so keep them visible with
+    // connected:false instead of hiding them — otherwise the agent cannot
+    // see or wait for a tab it opened and reopens it as a duplicate.
+    // Without scoped metadata the session is not in this agent's scope.
+    if (!hasTransport && !scopeMeta) continue;
+    const meta = scopeMeta || {};
     hosts.push({
       sessionId,
       hostname: meta.hostname || session.hostname || "",
@@ -2047,7 +2456,7 @@ async function handleGetContext(params) {
       protocol: meta.protocol || session.protocol || session.type || "",
       shellType: meta.shellType || session.shellKind || "",
       deviceType: meta.deviceType || "",
-      connected: meta.connected !== undefined ? meta.connected : !!(session.sshClient || session.conn || ptyStream || session.serialPort),
+      connected: meta.connected !== undefined ? meta.connected : hasTransport,
       hostId: meta.hostId || "",
       hostChain: meta.hostChain || [],
       activePortForwards: meta.activePortForwards || [],
@@ -2059,12 +2468,21 @@ async function handleGetContext(params) {
     for (const sessionId of resolvedScopedIds) {
       if (addedHostIds.has(sessionId)) continue;
       const meta = getSessionMeta(sessionId, chatSessionId);
-      if (!meta || meta.connected === false) continue;
+      if (!meta) continue;
+      // Keep disconnected/reconnecting sessions listed with connected:false so
+      // the agent can wait on the existing sessionId instead of reopening the
+      // host as a duplicate tab (SSH auto-reconnect preserves the sessionId).
       hosts.push(buildHostFromMetadata(sessionId, meta));
       addedHostIds.add(sessionId);
     }
   }
 
+  if (pluginAgentDelegations.isApproved(approvalContext)) {
+    // Do not query or serialize app-wide tunnel/tool inventory for a delegated
+    // conversation. Its core-owned scope already selected the session metadata.
+    return { environment: "netcatty-terminal", description: "Use only these host-selected session IDs.",
+      hosts, hostCount: hosts.length };
+  }
   let activePortForwardTunnels = [];
   try {
     activePortForwardTunnels = await listActivePortForwards();
@@ -2080,6 +2498,7 @@ async function handleGetContext(params) {
       "Use the provided tools to execute commands through the sessions exposed by Netcatty. " +
       buildTerminalToolGuidance(toolHints) +
       "Serial sessions (protocol: serial, shellType: raw) do not run a standard shell — commands are sent as-is. " +
+      "A session listed with connected false is still in the scope. SSH auto-reconnect keeps the same sessionId: wait and retry that session while it reconnects. Inactive disconnected or restored tabs may require user action; host_open reuses connected or connecting sessions by default and opens a connection when none is usable. " +
       "Network device sessions (deviceType: network) use vendor CLIs (Huawei VRP, Cisco IOS, etc.) — commands are sent as-is without shell wrapping, and exit codes are unavailable. " +
       "Vault snippets, port forwarding rules/tunnels, and SFTP read/write tools are available when exposed in the tool list. " +
       "Always prefer these tools over suggesting the user to do things manually.",
@@ -2092,6 +2511,10 @@ async function handleGetContext(params) {
 }
 
 function handleGetStatus() {
+  const cliDiscoveryFilePath = getActiveCliDiscoveryFilePath();
+  // Repair the discovery pointer before reporting on it, so a mid-session
+  // out-of-band deletion is visible to callers as already self-healed.
+  ensureCliDiscoveryFile();
   return {
     ok: true,
     environment: "netcatty-terminal",
@@ -2209,12 +2632,35 @@ const configAndCleanupApi = createConfigAndCleanupApi({
 const { resolveMcpServerRuntimeCommand, buildMcpServerConfig, cleanupScopedMetadata } = configAndCleanupApi;
 
 function cleanup() {
+  pluginAgentDelegations.shutdown();
   try { disposeWorkerSessionClosed?.dispose?.(); } catch { /* ignore */ }
   disposeWorkerSessionClosed = null;
   shutdownHost();
 }
 
+// Keep identifier exports so Node 22's CJS namespace analysis also preserves the
+// existing named exports consumed by renderer-side harness tests.
+const registerPluginAgentDelegation = (...args) => pluginAgentDelegations.register(...args);
+const getPluginAgentMcpConfiguration = (id, tag) => pluginAgentDelegations.configuration(id, tag);
+const isPluginAgentConversation = (id) => pluginAgentDelegations.isReserved(id);
+const assertPluginAgentCaller = (id, senderId, tag) => pluginAgentDelegations.assertCaller(id, senderId, tag);
+const onPluginAgentRelease = (id, tag, cancel) => pluginAgentDelegations.onRelease(id, tag, cancel);
+
+const beginPluginAgentModelRequest = (id, senderId, tag) => pluginAgentDelegations.beginModelRequest(id, senderId, tag);
+function getPluginAgentJobTarget(jobId, chatSessionId) {
+  if (!pluginAgentDelegations.isReserved(chatSessionId)) return null;
+  const job = workerBackgroundJobs.get(jobId) ?? backgroundJobs.get(jobId);
+  return job?.chatSessionId === chatSessionId && typeof job.sessionId === "string" ? job.sessionId : null;
+}
+
 module.exports = {
+  getPluginAgentJobTarget,
+  beginPluginAgentModelRequest,
+  registerPluginAgentDelegation,
+  getPluginAgentMcpConfiguration,
+  isPluginAgentConversation,
+  assertPluginAgentCaller,
+  onPluginAgentRelease,
   init,
   setCommandBlocklist,
   getCommandBlocklist,
@@ -2242,6 +2688,7 @@ module.exports = {
   handleReadAttachment,
   getScopedSessionIds,
   getOrCreateHost,
+  ensureCliDiscoveryFile,
   buildMcpServerConfig,
   activePtyExecs,
   cancelBackgroundJobsForSession,
@@ -2261,6 +2708,7 @@ module.exports = {
   setExternalMcpHooks,
   disconnectExternalMcpClients,
   issueExternalMcpAuthToken,
+  attachExternalMcpClient,
   revokeExternalMcpAuthToken,
   getExternalMcpAuthToken,
   syncLiveSessionsToExternalScope,

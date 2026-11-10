@@ -13,6 +13,8 @@ const {
   parseRemoteLoginShellProbeOutput,
   parseRemoteWindowsLoginShellProbeOutput,
   isWindowsOpenSshRemote,
+  remoteDisallowsExecChannelProbe,
+  sessionDisallowsExtraSshChannel,
   createSshConnExecProbe,
   createSessionExecProbe,
   ensureSessionShellKind,
@@ -773,6 +775,71 @@ test("createSshConnExecProbe closes a channel that arrives after timeout", async
   assert.equal(closed, true);
 });
 
+test("terminal shell-kind probe open timeout keeps the SSH connection (#1181)", async () => {
+  let execCallback;
+  let execCalls = 0;
+  let endCalls = 0;
+  let destroyCalls = 0;
+  const conn = {
+    exec(_command, cb) {
+      execCalls += 1;
+      execCallback = cb;
+    },
+    end() { endCalls += 1; },
+    destroy() { destroyCalls += 1; },
+  };
+  const probe = createSessionExecProbe({ conn });
+  assert.equal(await probe("true", 15), null);
+  assert.equal(execCalls, 1);
+  assert.equal(endCalls, 0);
+  assert.equal(destroyCalls, 0);
+
+  // The hung open stays fenced until ssh2 delivers the late callback.
+  assert.equal(await probe("true", 1000), null);
+  assert.equal(execCalls, 1);
+  assert.equal(endCalls, 0);
+  assert.equal(destroyCalls, 0);
+
+  let closed = false;
+  const stream = {
+    on() { return stream; },
+    stderr: { on() { return this; } },
+    close() { closed = true; },
+  };
+  execCallback(null, stream);
+  assert.equal(closed, true);
+  assert.equal(endCalls, 0);
+  assert.equal(destroyCalls, 0);
+});
+
+test("sshClient shell-kind probe open timeout keeps the terminal connection (#1181)", async () => {
+  let ended = false;
+  const sshClient = {
+    exec() {},
+    end() { ended = true; },
+    destroy() { ended = true; },
+  };
+  const probe = createSessionExecProbe({ sshClient });
+  assert.equal(await probe("true", 15), null);
+  assert.equal(ended, false);
+});
+
+test("helper shell-kind probe open timeout still tears down Mosh and ET connections", async () => {
+  for (const key of ["moshStatsConn", "etStatsConn"]) {
+    let endCalls = 0;
+    let destroyCalls = 0;
+    const helper = {
+      exec() {},
+      end() { endCalls += 1; },
+      destroy() { destroyCalls += 1; },
+    };
+    const probe = createSessionExecProbe({ [key]: helper });
+    assert.equal(await probe("true", 15), null);
+    assert.equal(endCalls, 1, key);
+    assert.equal(destroyCalls, 1, key);
+  }
+});
+
 test("createSessionExecProbe prefers session.conn over companions", () => {
   const session = {
     conn: { exec() {} },
@@ -783,6 +850,42 @@ test("createSessionExecProbe prefers session.conn over companions", () => {
   // Prefer primary conn: a probe built only from moshStatsConn is a different
   // function identity; we just need a usable probe here.
   assert.equal(createSessionExecProbe({}), null);
+});
+
+test("remoteDisallowsExecChannelProbe flags bastion banners that drop a second channel (#3146)", () => {
+  assert.equal(remoteDisallowsExecChannelProbe("BHostSSH_7.0"), true);
+  assert.equal(remoteDisallowsExecChannelProbe("TERM-SSHD"), true);
+  assert.equal(remoteDisallowsExecChannelProbe("OpenSSH_9.6"), false);
+  assert.equal(remoteDisallowsExecChannelProbe("CLOUDBILITY-4.14"), false);
+  assert.equal(remoteDisallowsExecChannelProbe("SSH-2.0-CLOUDBILITY-4.14"), false);
+  assert.equal(remoteDisallowsExecChannelProbe("dropbear_2022.83"), false);
+  assert.equal(remoteDisallowsExecChannelProbe("OpenSSH_for_Windows_9.5"), false);
+  assert.equal(remoteDisallowsExecChannelProbe(undefined), false);
+  assert.equal(remoteDisallowsExecChannelProbe(""), false);
+});
+
+test("createSessionExecProbe skips the exec channel on bastions so AI exec does not disconnect (#3146)", () => {
+  const session = {
+    remoteSshVersion: "BHostSSH_7.0",
+    conn: { exec() {} },
+  };
+  assert.equal(createSessionExecProbe(session), null);
+});
+
+test("ensureSessionShellKind does not exec-probe bastions (#3146)", async () => {
+  let execCalls = 0;
+  const session = {
+    protocol: "ssh",
+    remoteSshVersion: "BHostSSH_7.0",
+    conn: {
+      exec() {
+        execCalls += 1;
+      },
+    },
+  };
+  const kind = await ensureSessionShellKind(session);
+  assert.equal(kind, undefined);
+  assert.equal(execCalls, 0, "bastion must never open a second SSH channel");
 });
 
 // --- Real fish binary: wrapper must produce markers (issue #1854) -----------
@@ -873,3 +976,28 @@ test(
     assert.match(result.stdout, new RegExp(`${marker}_E:0`));
   },
 );
+
+test("CLOUDBILITY banner skips the exec probe without paced keystrokes", () => {
+  let execCalls = 0;
+  const session = {
+    remoteSshVersion: "SSH-2.0-CLOUDBILITY-4.14",
+    conn: { exec() { execCalls += 1; } },
+  };
+  assert.equal(remoteDisallowsExecChannelProbe(session.remoteSshVersion), false);
+  assert.equal(sessionDisallowsExtraSshChannel(session), true);
+  assert.equal(createSessionExecProbe(session), null);
+  assert.equal(execCalls, 0);
+});
+
+test("createSessionExecProbe skips the exec channel when singleChannelSsh is set", () => {
+  let execCalls = 0;
+  const session = {
+    singleChannelSsh: true,
+    remoteSshVersion: "CLOUDBILITY-4.14",
+    conn: { exec() { execCalls += 1; } },
+  };
+  assert.equal(sessionDisallowsExtraSshChannel(session), true);
+  assert.equal(createSessionExecProbe(session), null);
+  assert.equal(execCalls, 0);
+});
+

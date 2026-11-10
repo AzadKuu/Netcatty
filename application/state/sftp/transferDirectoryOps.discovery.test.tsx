@@ -334,7 +334,113 @@ test("live directory download rejects a Windows backslash traversal entry", asyn
   }
 });
 
-test("live folder settles a superseded child whose completed row was compacted", async () => {
+test("a file batch that rejects mid-walk does not emit unhandledRejection", async () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  const previousLocalStorage = (globalThis as { localStorage?: unknown }).localStorage;
+  const previousActEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+  const root = {
+    ...rootTask(),
+    targetPath: "C:\\Users\\alice\\Downloads\\folder",
+  };
+  let tasks: TransferTask[] = [root];
+  const transfersRef = { current: tasks };
+  const setTransfers = (update: React.SetStateAction<TransferTask[]>) => {
+    tasks = typeof update === "function" ? update(tasks) : update;
+    transfersRef.current = tasks;
+  };
+  let releaseLater!: () => void;
+  const laterGate = new Promise<void>((resolve) => {
+    releaseLater = resolve;
+  });
+  let laterListingStarted!: () => void;
+  const laterListing = new Promise<void>((resolve) => {
+    laterListingStarted = resolve;
+  });
+  (globalThis as { window?: unknown }).window = {
+    netcatty: {
+      mkdirLocal: async () => undefined,
+      statLocal: async () => ({ type: "directory" }),
+    },
+  };
+  (globalThis as { localStorage?: unknown }).localStorage = {
+    getItem: () => null,
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  };
+
+  let operations: ReturnType<typeof useSftpDirectoryTransferOps> | undefined;
+  let renderer: ReactTestRenderer | null = null;
+  const Probe = () => {
+    operations = useSftpDirectoryTransferOps({
+      ownerId: "owner",
+      cancelledTasksRef: { current: new Set() },
+      pausedTasksRef: { current: new Set() },
+      waitUntilTransferResumed: async () => undefined,
+      activeChildIdsRef: { current: new Map() },
+      transfersRef,
+      setTransfers,
+      listLocalFiles: async () => [],
+      listRemoteFiles: async (_sftpId: string, path: string) => {
+        if (path === "/source") return [directoryEntry("bad"), directoryEntry("later")];
+        if (path === "/source/bad") return [fileEntry("..\\outside.txt")];
+        laterListingStarted();
+        await laterGate;
+        return [];
+      },
+    });
+    return null;
+  };
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  const rejectionText = (reason: unknown) => (
+    reason instanceof Error ? reason.message : String(reason)
+  );
+  process.on("unhandledRejection", onUnhandled);
+
+  let running: Promise<number> | undefined;
+  try {
+    await act(async () => {
+      renderer = create(React.createElement(Probe));
+    });
+    assert.ok(operations);
+    running = operations.transferDirectory(
+      root,
+      "source-sftp",
+      null,
+      false,
+      true,
+      "auto",
+      "auto",
+      root.id,
+    );
+    await laterListing;
+    // The bad directory's batch is already queued. End this turn while the
+    // sibling listing is still blocked so an unhandled rejection can surface.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled.map(rejectionText), []);
+    releaseLater();
+    await assert.rejects(running, /unsafe transfer path/i);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled.map(rejectionText), []);
+  } finally {
+    releaseLater();
+    await running?.catch(() => {});
+    process.off("unhandledRejection", onUnhandled);
+    await act(async () => {
+      renderer?.unmount();
+    });
+    (globalThis as { window?: unknown }).window = previousWindow;
+    (globalThis as { localStorage?: unknown }).localStorage = previousLocalStorage;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+  }
+});
+
+for (const ownerChange of ["same", "changed-active", "changed-completed"] as const) {
+test(`live folder settles superseded ownership without clobbering its replacement: ${ownerChange}`, async () => {
   const { sftpTransferCenterStore } = await import("../sftpTransferCenterStore");
   const previousWindow = (globalThis as { window?: unknown }).window;
   const previousLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -355,10 +461,18 @@ test("live folder settles a superseded child whose completed row was compacted",
     startStreamTransfer: async (options: { transferId: string }) => {
       childId = options.transferId;
       sftpTransferCenterStore.publishOwner("live-compacted-owner", tasks);
-      // The winning invocation has already completed; history compaction drops its row.
-      sftpTransferCenterStore.ingestBackgroundEvent({
-        type: "completed", transferId: childId, transferred: 1, totalBytes: 1, lifecycleEpoch: 0,
-      });
+      if (ownerChange !== "same") {
+        const current = sftpTransferCenterStore.getTask(childId)!;
+        sftpTransferCenterStore.admitTaskRun({ ...current, directoryEntryIdentity: "b".repeat(64) });
+      }
+      if (ownerChange !== "changed-active") {
+        // The winning invocation completed; history compaction drops its row.
+        sftpTransferCenterStore.ingestBackgroundEvent({
+          type: "completed", transferId: childId, transferred: 1, totalBytes: 1, lifecycleEpoch: 0,
+        });
+      }
+      tasks = [...sftpTransferCenterStore.getSnapshot().tasks];
+      transfersRef.current = tasks;
       return { superseded: true };
     },
   } };
@@ -387,10 +501,15 @@ test("live folder settles a superseded child whose completed row was compacted",
       new Promise<"still-waiting">((resolve) => setTimeout(() => resolve("still-waiting"), 450)),
     ]);
     assert.ok(childId);
-    assert.equal(sftpTransferCenterStore.getTask(childId), undefined);
-    assert.equal(sftpTransferCenterStore.getTask(root.id)?.directoryResumeCheckpoint?.completedEntries, 1);
+    if (ownerChange === "changed-active") {
+      assert.equal(tasks.find((task) => task.id === childId)?.status, "transferring");
+      assert.equal(tasks.find((task) => task.id === childId)?.directoryEntryIdentity, "b".repeat(64));
+    } else {
+      assert.equal(tasks.find((task) => task.id === childId), undefined, "old waiter must not reinsert a compacted child");
+      assert.equal(sftpTransferCenterStore.getTask(root.id)?.directoryResumeCheckpoint?.completedEntries, 1);
+    }
     assert.notEqual(result, "still-waiting", "compacted completion must settle the live folder");
-    assert.equal(result, 0);
+    assert.equal(result, ownerChange === "same" ? 0 : 1);
   } finally {
     cancelledTasksRef.current.add(root.id);
     await running?.catch(() => {});
@@ -404,3 +523,4 @@ test("live folder settles a superseded child whose completed row was compacted",
   }
 });
 
+}

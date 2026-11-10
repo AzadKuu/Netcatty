@@ -148,7 +148,8 @@ test("session peer windows do not run main-window startup effects", () => {
   assert.match(settingsStateSource, /const enableSettingsSync = options\.enableSettingsSync !== false/);
   assert.match(settingsStateSource, /useSettingsIpcSync\(\{[^}]*enabled: enableSettingsSync/s);
   assert.match(settingsStateSource, /useSettingsStorageSync\(\{[^}]*enabled: enableSettingsSync/s);
-  assert.match(settingsStateSource, /if \(!enableSettingsSync\) return;\s*try \{\s*netcattyBridge\.get\(\)\?\.notifySettingsChanged/s);
+  // Detached windows share opacity, while general settings broadcasts stay off.
+  assert.match(settingsStateSource, /if \(!enableSettingsSync && key !== STORAGE_KEY_WINDOW_OPACITY\) return;\s*try \{\s*netcattyBridge\.get\(\)\?\.notifySettingsChanged/s);
   assert.match(settingsStateSource, /useSystemSettingsEffects\(\{[^}]*enabled: enableSystemEffects/s);
   assert.match(settingsIpcSyncSource, /enabled\?: boolean/);
   assert.match(settingsIpcSyncSource, /if \(!enabled\) return;/);
@@ -208,4 +209,14 @@ test("restore terminal cwd setting participates in cross-window settings sync", 
   assert.match(ipcSyncSource, /STORAGE_KEY_RESTORE_TERMINAL_CWD/);
   assert.match(ipcSyncSource, /setRestoreTerminalCwdState/);
   assert.match(ipcSyncSource, /key === STORAGE_KEY_RESTORE_TERMINAL_CWD/);
+});
+
+test("editor route keeps IPC/storage synchronization while disabling system effects", () => {
+  const source = readFileSync(new URL("../../index.tsx", import.meta.url), "utf8");
+  const expression = source.match(/const settingsOptions =\s*([^;]+);/s)?.[1];
+  assert.ok(expression, "renderer settings options must be explicit");
+  const resolveOptions = new Function("isPeerSessionWindow", "isEditorWindow", `return (${expression});`);
+  assert.deepEqual(resolveOptions(false, true), { enableSystemEffects: false });
+  assert.deepEqual(resolveOptions(true, false), { enableSettingsSync: false, enableSystemEffects: false });
+  assert.equal(resolveOptions(false, false), undefined);
 });

@@ -51,6 +51,9 @@ const passphraseListeners = new Set();
 const passphraseTimeoutListeners = new Set();
 const passphraseCancelledListeners = new Set();
 const passphraseAuthFailedListeners = new Set();
+const fidoPromptListeners = new Set();
+const fidoPromptTimeoutListeners = new Set();
+const fidoPromptCancelledListeners = new Set();
 const updateDownloadProgressListeners = new Set();
 const updateDownloadedListeners = new Set();
 const updateAvailableListeners = new Set();
@@ -62,6 +65,10 @@ const terminalPopupConfigState = {
   // Keep the last delivered payload so StrictMode remount (unsubscribe →
   // resubscribe) can replay config after the one-shot pending slot was drained.
   lastPayload: null,
+  listeners: new Set(),
+};
+const editorOpenTabState = {
+  pending: [],
   listeners: new Set(),
 };
 
@@ -96,7 +103,7 @@ const _mcpLineMetas = new Map(); // sessionId -> trailing fragment metadata
 const _mcpPendingMetas = new Map(); // sessionId -> metadata from filtered-empty chunks
 const _mcpFlushTimers = new Map(); // sessionId -> delayed-flush timer
 const _mcpDroppingWrappedLine = new Set(); // sessionIds with a split marker echo line in progress
-const _mcpProbePrompts = new Map(); // sessionId -> probe marker awaiting its command
+const _mcpProbePrompts = new Map(); // sessionId -> input/probe marker awaiting command start
 const _mcpAbortedProbes = new Map(); // sessionId -> bounded set of cancelled probe markers
 const MAX_MCP_BUFFERED_LINE_CHARS = 64 * 1024;
 
@@ -123,7 +130,9 @@ function filterProbePromptFragment(sessionId, fragment) {
     if (_mcpProbePrompts.get(sessionId) === reset[1]) _mcpProbePrompts.delete(sessionId);
     return true;
   }
-  const completion = fragment.match(/^\r?(__NCMCP_[A-Za-z0-9_]+)_Q/);
+  // I starts suppression before multiline input; Q keeps it active after
+  // the live shell probe. Both end only at the matching command start/reset.
+  const completion = fragment.match(/^\r?(__NCMCP_[A-Za-z0-9_]+)_[IQ]/);
   if (completion && !_mcpAbortedProbes.get(sessionId)?.has(completion[1])) {
     _mcpProbePrompts.set(sessionId, completion[1]);
   }
@@ -410,6 +419,19 @@ ipcRenderer.on("netcatty:window:terminalPopupConfig", (_event, payload) => {
     }
   });
 });
+ipcRenderer.on("netcatty:window:editorOpenTab", (_event, payload) => {
+  if (editorOpenTabState.listeners.size === 0) {
+    editorOpenTabState.pending.push(payload);
+    return;
+  }
+  editorOpenTabState.listeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Editor window open-tab callback failed", err);
+    }
+  });
+});
 ipcRenderer.on("netcatty:zmodem:progress", (_event, payload) => {
   if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
@@ -693,6 +715,37 @@ ipcRenderer.on("netcatty:passphrase-auth-failed", (_event, payload) => {
   });
 });
 
+// FIDO2 PIN / touch presence prompts
+ipcRenderer.on("netcatty:fido-prompt-request", (_event, payload) => {
+  fidoPromptListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("FIDO prompt request callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:fido-prompt-timeout", (_event, payload) => {
+  fidoPromptTimeoutListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("FIDO prompt timeout callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:fido-prompt-cancelled", (_event, payload) => {
+  fidoPromptCancelledListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("FIDO prompt cancelled callback failed", err);
+    }
+  });
+});
+
 // Auto-update events
 ipcRenderer.on("netcatty:update:update-available", (_event, payload) => {
   updateAvailableListeners.forEach((cb) => {
@@ -871,6 +924,9 @@ const api = createPreloadApi({
   passphraseTimeoutListeners,
   passphraseCancelledListeners,
   passphraseAuthFailedListeners,
+  fidoPromptListeners,
+  fidoPromptTimeoutListeners,
+  fidoPromptCancelledListeners,
   updateDownloadProgressListeners,
   updateDownloadedListeners,
   updateAvailableListeners,
@@ -878,6 +934,7 @@ const api = createPreloadApi({
   updateErrorListeners,
   updateNeedsSaveListeners,
   terminalPopupConfigState,
+  editorOpenTabState,
   portForwardStatusListeners,
   portForwardRuntimeListeners,
   fileWatchSyncedListeners,
@@ -945,7 +1002,9 @@ function isTrustedRendererLocation(allowedOrigins) {
 }
 
 const allowedOrigins = getAllowedRendererOrigins();
-if (harmonyCompat.isHarmony()) {
+// Only the application main frame receives the privileged bridge. Embedded
+// plugin frames remain unprivileged even if they navigate to an app URL.
+if (process.isMainFrame !== false && harmonyCompat.isHarmony()) {
   const harmonyApi = { ...api };
   harmonyApi.getWindowsPtyInfo = () => null;
   harmonyApi.getPathForFile = () => undefined;
@@ -967,7 +1026,7 @@ if (harmonyCompat.isHarmony()) {
   } catch(e) {
     console.warn("[Preload] HarmonyOS: failed to expose simplified API:", e.message);
   }
-} else if (isTrustedRendererLocation(allowedOrigins)) {
+} else if (process.isMainFrame !== false && isTrustedRendererLocation(allowedOrigins)) {
   contextBridge.exposeInMainWorld("netcatty", { ...existing, ...api, ...figSpecApi });
 } else {
   // If a window navigates to an untrusted origin, do NOT expose the bridge.

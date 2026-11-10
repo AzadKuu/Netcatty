@@ -4,8 +4,13 @@ const harmonyCompat = require("../harmonyCompat.cjs");
 
 let bridgesRegistered = false;
 let cloudSyncSessionPassword = null;
+const perfTrace = require("../perfTrace.cjs");
 const { readClipboardFiles, readClipboardImage, hasClipboardImage } = require("../bridges/clipboardFiles.cjs");
 const { registerSystemNotificationHandlers } = require("../bridges/systemNotification.cjs");
+const {
+  installWindowAttention,
+  registerExternalMcpApprovalAlertHandlers,
+} = require("../bridges/windowAttention.cjs");
 
 const excludedFigSpecPrefixes = ["aws", "gcloud", "az"];
 
@@ -146,14 +151,12 @@ function createBridgeRegistrar(context) {
     } = require("../plugins/pluginBridge.cjs");
     let terminalWorkerManager = null;
     const { toElectronAccelerator } = require("../plugins/keybindings.cjs");
-    const { startDevelopmentPluginHost } = require("../plugins/hostBootstrap.cjs");
-    const pluginHostService = startDevelopmentPluginHost({
+    const { startPluginHost } = require("../plugins/hostBootstrap.cjs");
+    perfTrace.mark("main:plugin-host:start");
+    const pluginHostService = startPluginHost({
       env: process.env,
       createService: () => {
         const { createPluginHostService } = require("../plugins/hostService.cjs");
-        const {
-          createNativePermissionDecisionProvider,
-        } = require("../plugins/nativePermissionDecision.cjs");
         const {
           terminalInterceptorChoiceLabel,
           terminalInterceptorIdentifier,
@@ -163,10 +166,11 @@ function createBridgeRegistrar(context) {
           app,
           electron: electronModule,
           safeStorage,
-          requestPermissionDecision: createNativePermissionDecisionProvider({
-            dialog: electronModule.dialog,
-            window: win,
-          }),
+          getInteractionWindow: () => win,
+          getPermissionWindows: () => getWindowManager().getManagedAppWindows(),
+          getTerminalWorkerManager: () => terminalWorkerManager,
+          isAppLocked: () => getAppLockController?.()?.getRuntimeState?.()?.locked !== false,
+          subscribeAppLock: (listener) => getAppLockController?.()?.subscribe?.(listener),
           getLocale: () => getWindowManager().getCurrentLanguage?.() ?? "en",
           requestTerminalInterceptorSelection: async ({ direction, providers }) => {
             const messages = terminalInterceptorMessages(getWindowManager().getCurrentLanguage?.() ?? "en");
@@ -206,8 +210,15 @@ function createBridgeRegistrar(context) {
       },
       logger: console,
     });
+    perfTrace.mark("main:plugin-host:end");
     registerPluginBridge(ipcMain, {
       manager: pluginHostService?.manager,
+      interactionService: pluginHostService?.interactionService,
+      permissionEngine: pluginHostService?.permissionEngine,
+      permissionDecisionHost: pluginHostService?.permissionDecisionHost,
+      runtimeSupervisor: pluginHostService?.runtimeSupervisor,
+      database: pluginHostService?.database,
+      catalogService: pluginHostService?.catalogService,
       contributionService: pluginHostService?.contributionService,
       terminalProviderService: pluginHostService?.terminalProviderService,
       terminalDataPipelineService: pluginHostService?.terminalDataPipelineService,
@@ -225,13 +236,16 @@ function createBridgeRegistrar(context) {
         });
         return result.canceled ? null : result.filePaths[0] ?? null;
       },
+      resolveBrandIcon: (pluginId) => pluginHostService?.contributionIconService?.resolveBrand(pluginId),
       resolveContributionIcon: (payload) => pluginHostService?.contributionIconService?.resolve(payload),
-      viewHost: pluginHostService?.viewHost,
+      themeService: pluginHostService?.themeService,
+      logService: pluginHostService?.logService,
+      hostDrawnViewHost: pluginHostService?.hostDrawnViewHost,
       env: process.env,
       isTrustedSender: createTrustedPluginBridgeSender({ devServerUrl: effectiveDevServerUrl }),
       broadcast: (channel, payload) => {
         for (const window of electronModule.BrowserWindow.getAllWindows()) {
-          if (!window.isDestroyed()) window.webContents.send(channel, payload);
+          if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload);
         }
       },
     });
@@ -323,6 +337,11 @@ function createBridgeRegistrar(context) {
         windowManager.setPluginApplicationMenuProvider?.(applicationMenuProvider);
       });
     }
+    const { registerSystemThemeListener } = require("../bridges/systemTheme.cjs");
+    registerSystemThemeListener({
+      nativeTheme: electronModule.nativeTheme,
+      getWindows: () => BrowserWindow.getAllWindows(),
+    });
   
     const getCloudSyncPasswordPath = () => {
       try {
@@ -456,15 +475,52 @@ function createBridgeRegistrar(context) {
     });
   
     // Initialize temp directory (synchronously)
+    tempDirBridge.configureTempDirPreference?.(electronModule);
     tempDirBridge.ensureTempDir();
+    terminalWorkerManager?.setCustomTempDir(tempDirBridge.getCustomTempDir());
   
     // Register all IPC handlers
-    sshBridge.registerHandlers(ipcMain, { terminalWorkerManager });
+    sshBridge.registerHandlers(ipcMain, {
+      terminalWorkerManager,
+      manageSessionLogRestart: !terminalWorkerManager,
+    });
+    const stopMonitoring = () => terminalWorkerManager
+      ? terminalWorkerManager.request("netcatty:monitor:stop-all", {}, {}).catch(() => {})
+      : sshBridge.stopAllMonitoring();
+    electronModule.powerMonitor?.on("suspend", stopMonitoring);
+    require("../plugins/shutdownCoordinator.cjs").registerPluginShutdown(stopMonitoring);
     sftpBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     localFsBridge.registerHandlers(ipcMain);
+    require("../bridges/localFileDragBridge.cjs").registerHandlers(ipcMain, {
+      getWindows: () => getWindowManager().getAppContentWindows?.() || [],
+      nativeImage: electronModule.nativeImage,
+      app,
+    });
     transferBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     portForwardingBridge.registerHandlers(ipcMain, { terminalWorkerManager });
-    terminalBridge.registerHandlers(ipcMain, { terminalWorkerManager });
+    if (electronModule.WebContentsView && electronModule.session?.fromPartition) {
+      const { createHostBrowserManager } = require("../hostBrowser/hostBrowserManager.cjs");
+      const hostBrowserManager = createHostBrowserManager({
+        electron: electronModule,
+        app,
+        portForwardingBridge,
+      });
+      ipcMain.handle("netcatty:host-browser:request-panel", (event, request) => {
+        const senderWindow = BrowserWindow.fromWebContents(event.sender);
+        const mainWindow = getWindowManager().getMainWindow?.();
+        if (!senderWindow || senderWindow.webContents !== event.sender || !mainWindow || mainWindow.isDestroyed()
+          || typeof request?.host?.id !== "string") throw new Error("Browser opener is unavailable");
+        mainWindow.webContents.send("netcatty:host-browser:request-panel", request);
+        mainWindow.show();
+        mainWindow.focus();
+        return true;
+      });
+      app.once?.("will-quit", () => hostBrowserManager.closeAll());
+    }
+    terminalBridge.registerHandlers(ipcMain, {
+      terminalWorkerManager,
+      manageSessionLogRestart: !terminalWorkerManager,
+    });
 
     const scriptBridge = require("../bridges/scriptBridge.cjs");
     scriptBridge.init({
@@ -490,16 +546,21 @@ function createBridgeRegistrar(context) {
     onedriveAuthBridge.registerHandlers(ipcMain, electronModule);
     cloudSyncBridge.registerHandlers(ipcMain, electronModule);
     fileWatcherBridge.registerHandlers(ipcMain, { terminalWorkerManager });
-    tempDirBridge.registerHandlers(ipcMain, shell, electronModule);
+    tempDirBridge.registerHandlers(ipcMain, shell, electronModule, terminalWorkerManager);
     sessionLogsBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     compressUploadBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     globalShortcutBridge.registerHandlers(ipcMain);
     credentialBridge.registerHandlers(ipcMain, electronModule);
+    const { registerTotpHandlers } = require("../bridges/totpBridge.cjs");
+    registerTotpHandlers(ipcMain, electronModule);
     autoUpdateBridge.init(deps);
     autoUpdateBridge.registerHandlers(ipcMain);
     aiBridge.registerHandlers(ipcMain);
     httpNetworkProxyBridge.registerHandlers(ipcMain, electronModule);
     crashLogBridge.registerHandlers(ipcMain);
+    const aiSessionsBackupBridge = require("../bridges/aiSessionsBackupBridge.cjs");
+    aiSessionsBackupBridge.init({ electronModule });
+    aiSessionsBackupBridge.registerHandlers(ipcMain);
     vaultBackupBridge.registerHandlers(ipcMain, electronModule);
     appLockController?.registerHandlers?.(ipcMain);
   
@@ -786,6 +847,81 @@ function createBridgeRegistrar(context) {
         return { success: false, error: err?.message || "Failed to open terminal popup" };
       }
     });
+
+    ipcMain.handle("netcatty:window:openEditor", async (event, payload) => {
+      try {
+        const sourceWindow = BrowserWindow.fromWebContents(event.sender);
+        return await getWindowManager().openEditorWindow(electronModule, {
+          preload,
+          devServerUrl: effectiveDevServerUrl,
+          isDev,
+          appIcon: getAppIconPath(),
+          isMac,
+          electronDir,
+          sourceWindow,
+          sourceWebContents: event.sender,
+        }, payload);
+      } catch (err) {
+        console.error("[Main] Failed to open editor window:", err);
+        return { success: false, error: err?.message || "Failed to open editor window" };
+      }
+    });
+
+    ipcMain.handle("netcatty:window:focusEditor", async (_event, payload) => {
+      try {
+        return getWindowManager().focusEditorTab(electronModule, payload?.editorId);
+      } catch (err) {
+        return { success: false, error: err?.message || "Failed to focus editor window" };
+      }
+    });
+
+    ipcMain.handle("netcatty:window:closeEditorTabs", async (_event, payload) => {
+      try {
+        return await getWindowManager().closeEditorWindowTabs(electronModule, payload);
+      } catch (err) {
+        return { success: false, cancelled: true, closedIds: [], error: err?.message || "Failed to close editor tabs" };
+      }
+    });
+
+    ipcMain.handle("netcatty:editorWindow:save", async (_event, payload) => {
+      try {
+        return await getWindowManager().saveEditorWindowTab(electronModule, payload);
+      } catch (err) {
+        return { ok: false, error: err?.message || "Save failed" };
+      }
+    });
+
+    ipcMain.handle("netcatty:editorWindow:dock", async (_event, payload) => {
+      try {
+        return await getWindowManager().dockEditorTab(electronModule, payload);
+      } catch (err) {
+        return { success: false, error: err?.message || "Failed to dock editor tab" };
+      }
+    });
+
+    ipcMain.on("netcatty:editorWindow:dirty", (_event, payload) => {
+      try {
+        getWindowManager().reportEditorDirty(electronModule, payload);
+      } catch {
+        // ignore
+      }
+    });
+
+    ipcMain.on("netcatty:editorWindow:tabsClosed", (_event, payload) => {
+      try {
+        getWindowManager().reportEditorTabsClosed(electronModule, payload);
+      } catch {
+        // ignore
+      }
+    });
+
+    ipcMain.on("netcatty:editorWindow:remapSession", (_event, payload) => {
+      try {
+        getWindowManager().remapEditorSession(electronModule, payload);
+      } catch {
+        // ignore
+      }
+    });
   
     // Cloud sync master password (stored in-memory + persisted via safeStorage)
     ipcMain.handle("netcatty:cloudSync:session:setPassword", async (_event, password) => {
@@ -857,8 +993,19 @@ function createBridgeRegistrar(context) {
     });
   
     // PTY child process list for busy-check before close
-    ipcMain.handle("netcatty:pty:childProcesses", async (_event, sessionId) => {
+    ipcMain.handle("netcatty:pty:childProcesses", async (event, sessionId) => {
       if (typeof sessionId !== "string") return [];
+      if (terminalWorkerManager) {
+        try {
+          const result = await terminalWorkerManager.request("netcatty:pty:childProcesses", { sessionId }, {
+            webContentsId: event?.sender?.id,
+          });
+          const children = Array.isArray(result) ? result : result?.children;
+          if (Array.isArray(children)) return children;
+        } catch {
+          // Fall back to main-owned sessions when the worker is unavailable.
+        }
+      }
       return ptyProcessTree.getChildProcesses(sessionId);
     });
   
@@ -891,7 +1038,26 @@ function createBridgeRegistrar(context) {
     );
   
     // OSC 9/777/99 desktop notifications (Codex, iTerm2, kitty, rxvt)
-    registerSystemNotificationHandlers(ipcMain, { electronModule, BrowserWindow });
+    // and External MCP approval alerts, which reuse the same click-to-focus channel.
+    registerSystemNotificationHandlers(ipcMain, {
+      electronModule,
+      BrowserWindow,
+      getAppFocused: () => BrowserWindow.getAllWindows().some(
+        (win) => win && !win.isDestroyed?.() && win.isFocused?.(),
+      ),
+    });
+    installWindowAttention({
+      app,
+      platform: process.platform,
+      getWindows: () => {
+        try {
+          return BrowserWindow.getAllWindows();
+        } catch {
+          return [];
+        }
+      },
+    });
+    registerExternalMcpApprovalAlertHandlers(ipcMain);
 
     // Clipboard helpers for renderer fallback paths (e.g. Monaco paste in Electron)
     ipcMain.handle("netcatty:clipboard:readText", async () => {

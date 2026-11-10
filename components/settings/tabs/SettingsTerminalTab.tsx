@@ -5,10 +5,13 @@ import type {
   CursorShape,
   HostInfoBarTitleMode,
   PasswordPromptAssistMode,
+  ProxyProfile,
   TerminalEmulationType,
   TerminalSettings,
 } from "../../../domain/models";
 import { useI18n } from "../../../application/i18n/I18nProvider";
+import { localStorageAdapter, LOCAL_STORAGE_ADAPTER_CHANGED_EVENT } from "../../../infrastructure/persistence/localStorageAdapter";
+import { STORAGE_KEY_PROXY_PROFILES } from "../../../infrastructure/config/storageKeys";
 import { MAX_FONT_SIZE, MIN_FONT_SIZE, resolveTerminalFontFamilyId, type TerminalFont } from "../../../infrastructure/config/fonts";
 import { TERMINAL_THEMES } from "../../../infrastructure/config/terminalThemes";
 import { customThemeStore, useCustomThemes } from "../../../application/state/customThemeStore";
@@ -42,6 +45,34 @@ import {
   TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MAX,
   TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_MIN,
 } from "../../../domain/terminalInlineImages";
+
+const GLOBAL_DEFAULT_PROXY_NONE = "__none__";
+
+const readSavedProxyProfiles = (): ProxyProfile[] => {
+  const stored = localStorageAdapter.read<ProxyProfile[]>(STORAGE_KEY_PROXY_PROFILES);
+  return Array.isArray(stored) ? stored : [];
+};
+
+const useSavedProxyProfiles = (): ProxyProfile[] => {
+  const [profiles, setProfiles] = useState<ProxyProfile[]>(readSavedProxyProfiles);
+  useEffect(() => {
+    const refresh = (key?: string | null) => {
+      if (key && key !== STORAGE_KEY_PROXY_PROFILES) return;
+      setProfiles(readSavedProxyProfiles());
+    };
+    const onAdapterChange = (event: Event) => {
+      refresh((event as CustomEvent<{ key?: string }>).detail?.key);
+    };
+    const onStorage = (event: StorageEvent) => refresh(event.key);
+    window.addEventListener(LOCAL_STORAGE_ADAPTER_CHANGED_EVENT, onAdapterChange);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(LOCAL_STORAGE_ADAPTER_CHANGED_EVENT, onAdapterChange);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
+  return profiles;
+};
 
 const FONT_WEIGHT_OPTIONS = [
   { value: "100", labelKey: "settings.terminal.font.weight.thin" },
@@ -80,9 +111,15 @@ function SettingsTerminalTab(props: {
   setTerminalSidePanelAutoOpen: (enabled: boolean) => void;
   terminalSidePanelAutoOpenTab: TerminalSidePanelAutoOpenTab;
   setTerminalSidePanelAutoOpenTab: (tab: TerminalSidePanelAutoOpenTab) => void;
+  localShellSidePanelAutoOpen: boolean;
+  setLocalShellSidePanelAutoOpen: (enabled: boolean) => void;
+  localShellSidePanelAutoOpenTab: TerminalSidePanelAutoOpenTab;
+  setLocalShellSidePanelAutoOpenTab: (tab: TerminalSidePanelAutoOpenTab) => void;
   availableFonts: TerminalFont[];
   workspaceFocusStyle: 'dim' | 'border';
   setWorkspaceFocusStyle: (style: 'dim' | 'border') => void;
+  globalDefaultProxyProfileId?: string;
+  setGlobalDefaultProxyProfileId: (id: string | undefined) => void;
 }) {
   const {
     terminalThemeId,
@@ -106,11 +143,21 @@ function SettingsTerminalTab(props: {
     setTerminalSidePanelAutoOpen,
     terminalSidePanelAutoOpenTab,
     setTerminalSidePanelAutoOpenTab,
+    localShellSidePanelAutoOpen,
+    setLocalShellSidePanelAutoOpen,
+    localShellSidePanelAutoOpenTab,
+    setLocalShellSidePanelAutoOpenTab,
     availableFonts,
     workspaceFocusStyle,
     setWorkspaceFocusStyle,
+    globalDefaultProxyProfileId,
+    setGlobalDefaultProxyProfileId,
   } = props;
   const { t } = useI18n();
+  const proxyProfiles = useSavedProxyProfiles();
+  const defaultProxyValue = proxyProfiles.some((profile) => profile.id === globalDefaultProxyProfileId)
+    ? globalDefaultProxyProfileId ?? GLOBAL_DEFAULT_PROXY_NONE
+    : GLOBAL_DEFAULT_PROXY_NONE;
 
   // Local shell settings state
   const [defaultShell, setDefaultShell] = useState<string>("");
@@ -595,6 +642,17 @@ function SettingsTerminalTab(props: {
         </SettingRow>
 
         <SettingRow
+          anchorId="terminal-font-ligatures"
+          label={t("settings.terminal.font.ligatures")}
+          description={t("settings.terminal.font.ligatures.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.fontLigatures}
+            onChange={(v) => updateTerminalSetting("fontLigatures", v)}
+          />
+        </SettingRow>
+
+        <SettingRow
           anchorId="terminal-font-line-padding"
           label={t("settings.terminal.font.linePadding")}
           description={t("settings.terminal.font.linePadding.desc")}
@@ -642,6 +700,28 @@ function SettingsTerminalTab(props: {
             onChange={(v) => updateTerminalSetting("cursorShape", v as CursorShape)}
             className="w-32"
           />
+        </SettingRow>
+
+        <SettingRow
+          anchorId="terminal-cursor-bar-width"
+          label={t("settings.terminal.cursor.barWidth")}
+          description={t("settings.terminal.cursor.barWidth.desc")}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              aria-label={t("settings.terminal.cursor.barWidth")}
+              min={1}
+              max={4}
+              step={1}
+              value={terminalSettings.cursorBarWidth}
+              onChange={(e) => updateTerminalSetting("cursorBarWidth", parseInt(e.target.value))}
+              className="w-24 accent-primary"
+            />
+            <span className="w-6 text-center text-sm text-muted-foreground">
+              {terminalSettings.cursorBarWidth}px
+            </span>
+          </div>
         </SettingRow>
 
         <SettingRow anchorId="terminal-cursor-blink" label={t("settings.terminal.cursor.blink")}>
@@ -745,6 +825,33 @@ function SettingsTerminalTab(props: {
             }))}
             onChange={(value) => setTerminalSidePanelAutoOpenTab(value as TerminalSidePanelAutoOpenTab)}
             disabled={!terminalSidePanelAutoOpen}
+            className="w-36"
+          />
+        </SettingRow>
+      </div>
+
+      <SectionHeader title={t("settings.terminal.section.localShellSidePanel")} />
+      <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          anchorId="terminal-local-shell-side-panel-auto-open"
+          label={t("settings.terminal.localShellSidePanel.autoOpen")}
+          description={t("settings.terminal.localShellSidePanel.autoOpen.desc")}
+        >
+          <Toggle checked={localShellSidePanelAutoOpen} onChange={setLocalShellSidePanelAutoOpen} />
+        </SettingRow>
+
+        <SettingRow
+          label={t("settings.terminal.localShellSidePanel.autoOpenPane")}
+          description={t("settings.terminal.localShellSidePanel.autoOpenPane.desc")}
+        >
+          <Select
+            value={localShellSidePanelAutoOpenTab}
+            options={TERMINAL_SIDE_PANEL_AUTO_OPEN_TABS.map((tab) => ({
+              value: tab,
+              label: t(`settings.terminal.sidePanel.pane.${tab}`),
+            }))}
+            onChange={(value) => setLocalShellSidePanelAutoOpenTab(value as TerminalSidePanelAutoOpenTab)}
+            disabled={!localShellSidePanelAutoOpen}
             className="w-36"
           />
         </SettingRow>
@@ -859,10 +966,28 @@ function SettingsTerminalTab(props: {
             )}
           </div>
         </SettingRow>
+
       </div>
 
       <SectionHeader title={t("settings.terminal.section.connection")} />
       <div className="space-y-0 divide-y divide-border rounded-lg border bg-card px-4">
+        <SettingRow
+          anchorId="terminal-default-proxy"
+          label={t("settings.terminal.connection.defaultProxy")}
+          description={t("settings.terminal.connection.defaultProxy.desc")}
+        >
+          <Select
+            value={defaultProxyValue}
+            onChange={(value) => {
+              setGlobalDefaultProxyProfileId(value === GLOBAL_DEFAULT_PROXY_NONE ? undefined : value);
+            }}
+            options={[
+              { value: GLOBAL_DEFAULT_PROXY_NONE, label: t("settings.terminal.connection.defaultProxy.none") },
+              ...proxyProfiles.map((profile) => ({ value: profile.id, label: profile.label })),
+            ]}
+            className="w-56"
+          />
+        </SettingRow>
         <SettingRow
           anchorId="terminal-verify-host-keys"
           label={t("settings.terminal.connection.verifyHostKeys")}
@@ -871,6 +996,26 @@ function SettingsTerminalTab(props: {
           <Toggle
             checked={terminalSettings.verifyHostKeys}
             onChange={(v) => updateTerminalSetting("verifyHostKeys", v)}
+          />
+        </SettingRow>
+        <SettingRow
+          anchorId="terminal-temporary-legacy-algorithms"
+          label={t("settings.terminal.connection.temporaryLegacyAlgorithms")}
+          description={t("settings.terminal.connection.temporaryLegacyAlgorithms.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.temporaryConnectionsAllowLegacyAlgorithms}
+            onChange={(v) => updateTerminalSetting("temporaryConnectionsAllowLegacyAlgorithms", v)}
+          />
+        </SettingRow>
+        <SettingRow
+          anchorId="terminal-temporary-network-device-mode"
+          label={t("settings.terminal.connection.temporaryNetworkDeviceMode")}
+          description={t("settings.terminal.connection.temporaryNetworkDeviceMode.desc")}
+        >
+          <Toggle
+            checked={terminalSettings.temporaryConnectionsNetworkDeviceMode}
+            onChange={(v) => updateTerminalSetting("temporaryConnectionsNetworkDeviceMode", v)}
           />
         </SettingRow>
         <SettingRow

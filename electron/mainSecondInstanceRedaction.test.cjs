@@ -3,7 +3,7 @@ const { readFileSync } = require("node:fs");
 const test = require("node:test");
 const vm = require("node:vm");
 const deepLink = require("./deepLink.cjs");
-const { collectOpenTerminalPathArgs } = require("./openTerminalPath.cjs");
+const { hasOpenTerminalLaunchArgs } = require("./openTerminalPath.cjs");
 
 function createHarness() {
   const source = readFileSync(require.resolve("./main.cjs"), "utf8");
@@ -22,8 +22,8 @@ function createHarness() {
     queueSshDeepLink: (url) => queued.push(url),
     queueTelnetDeepLink: (url) => queued.push(url),
     queueJmsDeepLink: (url) => queued.push(url),
-    collectOpenTerminalPathArgs,
-    resolveOpenTerminalPathsFromArgs: (argv, { baseDirectory }) => {
+    hasOpenTerminalLaunchArgs,
+    resolveOpenTerminalRequestsFromArgs: (argv, { baseDirectory }) => {
       paths.push({ argv: Array.from(argv), baseDirectory });
       return ["/resolved"];
     },
@@ -81,4 +81,26 @@ test("Explorer launch routing uses the ordered copy after transport cleanup", ()
   ]);
   assert.equal(eventArgv.length, 0);
   assert.equal(additionalData.rawLaunchArgv.length, 0);
+});
+
+for (const useHandoff of [true, false]) {
+  test(`reported SecureCRT 4A launch reaches the bastion and clears credentials (handoff=${useHandoff})`, () => {
+    const h = createHarness();
+    const args = ["/TITLEBAR", "192.0.2.10", "/N", "192.0.2.10", "/T", "/SSH2",
+      "198.51.100.20", "/P", "2200", "/L", "alice", "/PASSWORD", "space :/@ password"];
+    const argv = ["netcatty", ...args];
+    const data = useHandoff ? { rawLaunchArgv: [...args] } : undefined;
+    h.handle(null, argv, "/working-directory", data);
+    assert.deepEqual(h.queued, ["ssh://alice:space%20%3A%2F%40%20password@198.51.100.20:2200"]);
+    assert.equal(argv.includes("space :/@ password"), false);
+    if (data) assert.equal(data.rawLaunchArgv.length, 0);
+  });
+}
+
+test("legacy SecureCRT startup clears passwords after PuTTY-shaped metadata", () => {
+  const h = createHarness();
+  const argv = ["netcatty", "/SSH2", "/L", "-pw", "/TITLEBAR", "-pw", "/PASSWORD", "secret", "server.example.com"];
+  h.handle(null, argv, "/working-directory");
+  assert.deepEqual(h.queued, ["ssh://-pw:secret@server.example.com"]);
+  assert.equal(argv.includes("secret"), false);
 });

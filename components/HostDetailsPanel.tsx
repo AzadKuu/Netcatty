@@ -4,6 +4,7 @@ import {
   EyeOff,
   FileText,
   FolderPlus,
+  PlugZap,
   Plus,
   Settings2,
   Tag,
@@ -23,6 +24,7 @@ import {
   updateProxyConfigField,
 } from "../domain/proxyProfiles";
 import { hasRequiredHostAuthCredential, resolveHostAuth, resolveHostAuthMethodForPersistence } from "../domain/sshAuth";
+import { canServeAsSshJumpHost } from "../domain/terminalProtocol";
 import { customThemeStore } from "../application/state/customThemeStore";
 import {
   hasHostFontSizeOverride,
@@ -30,7 +32,7 @@ import {
   resolveHostTerminalFontSize,
   resolveHostTerminalThemeId,
 } from "../domain/terminalAppearance";
-import { EnvVar, GroupConfig, Host, Identity, ManagedSource, ProxyConfig, ProxyProfile, Snippet, SSHKey } from "../types";
+import { EnvVar, GroupConfig, Host, Identity, KnownHost, ManagedSource, ProxyConfig, ProxyProfile, Snippet, SSHKey, TerminalSettings } from "../types";
 import { DISTRO_COLORS, DISTRO_LOGOS } from "./DistroAvatar";
 import ThemeSelectPanel from "./ThemeSelectPanel";
 import {
@@ -42,6 +44,7 @@ import {
 } from "./ui/aside-panel";
 import { HostDetailsAdvancedSections } from "./HostDetailsAdvancedSections";
 import { detachEffectiveHostIdentity, HostDetailsConnectionSections } from "./HostDetailsConnectionSections";
+import type { HostTotpFlushResult } from "./HostTotpFields";
 import {
   LINUX_DISTRO_OPTION_IDS,
   parseOptionalPortInput,
@@ -52,6 +55,11 @@ import {
   resolvePrimaryProtocolSwitchPort,
   prepareTelnetCredentialsForSave,
   prepareProxyConfigForSave,
+  nextFormAfterSelectProxyProfile,
+  nextFormAfterClearHostChain,
+  nextFormAfterRemoveHostFromChain,
+  resolveFormHostChainIds,
+  resolveDisplayProxyProfileId,
 } from "./HostDetailsPanel.helpers";
 export { parseOptionalPortInput } from "./HostDetailsPanel.helpers";
 import { TerminalEncodingSelect } from "./TerminalEncodingSelect";
@@ -60,6 +68,7 @@ import { Combobox, ComboboxOption, MultiCombobox } from "./ui/combobox";
 import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { toast } from "./ui/toast";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 import {
   ChainPanel,
@@ -77,6 +86,8 @@ import {
   stripBuiltInConnectionFieldsForPluginHost,
 } from "../domain/pluginConnection";
 import { PluginConnectionSection } from "./PluginConnectionSection";
+import { useHostConnectionTest } from "../application/state/useHostConnectionTest";
+import { HostConnectionTestDialog } from "./host-details/HostConnectionTestDialog";
 
 type CredentialType = "sshid" | "key" | "certificate" | "localKeyFile" | null;
 type SubPanel =
@@ -111,6 +122,9 @@ interface HostDetailsPanelProps {
   snippets?: Snippet[];
   onSnippetsChange?: (snippets: Snippet[]) => void;
   onHostsChange?: (hosts: Host[] | ((prev: Host[]) => Host[])) => void;
+  knownHosts?: KnownHost[];
+  onAddKnownHost?: (knownHost: KnownHost) => void;
+  terminalSettings?: TerminalSettings;
   className?: string;
 }
 
@@ -139,6 +153,9 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   snippets = [],
   onSnippetsChange,
   onHostsChange,
+  knownHosts,
+  onAddKnownHost,
+  terminalSettings,
   className,
   resizable,
   persistWidthStorageKey,
@@ -152,6 +169,8 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   };
   const { checkSshAgent } = useApplicationBackend();
   const baselineSnippetsRef = useRef(snippets);
+  const totpFlushRef = useRef<(() => Promise<HostTotpFlushResult>) | null>(null);
+  const savingHostRef = useRef(false);
   const baselineHydratedRef = useRef(snippets.length > 0);
   const openingQueueIdsRef = useRef<string[]>([]);
   const [form, setForm] = useState<Host>(
@@ -168,6 +187,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
         os: "linux",
         authMethod: undefined,
         authPolicyVersion: 1,
+        sshInputCompatibility: false,
         charset: groupDefaults?.charset ? undefined : "UTF-8",
         distroMode: "auto",
         createdAt: Date.now(),
@@ -197,6 +217,28 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
 
   const [sshAgentStatus, setSshAgentStatus] = useState<SshAgentStatus | null>(null);
   const [sshForwardingAgentStatus, setSshForwardingAgentStatus] = useState<SshAgentStatus | null>(null);
+
+  const [testOpen, setTestOpen] = useState(false);
+  const hostConnectionTest = useHostConnectionTest({
+    host: form,
+    hosts: allHosts,
+    keys: availableKeys,
+    identities,
+    knownHosts,
+    groupConfigs,
+    proxyProfiles,
+    terminalSettings,
+    onAddKnownHost,
+  });
+
+  const handleStartTest = () => {
+    setTestOpen(true);
+    void hostConnectionTest.startTest();
+  };
+
+  const handleCloseTest = () => {
+    setTestOpen(false);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -387,24 +429,34 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   );
 
   const effectiveFormDistro = getEffectiveHostDistro(form);
+  const hasHostProxyOverride = form.directProxy === true
+    || form.proxyProfileId !== undefined
+    || form.proxyConfig !== undefined;
+  const displayProxyProfileId = resolveDisplayProxyProfileId(form, effectiveAuthHost.proxyProfileId);
+  const displayProxyConfig = form.directProxy
+    ? undefined
+    : (form.proxyConfig ?? effectiveAuthHost.proxyConfig);
   const selectedProxyProfile = useMemo(
-    () => proxyProfiles.find((profile) => profile.id === form.proxyProfileId),
-    [form.proxyProfileId, proxyProfiles],
+    () => proxyProfiles.find((profile) => profile.id === displayProxyProfileId),
+    [displayProxyProfileId, proxyProfiles],
   );
-  const hasMissingProxyProfile = Boolean(form.proxyProfileId && !selectedProxyProfile);
+  const hasMissingProxyProfile = Boolean(displayProxyProfileId && !selectedProxyProfile);
+  const proxyInherited = !hasHostProxyOverride && Boolean(
+    displayProxyProfileId || displayProxyConfig?.host || displayProxyConfig?.command,
+  ) && Boolean(effectiveGroupDefaults?.proxyProfileId || effectiveGroupDefaults?.proxyConfig);
   const proxySummaryType = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missing")
-    : formatProxyConfigType(selectedProxyProfile?.config || form.proxyConfig) || "HTTP";
+    : formatProxyConfigType(selectedProxyProfile?.config || displayProxyConfig) || "HTTP";
   const proxySummaryLabel = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missingSaved")
     : selectedProxyProfile
       ? selectedProxyProfile.label
-      : formatProxyConfigEndpoint(form.proxyConfig);
+      : formatProxyConfigEndpoint(displayProxyConfig);
   const proxySummaryTooltip = hasMissingProxyProfile
     ? t("hostDetails.proxyPanel.missingSaved")
     : selectedProxyProfile
       ? `${selectedProxyProfile.label} - ${formatProxyConfigEndpoint(selectedProxyProfile.config)}`
-      : `${formatProxyConfigType(form.proxyConfig)} ${formatProxyConfigEndpoint(form.proxyConfig)}`;
+      : `${formatProxyConfigType(displayProxyConfig)} ${formatProxyConfigEndpoint(displayProxyConfig)}`;
 
   const handleDistroModeChange = useCallback((mode: "auto" | "manual") => {
     setForm((prev) => ({
@@ -420,28 +472,37 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   const updateProxyConfig = useCallback(
     (field: keyof ProxyConfig, value: ProxyConfig[keyof ProxyConfig]) => {
       setForm((prev) => {
-        const { proxyProfileId: _proxyProfileId, ...rest } = prev;
+        const { proxyProfileId: _proxyProfileId, directProxy: _directProxy, ...rest } = prev;
+        const inheritedConfig = !prev.directProxy
+          && prev.proxyProfileId === undefined
+          && prev.proxyConfig === undefined
+          && effectiveGroupDefaults
+          ? applyGroupDefaults(prev, effectiveGroupDefaults).proxyConfig
+          : undefined;
         return {
           ...rest,
-          proxyConfig: updateProxyConfigField(prev.proxyConfig, field, value),
+          proxyConfig: updateProxyConfigField(prev.proxyConfig ?? inheritedConfig, field, value),
         } as Host;
       });
     },
-    [],
+    [effectiveGroupDefaults],
   );
 
   const clearProxyConfig = useCallback(() => {
     setForm((prev) => {
-      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
+      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, directProxy: _directProxy, ...rest } = prev;
       return rest as Host;
     });
   }, []);
 
   const selectProxyProfile = useCallback((profileId: string | undefined) => {
+    setForm((prev) => nextFormAfterSelectProxyProfile(prev, profileId, effectiveGroupDefaults));
+  }, [effectiveGroupDefaults]);
+
+  const selectDirectProxy = useCallback(() => {
     setForm((prev) => {
       const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
-      if (!profileId) return rest as Host;
-      return { ...rest, proxyProfileId: profileId } as Host;
+      return { ...rest, directProxy: true } as Host;
     });
   }, []);
 
@@ -449,24 +510,18 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
     setForm((prev) => ({
       ...prev,
       hostChain: {
-        hostIds: [...(prev.hostChain?.hostIds || []), hostId],
+        hostIds: [...resolveFormHostChainIds(prev, effectiveGroupDefaults), hostId],
       },
     }));
   };
 
   const removeHostFromChain = (index: number) => {
-    setForm((prev) => {
-      const ids = (prev.hostChain?.hostIds || []).filter((_, i) => i !== index);
-      return { ...prev, hostChain: ids.length > 0 ? { hostIds: ids } : undefined };
-    });
+    setForm((prev) => nextFormAfterRemoveHostFromChain(prev, index, effectiveGroupDefaults));
   };
 
   const clearHostChain = useCallback(() => {
-    setForm((prev) => {
-      const { hostChain: _hostChain, ...rest } = prev;
-      return rest as Host;
-    });
-  }, []);
+    setForm((prev) => nextFormAfterClearHostChain(prev, effectiveGroupDefaults));
+  }, [effectiveGroupDefaults]);
 
   const [newEnvName, setNewEnvName] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
@@ -494,7 +549,12 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
     ? pluginConnectionValid && Boolean(sanitizePluginConnection(form.pluginConnection, form.protocol))
     : hasHostname;
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    if (savingHostRef.current) return;
+    savingHostRef.current = true;
+    try {
+    const flushed = await totpFlushRef.current?.();
+    if (flushed && !flushed.ok) return;
     const hostname = form.hostname.trim()
       || (pluginProtocolActive ? form.label.trim() || form.pluginConnection?.providerId || "plugin" : "");
     if (!hostname || !canSaveHost) return;
@@ -575,6 +635,10 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
       authPolicyVersion: 1,
       managedSourceId: finalManagedSourceId,
     };
+    if (flushed?.ok) {
+      if (flushed.totp) cleaned.totp = flushed.totp;
+      else delete cleaned.totp;
+    }
     if (pluginProtocolActive) {
       const pluginConnection = sanitizePluginConnection(cleaned.pluginConnection, cleaned.protocol);
       if (!pluginConnection) return;
@@ -702,6 +766,9 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
       }
     }
     onSave(stripBuiltInConnectionFieldsForPluginHost(cleaned));
+    } finally {
+      savingHostRef.current = false;
+    }
   };
 
   const handleCreateGroup = () => {
@@ -717,17 +784,30 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
     setActiveSubPanel("none");
   };
 
+  const displayHostChainIds = useMemo(
+    () => form.hostChain !== undefined
+      ? (form.hostChain.hostIds || [])
+      : (effectiveAuthHost.hostChain?.hostIds || []),
+    [effectiveAuthHost.hostChain?.hostIds, form.hostChain],
+  );
+  const hostChainInherited = form.hostChain === undefined && displayHostChainIds.length > 0;
+
   const availableHostsForChain = useMemo(() => {
-    const chainedIds = new Set(form.hostChain?.hostIds || []);
-    return allHosts.filter((h) => h.id !== form.id && !chainedIds.has(h.id));
-  }, [allHosts, form.id, form.hostChain?.hostIds]);
+    const chainedIds = new Set(displayHostChainIds);
+    // Chain hops are SSH ProxyJump hops; never offer local/serial/telnet/plugin
+    // entries (e.g. saved local shells) as jump hosts.
+    return allHosts.filter((h) =>
+      h.id !== form.id
+      && !chainedIds.has(h.id)
+      && canServeAsSshJumpHost(h),
+    );
+  }, [allHosts, displayHostChainIds, form.id]);
 
   const chainedHosts = useMemo(() => {
-    const ids = form.hostChain?.hostIds || [];
-    return ids
+    return displayHostChainIds
       .map((id) => allHosts.find((h) => h.id === id))
       .filter(Boolean) as Host[];
-  }, [allHosts, form.hostChain?.hostIds]);
+  }, [allHosts, displayHostChainIds]);
 
   const groupOptions: ComboboxOption[] = useMemo(() => {
     return groups.map((g) => ({
@@ -843,12 +923,15 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   if (activeSubPanel === "proxy") {
     return (
       <ProxyPanel
-        proxyConfig={form.proxyConfig}
+        proxyConfig={displayProxyConfig}
         proxyProfiles={proxyProfiles}
         identities={identities}
-        selectedProxyProfileId={form.proxyProfileId}
+        selectedProxyProfileId={displayProxyProfileId}
+        directProxy={form.directProxy}
+        allowClear={hasHostProxyOverride}
         onUpdateProxy={updateProxyConfig}
         onSelectProxyProfile={selectProxyProfile}
+        onSelectDirectProxy={selectDirectProxy}
         onClearProxy={clearProxyConfig}
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
@@ -978,16 +1061,39 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
         initialData ? t("hostDetails.title.details") : t("hostDetails.title.new")
       }
       actions={
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          onClick={handleSubmit}
-          disabled={!canSaveHost}
-          aria-label={t("hostDetails.saveAria")}
-        >
-          <Check size={16} />
-        </Button>
+        <>
+          {!pluginProtocolActive && form.protocol !== "telnet" && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={handleStartTest}
+                    disabled={!canSaveHost}
+                    aria-label={t("hostConnectionTest.title")}
+                  >
+                    <PlugZap size={16} />
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {t("hostConnectionTest.title")}
+              </TooltipContent>
+            </Tooltip>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            onClick={handleSubmit}
+            disabled={!canSaveHost}
+            aria-label={t("hostDetails.saveAria")}
+          >
+            <Check size={16} />
+          </Button>
+        </>
       }
     >
       <AsidePanelContent>
@@ -1066,6 +1172,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
           t={t}
           form={form}
           setForm={setForm}
+          totpFlushRef={totpFlushRef}
           update={update}
           groupDefaults={effectiveGroupDefaults}
           effectiveAuthMethod={effectiveAuthMethod}
@@ -1149,11 +1256,13 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
           showAlgorithmOverrides={showAlgorithmOverrides}
           setShowAlgorithmOverrides={setShowAlgorithmOverrides}
           chainedHosts={chainedHosts}
+          hostChainInherited={hostChainInherited}
           setActiveSubPanel={setActiveSubPanel}
           clearHostChain={clearHostChain}
           proxySummaryType={proxySummaryType}
           proxySummaryLabel={proxySummaryLabel}
           proxySummaryTooltip={proxySummaryTooltip}
+          proxyInherited={proxyInherited}
           clearProxyConfig={clearProxyConfig}
         />
 
@@ -1318,6 +1427,13 @@ const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
           {t("common.save")}
         </Button>
       </AsidePanelFooter>
+      <HostConnectionTestDialog
+        open={testOpen}
+        onClose={handleCloseTest}
+        host={form}
+        keys={availableKeys}
+        test={hostConnectionTest}
+      />
     </AsidePanel>
   );
 };

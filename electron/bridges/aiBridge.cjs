@@ -13,11 +13,13 @@ const { randomUUID } = require("node:crypto");
 const { spawn, execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const { existsSync } = fs;
-const { appendVaultAgentGuidance } = require("../shared/vaultAgentGuidance.cjs");
+const { appendVaultAgentGuidance, VAULT_NOTES_CLI_GUIDANCE } = require("../shared/vaultAgentGuidance.cjs");
 
 const mcpServerBridge = require("./mcpServerBridge.cjs");
 const { createExternalMcpController } = require("./externalMcpController.cjs");
+const { registerPrivacyHandlers } = require("./aiBridge/privacyHandlers.cjs");
 const { getCliLauncherPath, TOOL_CLI_DISCOVERY_ENV_VAR } = require("../cli/discoveryPath.cjs");
+const { injectCliTransportEnv } = require("../cli/cliChatSession.cjs");
 const { getExternalMcpDiscoveryFilePath } = require("../cli/externalMcpDiscoveryPath.cjs");
 const {
   scanUserSkills,
@@ -28,6 +30,7 @@ const { registerProviderHandlers } = require("./aiBridge/providerHandlers.cjs"),
 const { createVaultAgentBridge } = require("./aiBridge/vaultAgentBridge.cjs");
 const { registerAgentDiscoveryHandlers } = require("./aiBridge/agentDiscoveryHandlers.cjs"), { registerAgentProcessHandlers } = require("./aiBridge/agentProcessHandlers.cjs"), { registerSdkStreamHandlers } = require("./aiBridge/sdk/sdkStreamHandlers.cjs");
 const { probeClaudeAuth, probeCopilotAuth, probeCodexAuth, probeCodebuddyAuth, probeCursorCliAuth, probeGrokAuth } = require("./aiBridge/agentAuthProbes.cjs");
+const { buildSdkAgentEnv } = require("./aiBridge/sdk/env.cjs");
 
 // ── Extracted modules ──
 const {
@@ -148,7 +151,7 @@ function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSes
         ? `For this chat session, the exact Netcatty CLI command prefix is \`${cliCommandPrefix}\`.`
         : "Use the exact Netcatty CLI command prefix provided by the host application for this chat session. ";
     const scopeHint = chatSessionId
-      ? `Always include \`--chat-session ${chatSessionId}\` on every Netcatty CLI call so you stay inside the current scoped session set. `
+      ? `The current Netcatty chat session is already bound in this process via the host environment. Keep using \`--session <session-id>\` to select a terminal. `
       : "";
     const defaultTargetHint = defaultTargetSession
       ? (
@@ -159,13 +162,13 @@ function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSes
         `protocol="${defaultTargetSession.protocol || ""}", ` +
         `connected=${defaultTargetSession.connected !== false}. ` +
         (defaultTargetSession.connected !== false
-          ? `For routine requests that do not mention another session or host, use this default target directly and prefer \`${cliCommandPrefix} session --session ${defaultTargetSession.sessionId} --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` as the first call instead of starting with \`env\` discovery. Only run \`env\` when the user explicitly points to another session (for example with @), when the task is ambiguous, or when that direct session lookup fails. `
+          ? `For routine requests that do not mention another session or host, use this default target directly and prefer \`${cliCommandPrefix} session --session ${defaultTargetSession.sessionId} --json\` as the first call instead of starting with \`env\` discovery. Only run \`env\` when the user explicitly points to another session (for example with @), when the task is ambiguous, or when that direct session lookup fails. `
           : `This default target is currently not connected, so do not execute against it directly. Fall back to \`env\` / \`session\` lookup if the user may want another available session. `)
       )
       : "";
     const discoveryHint = defaultTargetSession?.connected !== false
-      ? `If you do need discovery because the task is ambiguous or points to another session, start with \`${cliCommandPrefix} env --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` to discover available sessions and their IDs. `
-      : `Start with \`${cliCommandPrefix} env --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` to discover available sessions and their IDs. `;
+      ? `If you do need discovery because the task is ambiguous or points to another session, start with \`${cliCommandPrefix} env --json\` to discover available sessions and their IDs. `
+      : `Start with \`${cliCommandPrefix} env --json\` to discover available sessions and their IDs. `;
 
     return (
       `${userSkillsPreamble}` +
@@ -176,24 +179,25 @@ function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSes
       `${defaultTargetHint}` +
       `Use Skills + CLI instead of the "netcatty-remote-hosts" MCP server for Netcatty session access. ` +
       `Use the local shell only to invoke Netcatty CLI commands. Do not use local shell or filesystem tools for unrelated local-machine work. ` +
-      `For files explicitly attached by the user, call \`${cliCommandPrefix} attachment list --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`, then read the selected file with \`${cliCommandPrefix} attachment read --filename <filename> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`. ` +
+      `For files explicitly attached by the user, call \`${cliCommandPrefix} attachment list --json\`, then read the selected file with \`${cliCommandPrefix} attachment read --filename <filename> --json\`. ` +
+      `${VAULT_NOTES_CLI_GUIDANCE} Invoke those notes commands as \`${cliCommandPrefix} notes list|get|create|update|delete|import --json\`, and read the notes reference in the Netcatty skill before the first notes write. ` +
       `First classify the task: remote command execution tasks go through \`exec\`, while remote file or directory tasks go through \`sftp\`. If the user explicitly says to avoid shell or \`exec\`, do not use \`exec\`. Treat \`exec\` as the short-command path only: use it only for commands expected to finish within about 60 seconds. For builds, scans, watch mode, tail-following, ping, or anything likely to exceed that budget or stream output for an extended period, do not use plain \`exec\`; use the long-running job commands instead. ` +
       `${discoveryHint}` +
-      `After choosing a target session ID, call \`${cliCommandPrefix} session --session <id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` before executing anything. Do not infer protocol, shell type, device type, or connection readiness from the \`env\` result alone when you are about to run a command. ` +
-      `For remote file operations, use the Netcatty SFTP CLI surface instead of trying to reconstruct SSH credentials or open your own SSH/SFTP connection, but only when the chosen session is SSH-backed and connected. After the required \`session --session <id>\` confirmation step, inspect the reported protocol, shell type, device type, and connected state before picking a file-operation path. For SSH-backed sessions, prefer one-off commands such as \`${cliCommandPrefix} sftp list --session <id> --remote-path <remote-path> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`, \`${cliCommandPrefix} sftp read --session <id> --remote-path <remote-path> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`, \`${cliCommandPrefix} sftp write --session <id> --remote-path <remote-path> --content <text> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`, \`${cliCommandPrefix} sftp download --session <id> --remote-path <remote-path> --local-path <local-path> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`, or \`${cliCommandPrefix} sftp upload --session <id> --local-path <local-path> --remote-path <remote-path> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\`. For local sessions, use normal local filesystem tools instead of Netcatty SFTP. For Mosh, Telnet, serial/raw, or network-device sessions, do not call SFTP; use a real SSH session, vendor CLI commands, or tell the user that the requested file transfer is unsupported on that transport. ` +
+      `After choosing a target session ID, call \`${cliCommandPrefix} session --session <id> --json\` before executing anything. Do not infer protocol, shell type, device type, or connection readiness from the \`env\` result alone when you are about to run a command. ` +
+      `For remote file operations, use the Netcatty SFTP CLI surface instead of trying to reconstruct SSH credentials or open your own SSH/SFTP connection, but only when the chosen session is SSH-backed and connected. After the required \`session --session <id>\` confirmation step, inspect the reported protocol, shell type, device type, and connected state before picking a file-operation path. For SSH-backed sessions, prefer one-off commands such as \`${cliCommandPrefix} sftp list --session <id> --remote-path <remote-path> --json\`, \`${cliCommandPrefix} sftp read --session <id> --remote-path <remote-path> --json\`, \`${cliCommandPrefix} sftp write --session <id> --remote-path <remote-path> --content <text> --json\`, \`${cliCommandPrefix} sftp download --session <id> --remote-path <remote-path> --local-path <local-path> --json\`, or \`${cliCommandPrefix} sftp upload --session <id> --local-path <local-path> --remote-path <remote-path> --json\`. For local sessions, use normal local filesystem tools instead of Netcatty SFTP. For Mosh, Telnet, serial/raw, or network-device sessions, do not call SFTP; use a real SSH session, vendor CLI commands, or tell the user that the requested file transfer is unsupported on that transport. ` +
       `Keep local and remote path semantics strict: \`--remote-path\` always refers to the remote host, while \`--local-path\` always refers to the local machine running Netcatty. If the user asks to download a file to a local destination such as \`/tmp\`, \`~/Downloads\`, or a desktop path, use \`sftp download\`, not \`sftp read\` or \`sftp write\`. If the user asks to create or modify a file on the remote host, use \`sftp write\` or another remote SFTP operation, not \`sftp download\`. ` +
       `If you need to create or update a small text file with known content on the remote host, prefer \`${cliCommandPrefix} sftp write ...\` directly. Use \`sftp upload\` only when a real local file already exists and must be transferred to the remote host. Do not create temporary local files just to upload text that could be sent with \`sftp write\`. ` +
-      `Keep SFTP usage one-off and explicit: every \`sftp\` command should include both \`--session <id>\` and \`--chat-session ${chatSessionId || "<chat-session-id>"}\`. Do not open reusable SFTP handles or use \`--sftp <id>\`. ` +
+      `Keep SFTP usage one-off and explicit: every \`sftp\` command should include \`--session <id>\`. Do not open reusable SFTP handles or use \`--sftp <id>\`. ` +
       `Run Netcatty CLI calls strictly one at a time. Do not issue concurrent or background Netcatty CLI commands for the same chat session, and always wait for each call to finish before starting the next one. ` +
       `For simple read-only requests such as hostname, IP address, CPU info, memory info, disk usage, pwd, whoami, uname, or process checks, use the shortest possible path: one \`env\`, one \`session\`, then one \`exec\`. Prefer a single straightforward command over creating helper scripts or multi-step shell orchestration. ` +
-      `For long-running command tasks, start them with \`${cliCommandPrefix} job-start --session <id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""} -- <command>\`, then use \`${cliCommandPrefix} job-poll --job <job-id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` to fetch incremental output, and \`${cliCommandPrefix} job-stop --job <job-id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""}\` if the user asks to stop them. Do not poll aggressively; wait roughly 30 seconds between polls unless the output clearly justifies checking sooner. ` +
+      `For long-running command tasks, start them with \`${cliCommandPrefix} job-start --session <id> --json -- <command>\`, then use \`${cliCommandPrefix} job-poll --job <job-id> --json\` to fetch incremental output, and \`${cliCommandPrefix} job-stop --job <job-id> --json\` if the user asks to stop them. Do not poll aggressively; wait roughly 30 seconds between polls unless the output clearly justifies checking sooner. ` +
       `For those simple read-only requests, do not spend time reading extra files, designing scripts, or narrating a plan unless the first direct command fails or the session metadata shows a special device type. ` +
       `Do not create temporary scripts, JSON post-processing scripts, or extra wrapper commands unless the task genuinely requires logic that cannot fit cleanly in one direct command. ` +
       `Avoid shell command substitution such as \`$()\` and backticks, because Netcatty safety policy may block them. Prefer straightforward command chains such as \`hostname && hostname -I && lscpu\`. ` +
       `Avoid wrapping simple commands in \`sh -c\`, \`bash -c\`, or similar shell launcher patterns unless the task genuinely requires shell parsing that cannot be expressed as a direct command. ` +
       `Do not spend time narrating intent before every CLI call for routine read-only checks. Execute the minimal command sequence and then report the result. ` +
-      `Only after that confirmation step should you call \`${cliCommandPrefix} exec --session <id> --json${chatSessionId ? ` --chat-session ${chatSessionId}` : ""} -- <command>\` for command execution. ` +
-      `If the user stops the run or asks to abort outstanding Netcatty work, use \`${cliCommandPrefix} cancel --chat-session ${chatSessionId || "<chat-session-id>"} --json\`, and use \`resume\` to re-enable execs for that scope if needed. ` +
+      `Only after that confirmation step should you call \`${cliCommandPrefix} exec --session <id> --json -- <command>\` for command execution. ` +
+      `If the user stops the run or asks to abort outstanding Netcatty work, use \`${cliCommandPrefix} cancel --json\`, and use \`resume\` to re-enable execs for that scope if needed. ` +
       `For serial/raw sessions and network device sessions (deviceType: network), commands are sent as-is without shell wrapping and exit codes are unavailable. Use vendor CLI commands directly.]`
     );
   }
@@ -237,6 +241,7 @@ let registeredVaultAgentBridge = null;
 
 // Active streaming requests (for cancellation)
 const activeStreams = new Map();
+const pluginModelStreamOwners = new Map();
 
 // ── Provider registry (synced from renderer, keys stay encrypted) ──
 const ENC_PREFIX = "enc:v1:";
@@ -297,7 +302,7 @@ const WEB_SEARCH_KEY_PLACEHOLDER = "__WEB_SEARCH_KEY__";
 function injectApiKeyIntoRequest(url, headers, providerId) {
   if (!providerId) return { url, headers };
   const resolved = resolveProviderApiKey(providerId);
-  if (!resolved || !resolved.apiKey) return { url, headers };
+  if (!resolved) return { url, headers };
   const realKey = resolved.apiKey;
 
   // Replace placeholder in all header values
@@ -312,6 +317,17 @@ function injectApiKeyIntoRequest(url, headers, providerId) {
     patchedUrl = url.replace(API_KEY_PLACEHOLDER, encodeURIComponent(realKey));
   }
 
+  for (const [name, stored] of Object.entries(resolved.provider.customHeaders || {})) {
+    const value = decryptApiKeyValue(stored);
+    if (stored.startsWith(ENC_PREFIX) && (!value || value === stored)) {
+      throw new Error("Unable to decrypt custom HTTP headers");
+    }
+    // Replace case-insensitively, including SDK-generated authorization headers.
+    for (const key of Object.keys(patchedHeaders)) {
+      if (key.toLowerCase() === name.toLowerCase()) delete patchedHeaders[key];
+    }
+    Object.defineProperty(patchedHeaders, name, { value, enumerable: true, configurable: true });
+  }
   return { url: patchedUrl, headers: patchedHeaders };
 }
 
@@ -430,12 +446,11 @@ function init(deps) {
   }
 }
 
-function withCliDiscoveryEnv(env) {
-  if (!cliDiscoveryFilePath) return env;
-  return {
-    ...env,
-    [TOOL_CLI_DISCOVERY_ENV_VAR]: cliDiscoveryFilePath,
-  };
+function withCliDiscoveryEnv(env, chatSessionId) {
+  return injectCliTransportEnv(env, {
+    discoveryFilePath: cliDiscoveryFilePath,
+    chatSessionId,
+  });
 }
 
 /**
@@ -596,10 +611,25 @@ function withContentLength(headers, body) {
 }
 
 async function streamRequest(url, options, event, requestId, skipTLS) {
+  if (requestId.startsWith("agent-model_") && !/^agent-model_[0-9a-f-]{36}_[0-9a-f-]{36}_sdk_/.test(requestId)) {
+    throw new Error("Delegated model request identity invalid");
+  }
   const parsedUrl = new URL(url);
   // Register cancellation before any await so Stop during PAC/proxy lookup works.
   const controller = new AbortController();
-  const { idleTimeoutMs, totalTimeoutMs } = resolveAIStreamTimeouts(options);
+  const pluginRuntimeId = /^plugin-model_([A-Za-z0-9-]{1,128})_/.exec(requestId)?.[1];
+  const delegatedMatch = /^agent-model_([0-9a-f-]{36})_([0-9a-f-]{36})_sdk_/.exec(requestId);
+  const delegatedId = delegatedMatch?.[1];
+  const delegationTag = delegatedMatch?.[2];
+  const delegatedBridge = delegatedId ? require("./mcpServerBridge.cjs") : null;
+  const assertDelegation = () => delegatedBridge?.assertPluginAgentCaller(`plugin-agent:${delegatedId}`, event.sender.id, delegationTag);
+  assertDelegation();
+  if (delegatedId) delegatedBridge.beginPluginAgentModelRequest(`plugin-agent:${delegatedId}`, event.sender.id, delegationTag);
+  const detachDelegation = delegatedBridge?.onPluginAgentRelease(`plugin-agent:${delegatedId}`, delegationTag, () => controller.abort(createAbortError()));
+  const { idleTimeoutMs, totalTimeoutMs } = pluginRuntimeId || delegatedId
+    ? { idleTimeoutMs: Math.min(15_000, Math.max(1, Number(options.idleTimeoutMs) || 15_000)),
+        totalTimeoutMs: Math.min(60_000, Math.max(1, Number(options.totalTimeoutMs) || 60_000)) }
+    : resolveAIStreamTimeouts(options);
   const maxErrorBodyBytes = Math.max(1, Number(options.maxErrorBodyBytes) || 64 * 1024);
   let lifecycleFinished = false;
   let idleTimer;
@@ -609,6 +639,8 @@ async function streamRequest(url, options, event, requestId, skipTLS) {
     clearTimeout(totalTimer);
     clearTimeout(idleTimer);
     activeStreams.delete(requestId);
+    pluginModelStreamOwners.delete(requestId);
+    detachDelegation?.();
   };
   const noteStreamActivity = () => {
     if (lifecycleFinished) return;
@@ -622,10 +654,14 @@ async function streamRequest(url, options, event, requestId, skipTLS) {
   }, totalTimeoutMs);
   noteStreamActivity();
   activeStreams.set(requestId, controller);
+  if (pluginRuntimeId) pluginModelStreamOwners.set(requestId, { sender: event.sender, runtimeId: pluginRuntimeId });
   if (controller.signal.aborted) {
     finishLifecycle();
     throw controller.signal.reason instanceof Error ? controller.signal.reason : createAbortError();
   }
+
+  try { assertDelegation(); }
+  catch (error) { finishLifecycle(); throw error; }
 
   const { resolveOutboundHttpAgent } = require("./httpNetworkProxyAgent.cjs");
   let proxyAgent;
@@ -710,6 +746,7 @@ async function streamRequest(url, options, event, requestId, skipTLS) {
     if (proxyAgent) reqOpts.agent = proxyAgent;
 
     try {
+      assertDelegation();
       req = lib.request(parsedUrl, reqOpts,
         (res) => {
         if (streamFinished) {
@@ -768,10 +805,19 @@ async function streamRequest(url, options, event, requestId, skipTLS) {
         settleResolve({ statusCode, statusText });
 
         let buffer = "";
+        let pluginResponseBytes = 0;
         const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB safety limit
 
         res.on("data", (chunk) => {
+          if (streamFinished) return;
           noteStreamActivity();
+          if (pluginRuntimeId || delegatedId) {
+            pluginResponseBytes += Buffer.byteLength(chunk);
+            if (pluginResponseBytes > 131_072) {
+              failStream(new Error("Plugin model stream byte budget exceeded"));
+              return;
+            }
+          }
           const previousBufferLength = buffer.length;
           buffer += chunk.toString();
           // Guard against unbounded buffer growth
@@ -946,6 +992,7 @@ function createHandlerContext(ipcMain) {
     killTrackedProcessTree,
     safeSend,
     withCliDiscoveryEnv,
+    buildSdkAgentEnv,
     validateSender,
     validateSenderOrSettings,
     envPairsToObject,
@@ -983,10 +1030,23 @@ function registerHandlers(ipcMain) {
   registerAgentDiscoveryHandlers(context);
   registerAgentProcessHandlers(context);
   registerSdkStreamHandlers(context);
+  registerPrivacyHandlers(context);
 
   if (externalMcpController) {
     externalMcpController.registerHandlers(ipcMain, validateSenderOrSettings);
   }
+}
+
+// This entry point is main-process only. Plugin views cannot choose a sender or
+// access it through IPC. Internal Agent streams have no plugin request tag.
+function cancelPluginAIStreamsForSender(sender, runtimeId) {
+  let cancelled = 0;
+  for (const [requestId, owner] of [...pluginModelStreamOwners]) {
+    if (owner.sender !== sender || (runtimeId !== undefined && owner.runtimeId !== runtimeId)) continue;
+    activeStreams.get(requestId)?.abort(createAbortError());
+    cancelled++;
+  }
+  return cancelled;
 }
 
 // Abort active streams and child processes on shutdown
@@ -995,6 +1055,7 @@ function cleanup() {
     try { controller.abort(); } catch {}
   }
   activeStreams.clear();
+  pluginModelStreamOwners.clear();
 
   // Abort active SDK agent streams (set by registerSdkStreamHandlers on ctx).
   if (registeredContext && registeredContext.sdkActiveStreams) {
@@ -1040,6 +1101,7 @@ module.exports = {
   buildExternalAgentSystemContext,
   buildExternalAgentContextualPrompt,
   _streamRequestForTests: streamRequest,
+  cancelPluginAIStreamsForSender,
   _resolveAIStreamTimeoutsForTests: resolveAIStreamTimeouts,
   _getActiveStreamCountForTests: () => activeStreams.size,
   DEFAULT_AI_STREAM_TOTAL_TIMEOUT_MS,

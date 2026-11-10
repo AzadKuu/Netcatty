@@ -153,6 +153,37 @@ test("foreground PTY cancellation returns only a bounded tail", async () => {
   assert.equal(result.outputTruncated, true);
 });
 
+test("PTY cancellation delivers Ctrl+C as terminal data without a channel signal request", async () => {
+  const calls = [];
+  class SignalSpyPty extends EventEmitter {
+    signal(name) {
+      calls.push(["signal", name]);
+    }
+    write(data) {
+      if (data === "\x03") calls.push(["write", data]);
+      const marker = markerFromWrite(data);
+      if (!marker || this.started) return;
+      this.started = true;
+      queueMicrotask(() => {
+        this.emit("data", Buffer.from(`${marker}_S\n`));
+      });
+    }
+  }
+
+  const pty = new SignalSpyPty();
+  const job = startPtyJob(pty, "cancel-signal-request", {
+    shellKind: "posix",
+    timeoutMs: 1_000,
+    expectedPrompt: "$ ",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  job.cancel();
+  pty.emit("data", Buffer.from("$ "));
+  const result = await job.resultPromise;
+  assert.equal(result.error, "Cancelled");
+  assert.deepEqual(calls, [["write", "\x03"]]);
+});
+
 test("background PTY jobs preserve output that has no trailing newline", async () => {
   const job = startPtyJob(new ShellBackedPty(), "printf 'abc'", {
     shellKind: "posix",
@@ -278,6 +309,21 @@ test("recognizes PowerShell on Linux/macOS prompts (`PS /home/alice>`)", () => {
   assert.equal(
     resolveEffectiveShellKind(undefined, "PS /home/alice>"),
     "powershell",
+  );
+});
+
+test("recognizes the macOS zsh default prompt without changing PowerShell/cmd detection", () => {
+  assert.equal(
+    resolveEffectiveShellKind(undefined, "hexiao@JosephdeMacBook-Pro-2 ~ % "),
+    "posix",
+  );
+  assert.equal(
+    resolveEffectiveShellKind(undefined, "hexiao@MacBook-Pro ~/git %", { loginShellHint: "powershell" }),
+    "posix",
+  );
+  assert.equal(
+    resolveEffectiveShellKind("posix", "hexiao@MacBook-Pro ~ % echo half-typed"),
+    "posix",
   );
 });
 
@@ -874,6 +920,13 @@ test("execViaRawPty does not prepend a line-clear before device commands", async
   assert.equal(result.ok, false);
 });
 
+test("powershell wrapper submits with CR only", () => {
+  const wrapped = buildWrappedCommand("Get-Location", "powershell", "__NCMCP_TEST__");
+  assert.ok(wrapped.endsWith("\r"));
+  assert.ok(!wrapped.endsWith("\r\n"));
+  assert.ok(buildWrappedCommand("echo test", "cmd", "__NCMCP_TEST__").endsWith("\r\n"));
+});
+
 test("cmd wrapper uses interactive cmd variable expansion", () => {
   const wrapped = buildWrappedCommand("ipconfig /all", "cmd", "__NCMCP_TEST__");
   assert.match(wrapped, /"%__NCMCP_TEST___CMD%"/);
@@ -902,16 +955,15 @@ test("posix wrapper isolates set -e failures from the active shell", () => {
   assert.doesNotMatch(result.stdout, /SHOULD_NOT_PRINT/);
 });
 
-test("posix wrapper types multi-line commands as one physical line (no PS2 leak) and preserves semantics", () => {
+test("posix wrapper marks every continuation and preserves multi-line command semantics", () => {
   const marker = "__NCMCP_TEST__";
   const wrapped = buildWrappedCommand(
     "echo first\necho \"it's quoted\"\n\necho last",
     "posix",
     marker,
   );
-  // A single physical line: the interactive shell must never show PS2
-  // ("> ") continuation echoes, which would leak past the preload filter.
-  assert.equal(wrapped.indexOf("\n"), wrapped.length - 1);
+  // Every continuation carries the marker so its PS2 echo stays hidden.
+  assert.ok(wrapped.trimEnd().split("\n").every(line => line.includes(marker)));
 
   const result = spawnSync("sh", ["-c", wrapped], { encoding: "utf8" });
   assert.equal(result.error, undefined);
@@ -926,10 +978,10 @@ test("long POSIX assignments preserve quotes, Unicode, and heredoc newlines on b
   const literal = "quote' \\ $HOME `false` " + "\u4e2d\u6587\ud83d\ude42".repeat(600);
   const command = `cat <<'SMOKE_END'\n${literal}\n\nsecond line\nSMOKE_END\nprintf tail`;
   const wrapped = buildWrappedCommand(command, "posix", marker, true);
-  assert.ok(wrapped.split('\n').every(line => Buffer.byteLength(line, 'utf8') < 1000));
+  assert.ok(wrapped.split('\n').every(line => Buffer.byteLength(line, 'utf8') <= 480));
   const result = spawnSync('sh', ['-c', wrapped], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, `\n${marker}_S\n${literal}\n\nsecond line\ntail${marker}_E:0\n`);
+  assert.equal(result.stdout, `\n${marker}_I\n\n${marker}_S\n${literal}\n\nsecond line\ntail${marker}_E:0\n`);
 });
 
 test("posix wrapper isolates explicit exit from the active shell and reports its code", () => {
@@ -967,6 +1019,25 @@ test("posix wrapper keeps cd contained in the subshell (documented trade-off)", 
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+// A cancelled paced delivery may execute only the first physical line.
+// Neither partial delivery nor a complete command may change user shell hooks.
+for (const [partial, hasPS0] of [[true, true], [false, true], [true, false], [false, false]]) {
+  test(`posix ${partial ? "partial" : "complete"} wrapper preserves ${hasPS0 ? "set" : "unset"} PS0 and existing shell state`, () => {
+    const marker = "__NCMCP_TEST__";
+    const wrapped = buildWrappedCommand("echo HOOK_STATE_TEST", "posix", marker);
+    const script = partial ? wrapped.slice(0, wrapped.indexOf("\n") + 1) : wrapped;
+    const result = spawnSync("bash", ["--norc", "-c",
+      (hasPS0 ? 'PS0="[hook] "; ' : 'unset PS0; ') + '__NCMCP_PS0=user_value\n' + script
+        + 'printf "HOOK_STATE=<%s> SCRATCH=<%s>\\n" "$PS0" "$__NCMCP_PS0"',
+    ], { encoding: "utf8" });
+
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes(`HOOK_STATE=<${hasPS0 ? "[hook] " : ""}> SCRATCH=<user_value>`), result.stdout);
+    if (!partial) assert.match(result.stdout, new RegExp(`${marker}_E:0`));
+  });
+}
 
 // Issue #3265: with plain HISTCONTROL the wrapper line is recorded in bash
 // history; arrow-up recall then redraws the marker text, the preload __NCMCP_
@@ -1376,3 +1447,111 @@ test("posix wrapper avoids history expansion in interactive zsh", (t) => {
   assert.match(result.stdout, /HISTORY_PROBE/);
   assert.doesNotMatch(result.stderr, /event not found/);
 });
+
+
+test("cancelled POSIX input without a live probe resets display suppression", async () => {
+  const pty = new EventEmitter();
+  const resets = [];
+  pty.write = () => {};
+  const job = startPtyJob(pty, "echo should-not-start", {
+    shellKind: "posix", probeLiveShell: false, timeoutMs: 1000,
+    expectedPrompt: "ready$ ", onProbeAborted: marker => resets.push(marker),
+  });
+  pty.emit("data", `${job.marker}_I\nCUSTOM> `);
+  job.cancel();
+  pty.emit("data", "\nready$ ");
+  assert.equal((await job.resultPromise).error, "Cancelled");
+  assert.deepEqual(resets, [job.marker]);
+});
+
+test("startPtyJob types the wrapper one code point per write for strict bastions (#3146)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const writes = [];
+  class CapturePty extends EventEmitter {
+    write(data) {
+      writes.push(String(data));
+    }
+  }
+  const pty = new CapturePty();
+  const job = startPtyJob(pty, "echo test", {
+    shellKind: "posix",
+    bastionKeystrokes: true,
+    timeoutMs: 50,
+    expectedPrompt: "$ ",
+  });
+  const wrapped = buildWrappedCommand("echo test", "posix", job.marker);
+  const expected = Array.from(`${buildPendingInputClearPrefix("posix")}${wrapped}`);
+  while (writes.length < expected.length) t.mock.timers.tick(30);
+  assert.deepEqual(writes, expected, "one write per code point");
+  for (const chunk of writes) {
+    assert.equal(Array.from(chunk).length, 1, "each write is a single code point");
+  }
+  job.cancel();
+  pty.emit("data", Buffer.from("$ "));
+  const result = await job.resultPromise;
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "Cancelled");
+});
+
+test("echo suppression prime is delivered before the first typed input (#3384)", async () => {
+  for (const probeLiveShell of [false, true]) {
+    const pty = new EventEmitter();
+    const events = [];
+    pty.write = (data) => {
+      if (data === "\x03") return;
+      events.push(`write:${data}`);
+    };
+    const job = startPtyJob(pty, "echo prime-order", {
+      shellKind: "posix",
+      probeLiveShell,
+      timeoutMs: 1000,
+      onEchoSuppressionPrime: (marker) => events.push(`prime:${marker}`),
+    });
+    assert.equal(events[0], `prime:${job.marker}`, "prime precedes every typed byte");
+    assert.ok((events[1] || "").startsWith("write:"), "first write follows the prime");
+    assert.equal(events.filter((event) => event.startsWith("prime:")).length, 1);
+    if (probeLiveShell) {
+      pty.emit("data", `${job.marker}_P:sh\n${job.marker}_Q`);
+    }
+    pty.emit("data", `${job.marker}_S\ndone\n${job.marker}_E:0\n`);
+    const result = await job.resultPromise;
+    assert.equal(result.ok, true, JSON.stringify(result));
+  }
+});
+
+test("a throwing echo suppression prime callback still types the command (#3384)", () => {
+  const writes = [];
+  const pty = new EventEmitter();
+  pty.write = (data) => writes.push(String(data));
+  const job = startPtyJob(pty, "echo resilient", {
+    shellKind: "posix",
+    timeoutMs: 1000,
+    onEchoSuppressionPrime: () => {
+      throw new Error("Renderer closed");
+    },
+  });
+  assert.ok(writes.some((data) => data.includes("echo resilient")));
+  job.cancel();
+});
+
+test("skipPendingInputClear does not send line-kill keys", async () => {
+  const writes = [];
+  const pty = new EventEmitter();
+  pty.write = (data) => {
+    writes.push(String(data));
+    return true;
+  };
+  const job = startPtyJob(pty, "echo hi", {
+    shellKind: "posix",
+    probeLiveShell: false,
+    skipPendingInputClear: true,
+    timeoutMs: 300,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const input = writes.join("");
+  assert.equal(input.includes("\u0015"), false);
+  assert.equal(input.includes("\u000b"), false);
+  assert.match(input, /echo hi/);
+  job.cancel();
+});
+

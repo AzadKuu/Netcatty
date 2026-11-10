@@ -51,9 +51,14 @@ import { CopilotCliCard } from "./ai/CopilotCliCard";
 import { CodebuddyCard } from "./ai/CodebuddyCard";
 import { SafetySettings } from "./ai/SafetySettings";
 import { ExternalMcpCard } from "./ai/ExternalMcpCard";
+import { AIPrivacySection } from "./ai/AIPrivacySection";
 import { ToolAccessGuidance } from "./ai/ToolAccessGuidance";
 import { PermissionGrantsSettings } from "./ai/PermissionGrantsSettings";
 import { useAIPermissionGrantsState } from "../../../application/state/useAIPermissionGrantsState";
+import {
+  MAX_AI_SESSION_MESSAGE_CAP,
+  MIN_AI_SESSION_MESSAGE_CAP,
+} from "../../../domain/aiSessionMessageCap";
 import { WebSearchSettings } from "./ai/WebSearchSettings";
 import { QuickMessagesSettings } from "./ai/QuickMessagesSettings";
 import type { AIQuickMessage } from "../../../infrastructure/ai/quickMessages";
@@ -112,7 +117,7 @@ function getSavedManagedAgentPathInfo(
   return {
     path: command,
     binPath: command,
-    version: null,
+    version: managed.cliVersion ?? null,
     available: savedAvailable,
     installed: true,
     authenticated: undefined,
@@ -158,6 +163,8 @@ interface SettingsAITabProps {
   setResponseIdleTimeout: (value: number) => void;
   maxIterations: number;
   setMaxIterations: (value: number) => void;
+  aiSessionMessageCap: number;
+  setAiSessionMessageCap: (value: number) => void;
   webSearchConfig: WebSearchConfig | null;
   setWebSearchConfig: (config: WebSearchConfig | null) => void;
   quickMessages: AIQuickMessage[];
@@ -195,6 +202,8 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   setResponseIdleTimeout,
   maxIterations,
   setMaxIterations,
+  aiSessionMessageCap,
+  setAiSessionMessageCap,
   webSearchConfig,
   setWebSearchConfig,
   quickMessages,
@@ -226,6 +235,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     codebuddy: string;
     opencode: string;
     grok: string;
+    mimo: string;
   } | null>(null);
   if (!initialManagedPathsRef.current) {
     initialManagedPathsRef.current = getInitialManagedAgentPaths(externalAgents);
@@ -298,6 +308,12 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   const [grokCustomPath, setGrokCustomPath] = useState(() => initialManagedPathsRef.current?.grok ?? "");
   const [isResolvingGrok, setIsResolvingGrok] = useState(false);
 
+  const [mimoPathInfo, setMimoPathInfo] = useState<AgentPathInfo | null>(
+    () => getSavedManagedAgentPathInfo(externalAgents, "mimo"),
+  );
+  const [mimoCustomPath, setMimoCustomPath] = useState(() => initialManagedPathsRef.current?.mimo ?? "");
+  const [isResolvingMimo, setIsResolvingMimo] = useState(false);
+
   const codebuddyManagedAgent = useMemo(
     () => externalAgents.find((a) => a.id === "discovered_codebuddy"),
     [externalAgents],
@@ -348,7 +364,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     return () => {
       mountedRef.current = false;
       codexRequestIdRef.current += 1;
-      for (const key of ["codex", "claude", "copilot", "cursor", "codebuddy", "opencode", "grok"] as ManagedAgentKey[]) {
+      for (const key of ["codex", "claude", "copilot", "cursor", "codebuddy", "opencode", "grok", "mimo"] as ManagedAgentKey[]) {
         agentPathRequestIds[key] = (agentPathRequestIds[key] ?? 0) + 1;
       }
     };
@@ -371,7 +387,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               ? setCodebuddyPathInfo
               : agentKey === "opencode"
                 ? setOpencodePathInfo
-                : setGrokPathInfo;
+                : agentKey === "grok"
+                  ? setGrokPathInfo
+                  : setMimoPathInfo;
 
     setInfo(result);
 
@@ -414,7 +432,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               ? setIsResolvingCodebuddy
               : agentKey === "opencode"
                 ? setIsResolvingOpencode
-                : setIsResolvingGrok;
+                : agentKey === "grok"
+                  ? setIsResolvingGrok
+                  : setIsResolvingMimo;
 
     setResolving(true);
     const requestId = (agentPathRequestIdRef.current[agentKey] ?? 0) + 1;
@@ -455,7 +475,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
                   ? setCodebuddyPathInfo
                   : agentKey === "opencode"
                     ? setOpencodePathInfo
-                    : setGrokPathInfo;
+                    : agentKey === "grok"
+                      ? setGrokPathInfo
+                      : setMimoPathInfo;
         setInfo(result);
         return result;
       }
@@ -494,6 +516,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
       { key: "codebuddy", delayMs: 1280, path: initialPaths?.codebuddy ?? "" },
       { key: "opencode", delayMs: 1560, path: initialPaths?.opencode ?? "" },
       { key: "grok", delayMs: 1840, path: initialPaths?.grok ?? "" },
+      { key: "mimo", delayMs: 2120, path: initialPaths?.mimo ?? "" },
     ];
     const cancelTasks = tasks
       .filter((task) => !autoResolvedAgentStateRef.current[task.key])
@@ -645,6 +668,11 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     }, 900);
   }, []);
 
+  const codexManagedAgent = useMemo(
+    () => externalAgents.find((agent) => agent.id === "discovered_codex"),
+    [externalAgents],
+  );
+
   const refreshCodexIntegration = useCallback(async (opts?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string }) => {
     const bridge = getBridge();
     if (!bridge?.aiCodexGetIntegration) return;
@@ -655,7 +683,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     setIsCodexLoading(true);
     setCodexError(null);
     try {
-      const integration = await bridge.aiCodexGetIntegration(opts);
+      const integration = await bridge.aiCodexGetIntegration({ ...opts, agentEnv: codexManagedAgent?.env });
       if (!isCurrentRequest()) return;
       setCodexIntegration(integration);
     } catch (err) {
@@ -667,7 +695,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         setIsCodexLoading(false);
       }
     }
-  }, []);
+  }, [codexManagedAgent?.env]);
 
   const codexCommittedPath = useMemo(
     () => getManagedAgentCommandPath(externalAgents, "codex") || codexPathInfo?.path || undefined,
@@ -682,10 +710,6 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     codexCommittedPath
   ), [codexCommittedPath]);
 
-  const codexManagedAgent = useMemo(
-    () => externalAgents.find((agent) => agent.id === "discovered_codex"),
-    [externalAgents],
-  );
   const codexRuntime = codexManagedAgent?.codexRuntime ?? 'sdk';
 
   const refreshCodexAppServerStatus = useCallback(async () => {
@@ -753,7 +777,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               ? opencodeCustomPath
               : agentKey === "grok"
                 ? grokCustomPath
-                : "";
+                : agentKey === "mimo"
+                  ? mimoCustomPath
+                  : "";
     const result = await resolveAgentPath(agentKey, customPath, {
       refreshShellEnv: true,
       commandSource: customPath.trim() ? "manual" : "auto",
@@ -765,7 +791,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         codexPath: result?.path || customPath.trim() || undefined,
       });
     }
-  }, [claudeCustomPath, codexCustomPath, copilotCustomPath, codebuddyCustomPath, opencodeCustomPath, grokCustomPath, resolveAgentPath, refreshCodexIntegration]);
+  }, [claudeCustomPath, codexCustomPath, copilotCustomPath, codebuddyCustomPath, opencodeCustomPath, grokCustomPath, mimoCustomPath, resolveAgentPath, refreshCodexIntegration]);
 
   const handleResetCustomPath = useCallback(async (agentKey: ManagedAgentKey) => {
     if (agentKey === "codex") {
@@ -780,6 +806,8 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
       setOpencodeCustomPath("");
     } else if (agentKey === "grok") {
       setGrokCustomPath("");
+    } else if (agentKey === "mimo") {
+      setMimoCustomPath("");
     }
 
     const result = await resolveAgentPath(agentKey, "", {
@@ -861,7 +889,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     setCodexError(null);
     setIsCodexLoading(true);
     try {
-      const result = await bridge.aiCodexStartLogin({ codexPath: getCodexPathOverride() });
+      const result = await bridge.aiCodexStartLogin({ codexPath: getCodexPathOverride(), agentEnv: codexManagedAgent?.env });
       if (!isCurrentRequest()) return;
       if (!result.ok || !result.session) {
         throw new Error(result.error || "Failed to start Codex login");
@@ -876,7 +904,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         setIsCodexLoading(false);
       }
     }
-  }, [getCodexPathOverride]);
+  }, [getCodexPathOverride, codexManagedAgent?.env]);
 
   const handleCancelCodexLogin = useCallback(async () => {
     const bridge = getBridge();
@@ -912,7 +940,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     setCodexError(null);
     setIsCodexLoading(true);
     try {
-      const result = await bridge.aiCodexLogout({ codexPath: getCodexPathOverride() });
+      const result = await bridge.aiCodexLogout({ codexPath: getCodexPathOverride(), agentEnv: codexManagedAgent?.env });
       if (!isCurrentRequest()) return;
       if (!result.ok) {
         throw new Error(result.error || "Failed to log out from Codex");
@@ -928,7 +956,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         setIsCodexLoading(false);
       }
     }
-  }, [getCodexPathOverride, refreshCodexIntegration]);
+  }, [getCodexPathOverride, refreshCodexIntegration, codexManagedAgent?.env]);
 
   const refreshUserSkillsStatus = useCallback(async () => {
     const bridge = getBridge();
@@ -1206,6 +1234,21 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
             />
           </SettingsSection>
 
+          <SettingsSection
+            title={t('ai.mimo.title')}
+            leading={<AgentIconBadge agent={{ id: "mimo", icon: "mimo", name: "MiMo Code" }} variant="plain" className="h-5 w-5 text-muted-foreground/90" />}
+          >
+            <CopilotCliCard
+              pathInfo={mimoPathInfo}
+              isResolvingPath={isResolvingMimo}
+              customPath={mimoCustomPath}
+              onCustomPathChange={setMimoCustomPath}
+              onRecheckPath={() => void handleCheckCustomPath("mimo")}
+              onResetPath={() => void handleResetCustomPath("mimo")}
+              i18nPrefix="ai.mimo"
+            />
+          </SettingsSection>
+
           {agentOptions.length > 1 ? (
             <SettingsSection anchorId="ai-default-agent" title={t('ai.defaultAgent')}>
               <SettingCard>
@@ -1225,6 +1268,34 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
         </TabsContent>
 
         <TabsContent value="tools" className="m-0 space-y-6">
+
+
+          <SettingsSection
+            anchorId="ai-tool-access-mode"
+            title={t('ai.toolAccess.title')}
+          >
+            <SettingCard>
+              <SettingRow className="flex-col items-start md:flex-row md:items-center" description={t('ai.toolAccess.description')}>
+                <div className="flex flex-wrap justify-end gap-2">
+                <Select
+                  value={toolIntegrationMode}
+                  options={[
+                    { value: 'mcp', label: t('ai.toolAccess.mode.mcp') },
+                    { value: 'skills', label: t('ai.toolAccess.mode.skills') },
+                  ]}
+                  onChange={(value) => setToolIntegrationMode(value as AIToolIntegrationMode)}
+                  className="w-48"
+                />
+                <ToolAccessGuidance mode={toolIntegrationMode} />
+                </div>
+              </SettingRow>
+            </SettingCard>
+          </SettingsSection>
+
+          <ExternalMcpCard />
+
+          <AIPrivacySection />
+
           <SettingsSection title={t('ai.chatShortcuts.title')}>
             <SettingCard divided>
               <SettingRow
@@ -1242,29 +1313,32 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
           </SettingsSection>
 
           <SettingsSection
-            anchorId="ai-tool-access-mode"
-            title={t('ai.toolAccess.title')}
+            anchorId="ai-chat-history"
+            title={t('ai.chatHistory.title')}
           >
             <SettingCard>
-              <SettingRow description={t('ai.toolAccess.description')}>
-                <Select
-                  value={toolIntegrationMode}
-                  options={[
-                    { value: 'mcp', label: t('ai.toolAccess.mode.mcp') },
-                    { value: 'skills', label: t('ai.toolAccess.mode.skills') },
-                  ]}
-                  onChange={(value) => setToolIntegrationMode(value as AIToolIntegrationMode)}
-                  className="w-48"
-                />
+              <SettingRow
+                anchorId="ai-chat-history-message-cap"
+                label={t('ai.chatHistory.messageCap')}
+                description={t('ai.chatHistory.messageCap.description')}
+              >
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    aria-label={t('ai.chatHistory.messageCap')}
+                    value={aiSessionMessageCap}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      if (!isNaN(val)) setAiSessionMessageCap(val);
+                    }}
+                    min={MIN_AI_SESSION_MESSAGE_CAP}
+                    max={MAX_AI_SESSION_MESSAGE_CAP}
+                    className="w-20 h-9 rounded-md border border-input bg-background px-3 text-sm text-right focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                  <span className="text-xs text-muted-foreground">{t('ai.chatHistory.messageCap.unit')}</span>
+                </div>
               </SettingRow>
-              <div className="pb-4">
-                <ToolAccessGuidance mode={toolIntegrationMode} />
-              </div>
             </SettingCard>
-          </SettingsSection>
-
-          <SettingsSection anchorId="ai-external-mcp" title={t('ai.externalMcp.title')}>
-            <ExternalMcpCard />
           </SettingsSection>
 
           <SettingsSection

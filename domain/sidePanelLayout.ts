@@ -1,11 +1,18 @@
-export type SidePanelTool =
+export type BuiltinSidePanelTool =
   | 'sftp'
+  | 'browser'
   | 'scripts'
   | 'history'
   | 'theme'
   | 'ai'
   | 'system'
   | 'notes';
+
+export type SidePanelTool = BuiltinSidePanelTool | `plugin-view:${string}`;
+
+export function isPluginSidePanelTool(value: unknown): value is `plugin-view:${string}` {
+  return typeof value === 'string' && value.length <= 256 && /^plugin-view:[A-Za-z0-9_.-]+$/.test(value);
+}
 
 export type SidePanelSplitDirection = 'horizontal' | 'vertical';
 
@@ -248,4 +255,17 @@ export function resizeSidePanelSplit(
 
   const root = patch(layout.root);
   return root === layout.root ? layout : { ...layout, root };
+}
+
+export type SidePanelDockPosition = 'left' | 'right' | 'bottom';
+
+export const SIDE_PANEL_DOCK_POSITIONS: readonly SidePanelDockPosition[] = [
+  'left',
+  'right',
+  'bottom',
+];
+
+export function isSidePanelDockPosition(value: unknown): value is SidePanelDockPosition {
+  return typeof value === 'string'
+    && (SIDE_PANEL_DOCK_POSITIONS as readonly string[]).includes(value);
 }

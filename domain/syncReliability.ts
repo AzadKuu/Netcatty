@@ -24,7 +24,10 @@ const OPTIONAL_ENTITY_KEYS = new Set<CloudSyncPayloadEntityKey>([
   'proxyProfiles',
   'snippetPackages',
   'portForwardingRules',
+  'browserBookmarks',
   'groupConfigs',
+  'monitorPanels',
+  'aiSessions',
 ]);
 
 function fingerprint(value: unknown): string {
@@ -70,7 +73,7 @@ function payloadValues(
   if (
     base
     && OPTIONAL_ENTITY_KEYS.has(entityType)
-    && !Object.prototype.hasOwnProperty.call(payload, entityType)
+    && payload[entityType] === undefined
   ) {
     return base[entityType];
   }
@@ -286,10 +289,13 @@ export function withSyncReliabilityMeta(
   const changeSummary = summarizeSyncChanges(base, payload);
   const deletions = mergeDeletionRecords(
     payload,
-    collectSyncDeletions(base, payload, {
-      deletedAt: generatedAt,
-      ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
-    }),
+    [
+      ...(base?.syncMeta?.deletions ?? []),
+      ...collectSyncDeletions(base, payload, {
+        deletedAt: generatedAt,
+        ...(opts.deviceId ? { deviceId: opts.deviceId } : {}),
+      }),
+    ],
   );
   const meta: SyncReliabilityMeta = {
     schemaVersion: 1,

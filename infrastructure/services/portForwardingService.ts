@@ -12,8 +12,10 @@ import {
   selectStoppablePortForwardingRules,
 } from '../../domain/portForwardingBulkActions';
 import { isEncryptedCredentialPlaceholder, sanitizeCredentialValue } from '../../domain/credentials';
+import { isPortForwardingAutoReconnectEnabled } from '../../domain/portForwardingReconnect';
 import { resolveBridgeKeyAuth, resolveBridgeSshAgentAuth, resolveHostAuth } from '../../domain/sshAuth';
 import { resolveHostKeepalive } from '../../domain/host';
+import { connectionTotpFields } from '../../domain/totpConfig';
 import { resolveHostSshConnectionTimeouts } from '../../domain/sshConnectionTimeouts';
 import {
   findIncompleteProxyIdentityId,
@@ -215,13 +217,27 @@ const scheduleReconnectIfNeeded = (
   enableReconnect: boolean,
   onStatusChange: (status: PortForwardingRule['status'], error?: string) => void,
 ): boolean => {
-  if (!enableReconnect || !reconnectCallback || shouldReconnectRule?.(ruleId) === false) {
+  // The rule's autoReconnect setting may change while the tunnel is running
+  // (e.g. toggled in the edit panel).  The start-time flag alone would keep
+  // rejecting reconnects after such a change, so also consult the dynamic
+  // rule gate, which reads fresh rule state.
+  const effectiveEnableReconnect =
+    enableReconnect || shouldReconnectRule?.(ruleId) === true;
+  if (
+    !effectiveEnableReconnect ||
+    !reconnectCallback ||
+    shouldReconnectRule?.(ruleId) === false
+  ) {
     return false;
   }
   if (rulesPendingCleanup.has(ruleId)) {
-    deferredReconnects.set(ruleId, { enableReconnect, onStatusChange });
+    deferredReconnects.set(ruleId, { enableReconnect: effectiveEnableReconnect, onStatusChange });
     return true;
   }
+
+  // One failed dial can report both a status event and a rejected start.
+  // Once exhausted, neither notification may begin another retry cycle.
+  if (exhaustedReconnectRules.has(ruleId)) return false;
 
   const currentConn = activeConnections.get(ruleId);
   if (currentConn?.reconnectSuppressed) return false;
@@ -670,6 +686,10 @@ const subscribeSyncedConnection = async (
     connection.status = resolveBackendStatus(snapshot.status);
     connection.error = snapshot.error;
   }
+  if (connection.status === 'active') {
+    exhaustedReconnectRules.delete(ruleId);
+    connection.reconnectAttempts = 0;
+  }
   return true;
 };
 
@@ -809,6 +829,10 @@ export const reconcileWithBackend = async (): Promise<{
           if (existing.status !== backendStatus || existing.error !== tunnel.error) {
             existing.status = backendStatus;
             existing.error = tunnel.error;
+            if (backendStatus === 'active') {
+              exhaustedReconnectRules.delete(ruleId);
+              existing.reconnectAttempts = 0;
+            }
             result.appeared.push(ruleId);
           }
         }
@@ -860,7 +884,8 @@ export const startPortForward = async (
   enableReconnect = false,
   terminalSettings?: Pick<TerminalSettings, 'verifyHostKeys' | 'keepaliveInterval' | 'keepaliveCountMax'>,
   knownHosts?: KnownHost[],
-): Promise<{ success: boolean; error?: string }> => {
+  options?: { dedicatedTransport?: boolean; prepareOnly?: boolean },
+): Promise<{ success: boolean; error?: string; localPort?: number; tunnelId?: string; connectionOptions?: PortForwardOptions }> => {
   const globalTerminalSettings = { ...FALLBACK_TERMINAL_SETTINGS, ...(terminalSettings ?? {}) };
   const bridge = netcattyBridge.get();
   if (rulesPendingCleanup.has(rule.id)) {
@@ -882,7 +907,9 @@ export const startPortForward = async (
   
   // Clear any existing reconnect timer
   clearReconnectTimer(rule.id);
-  
+  // Explicit starts (including network recovery) authorize a fresh cycle.
+  exhaustedReconnectRules.delete(rule.id);
+
   if (!bridge?.startPortForward) {
     // Fallback for browser/dev mode - simulate the connection
     logger.warn('[PortForwardingService] Backend not available, simulating connection...');
@@ -972,6 +999,7 @@ export const startPortForward = async (
             authMethod: jumpResolved.authMethod,
             requiresMfa: !!jumpHost.requiresMfa,
             password: jumpPassword,
+            ...connectionTotpFields(jumpHost),
             privateKey: jumpKeyAuth.privateKey,
             certificate: jumpKey?.certificate,
             passphrase: jumpKeyAuth.passphrase,
@@ -1092,7 +1120,7 @@ export const startPortForward = async (
     
     // Start the tunnel
     const connectionTimeouts = resolveHostSshConnectionTimeouts(host);
-    const result = await bridge.startPortForward({
+    const connectionOptions: PortForwardOptions = {
       ruleId: rule.id,
       tunnelId,
       type: rule.type,
@@ -1107,6 +1135,7 @@ export const startPortForward = async (
       authMethod: resolved.authMethod,
       requiresMfa: !!host.requiresMfa,
       password,
+      ...connectionTotpFields(host),
       privateKey: keyAuth.privateKey,
       certificate: key?.certificate,
       keyId: resolved.keyId,
@@ -1124,7 +1153,15 @@ export const startPortForward = async (
       keepaliveCountMax: resolveHostKeepalive(host, globalTerminalSettings).countMax,
       sshTcpConnectTimeoutMs: connectionTimeouts.tcpConnectTimeoutSeconds * 1000,
       sshAuthReadyTimeoutMs: connectionTimeouts.authReadyTimeoutSeconds * 1000,
-    });
+      reuseTransport: !options?.dedicatedTransport,
+    };
+    if (options?.prepareOnly) {
+      activeConnections.delete(rule.id);
+      unsubscribe?.();
+      onStatusChange('inactive');
+      return { success: true, connectionOptions };
+    }
+    const result = await bridge.startPortForward(connectionOptions);
     
     if (!result.success) {
       // Intentional cancellation (rule deleted/replaced during handshake).
@@ -1211,7 +1248,7 @@ export const startPortForward = async (
     }
     exhaustedReconnectRules.delete(rule.id);
     
-    return { success: true };
+    return { success: true, localPort: result.localPort, tunnelId: result.tunnelId };
     
   } catch (err) {
     const error = err instanceof Error ? err.message : 'Unknown error';
@@ -1392,7 +1429,7 @@ export const startAllPortForwards = async (
       keys,
       identities,
       (status, error) => onStatusChange(rule.id, status, error),
-      Boolean(rule.autoStart),
+      isPortForwardingAutoReconnectEnabled(rule),
       terminalSettings,
       knownHosts,
     );

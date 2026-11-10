@@ -1,7 +1,8 @@
-import { Check, ChevronLeft, ChevronRight, Loader2, Pin, Search, Star } from 'lucide-react';
+import { Check, ChevronLeft, ChevronRight, Loader2, Pin, RotateCw, Search, Star } from 'lucide-react';
 import React, { useEffect, useMemo, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import {
+  canonicalizeEffortEncodedModelId,
   filterComposerModels,
   resolveComposerEnterModelId,
   resolvePinnedAndRecentModels,
@@ -10,6 +11,7 @@ import {
   type ComposerPickerModel,
 } from '../../infrastructure/ai/composerPicker';
 import type { AgentModelPreset, ProviderConfig } from '../../infrastructure/ai/types';
+import { formatRelativeTime } from '../AIChatSessionHistoryDrawer';
 import { ProviderIconBadge } from '../settings/tabs/ai/ProviderIconBadge';
 import { useProviderModelCatalog } from './useProviderModelCatalog';
 
@@ -21,9 +23,41 @@ export interface ComposerModelPickerProps {
   selectedProviderId?: string;
   selectedModelId?: string;
   modelPresets?: AgentModelPreset[];
+  /**
+   * The host's live model catalog (external SDK agents like OpenCode) is still
+   * loading. Show the loading row instead of an empty/placeholder list.
+   */
+  loading?: boolean;
+  /**
+   * Provenance of the model list behind this picker: a live SDK fetch, the
+   * persisted last-known-good catalog, or the build-time preset fallback.
+   * Rendered as a small muted status footer; omit (provider switcher mode)
+   * to hide the chip.
+   */
+  catalogSource?: 'live' | 'last-known-good' | 'presets';
+  /** ISO timestamp of the successful fetch backing `catalogSource`. */
+  catalogFetchedAt?: string;
+  /**
+   * The catalog warning text behind the host's retry banner, when present.
+   * Together with `catalogSource` it decides whether the manual refresh
+   * button renders: any fetched catalog (live or last-known-good) or a
+   * degraded preset fallback offers a refresh; a plain preset list does not.
+   */
+  catalogWarning?: string | null;
+  /**
+   * Manual refresh action (LKG-first policy: the picker hydrates from disk
+   * and the user refreshes explicitly). Triggers the host's force refresh.
+   */
+  onRefreshCatalog?: () => void;
   prefs: ComposerModelPrefs;
+  /**
+   * Offer the "use custom model" action. Disable when the host locks the
+   * model (e.g. a managed Codex config's `model` field overrides every
+   * selection), so the action never becomes a silent no-op.
+   */
+  allowCustomEntry?: boolean;
   onSelectProviderModel?: (providerId: string, modelId: string, contextWindow?: number) => void;
-  onSelectModel?: (modelId: string) => void;
+  onSelectModel?: (modelId: string, options?: { custom?: boolean }) => void;
   onTogglePinned: (entry: ComposerModelPrefEntry) => void;
 }
 
@@ -56,7 +90,7 @@ const ModelRow: React.FC<{
       {selected
         ? <Check size={11} className="text-primary shrink-0" />
         : <span className="w-[11px] shrink-0" />}
-      <span className="min-w-0 flex-1 truncate text-foreground/88">{model.name}</span>
+      <span className="min-w-0 flex-1 truncate text-foreground/88" title={model.name}>{model.name}</span>
     </button>
     <button
       type="button"
@@ -82,7 +116,13 @@ export const ComposerModelPicker: React.FC<ComposerModelPickerProps> = ({
   selectedProviderId,
   selectedModelId,
   modelPresets = [],
+  loading = false,
+  catalogSource,
+  catalogFetchedAt,
+  catalogWarning,
+  onRefreshCatalog,
   prefs,
+  allowCustomEntry = true,
   onSelectProviderModel,
   onSelectModel,
   onTogglePinned,
@@ -133,11 +173,54 @@ export const ComposerModelPicker: React.FC<ComposerModelPickerProps> = ({
   );
 
   const trimmedQuery = query.trim();
+  // Uniform catalog status chip (all SDK backends). While the live fetch is
+  // in flight the spinner row replaces the chip, so it renders only for a
+  // resolved list; an unknown source renders nothing (provider mode).
+  const catalogChipText = useMemo(() => {
+    if (loading || !catalogSource) return null;
+    if (catalogSource === 'live') return t('ai.chat.modelCatalogSourceLive');
+    if (catalogSource === 'presets') return t('ai.chat.modelCatalogSourcePresets');
+    const parsed = catalogFetchedAt ? new Date(catalogFetchedAt) : null;
+    const time = parsed && !Number.isNaN(parsed.getTime())
+      ? formatRelativeTime(parsed, t)
+      : '';
+    return time
+      ? t('ai.chat.modelCatalogSourceCached').replace('{time}', time)
+      : t('ai.chat.modelCatalogSourceCachedNoTime');
+  }, [loading, catalogSource, catalogFetchedAt, t]);
+  // Manual refresh (LKG-first): offered whenever a fetched catalog (any
+  // source) or the degraded-preset warning is present. Hidden while loading —
+  // the spinner row is the in-flight feedback — and in provider mode, where
+  // neither a catalog chip nor a host refresh action exists.
+  const showRefreshButton = useMemo(() => (
+    !loading
+    && Boolean(onRefreshCatalog)
+    && (catalogSource === 'live'
+      || catalogSource === 'last-known-good'
+      || Boolean(catalogWarning))
+  ), [loading, onRefreshCatalog, catalogSource, catalogWarning]);
+  const refreshLabel = t('ai.chat.refreshModelList');
+  // Manual model ids are accepted in both modes: provider-bound catalogs and
+  // preset lists from external CLI agents whose catalogs lag new models.
   const showCustom = Boolean(
-    hasProviders
+    allowCustomEntry
     && trimmedQuery
     && !models.some((model) => model.id.toLowerCase() === trimmedQuery.toLowerCase()),
   );
+
+  // Ids the prefs already mark as custom. A saved custom model that was
+  // appended to the preset list is selectable from Recent/Pinned while
+  // showCustom is false (query empty, id present in the list); the callback
+  // must keep the custom provenance or the host overwrites the pref entry
+  // without it and resolveComposerCustomModelIds drops the model (#3534).
+  const customPrefIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const entry of [...prefs.pinned, ...prefs.recent]) {
+      if (entry.providerId || entry.custom !== true) continue;
+      ids.add(canonicalizeEffortEncodedModelId(entry.modelId).trim().toLowerCase());
+    }
+    return ids;
+  }, [prefs]);
 
   const selectModel = (modelId: string) => {
     const contextWindow = models.find((model) => model.id === modelId)?.contextWindow;
@@ -145,11 +228,23 @@ export const ComposerModelPicker: React.FC<ComposerModelPickerProps> = ({
       onSelectProviderModel?.(previewProvider.id, modelId, contextWindow);
       return;
     }
-    onSelectModel?.(modelId);
+    // showCustom is only true when no catalog id matches the query, so a
+    // matching pick here came from the manual-entry action (row or Enter).
+    // Otherwise preserve provenance already recorded in the prefs.
+    const custom = Boolean(
+      (showCustom && modelId.toLowerCase() === trimmedQuery.toLowerCase())
+      || customPrefIds.has(modelId.toLowerCase()),
+    );
+    onSelectModel?.(modelId, custom ? { custom: true } : undefined);
   };
 
   const prefEntryFor = (modelId: string): ComposerModelPrefEntry => (
-    previewProvider ? { providerId: previewProvider.id, modelId } : { modelId }
+    previewProvider
+      ? { providerId: previewProvider.id, modelId }
+      // Preserve custom provenance on pin/unpin: a manual model pinned while
+      // other selections evict its unmarked recent twin would otherwise lose
+      // the custom marker and fall back to a catalog model (#3534).
+      : { modelId, ...(customPrefIds.has(modelId.toLowerCase()) ? { custom: true as const } : {}) }
   );
 
   if (hasProviders && view === 'providers') {
@@ -235,7 +330,7 @@ export const ComposerModelPicker: React.FC<ComposerModelPickerProps> = ({
       </div>
 
       <div className="max-h-[280px] overflow-y-auto">
-        {catalog.loading && (
+        {(catalog.loading || (loading && !hasProviders)) && (
           <div className="flex h-8 items-center gap-1.5 px-2.5 text-[11px] text-muted-foreground/55">
             <Loader2 size={11} className="animate-spin" />
             {t('ai.chat.loadingModels')}
@@ -308,12 +403,31 @@ export const ComposerModelPicker: React.FC<ComposerModelPickerProps> = ({
           />
         ))}
 
-        {!catalog.loading && filtered.length === 0 && !showCustom && (
+        {!catalog.loading && !loading && filtered.length === 0 && !showCustom && (
           <div className="px-2.5 py-2 text-[11px] text-muted-foreground/50">
             {catalog.error || t('ai.chat.noMatchingModels')}
           </div>
         )}
       </div>
+
+      {(catalogChipText || showRefreshButton) && (
+        <div className="flex items-center gap-1 border-t border-border/40 px-2.5 py-1 text-[10px] text-muted-foreground/45">
+          {catalogChipText && (
+            <span className="min-w-0 flex-1 truncate" title={catalogChipText}>{catalogChipText}</span>
+          )}
+          {showRefreshButton && (
+            <button
+              type="button"
+              aria-label={refreshLabel}
+              title={refreshLabel}
+              onClick={onRefreshCatalog}
+              className="shrink-0 rounded p-0.5 text-muted-foreground/55 transition-colors hover:bg-muted/40 hover:text-foreground/75 cursor-pointer"
+            >
+              <RotateCw size={11} />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };

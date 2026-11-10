@@ -17,6 +17,7 @@ import React, { useCallback, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
 import type { GroupConfig } from "../domain/models";
+import { detectSshKeyType } from "../domain/keyTypeDetect";
 import { reorderVaultItems, sortByVaultOrder } from "../domain/vaultOrder";
 import { STORAGE_KEY_VAULT_KEYS_VIEW_MODE } from "../infrastructure/config/storageKeys";
 import { logger } from "../lib/logger";
@@ -378,6 +379,12 @@ echo $3 >> "$FILE"`);
         type: keyType,
         bits: keySize,
         comment: `${draftKey.label.trim()}@netcatty`,
+        resident: keyType === "ED25519-SK" || keyType === "ECDSA-SK"
+          ? !!(draftKey as { resident?: boolean }).resident
+          : undefined,
+        verifyRequired: keyType === "ED25519-SK" || keyType === "ECDSA-SK"
+          ? !!(draftKey as { verifyRequired?: boolean }).verifyRequired
+          : undefined,
       });
       if (!result) {
         throw new Error(
@@ -388,15 +395,17 @@ echo $3 >> "$FILE"`);
         throw new Error(result.error || t("keychain.error.generateKeyPairFailed"));
       }
 
+      const resolvedType = (result.keyType as KeyType | undefined) || keyType;
+      const isFidoSk = resolvedType === "ED25519-SK" || resolvedType === "ECDSA-SK";
       const newKey: SSHKey = {
         id: crypto.randomUUID(),
         label: draftKey.label.trim(),
-        type: keyType,
-        keySize: keyType !== "ED25519" ? keySize : undefined,
+        type: resolvedType,
+        keySize: resolvedType === "ED25519" || isFidoSk ? undefined : keySize,
         privateKey: result.privateKey,
         publicKey: result.publicKey,
-        passphrase: draftKey.passphrase,
-        savePassphrase: draftKey.savePassphrase,
+        passphrase: isFidoSk ? undefined : draftKey.passphrase,
+        savePassphrase: isFidoSk ? undefined : draftKey.savePassphrase,
         source: "generated",
         category: "key",
         created: Date.now(),
@@ -422,16 +431,16 @@ echo $3 >> "$FILE"`);
     }
 
     // Detect key type from private key content
-    let detectedType: KeyType = "ED25519";
-    const pk = draftKey.privateKey.toLowerCase();
-    if (pk.includes("rsa")) detectedType = "RSA";
-    else if (pk.includes("ecdsa") || pk.includes("ec ")) detectedType = "ECDSA";
-    else if (pk.includes("ed25519")) detectedType = "ED25519";
+    const detected = detectSshKeyType(
+      draftKey.privateKey,
+      draftKey.publicKey,
+    );
 
     const newKey: SSHKey = {
       id: crypto.randomUUID(),
       label: draftKey.label.trim(),
-      type: (draftKey.type as KeyType) || detectedType,
+      type: detected.type,
+      keySize: detected.keySize,
       privateKey: draftKey.privateKey.trim(),
       publicKey: draftKey.publicKey?.trim() || undefined,
       certificate: draftKey.certificate?.trim() || undefined,
@@ -541,12 +550,7 @@ echo $3 >> "$FILE"`);
         const content = e.target?.result as string;
         if (content) {
           // Try to detect key type from content
-          let detectedType: KeyType = "ED25519";
-          const lc = content.toLowerCase();
-          if (lc.includes("rsa")) detectedType = "RSA";
-          else if (lc.includes("ecdsa") || lc.includes("ec private"))
-            detectedType = "ECDSA";
-          else if (lc.includes("ed25519")) detectedType = "ED25519";
+          const detected = detectSshKeyType(content);
 
           // Extract label from filename (remove extension)
           const label = file.name.replace(/\.(pem|key|pub|ppk)$/i, "");
@@ -555,7 +559,8 @@ echo $3 >> "$FILE"`);
             ...prev,
             privateKey: content,
             label: prev.label || label,
-            type: detectedType,
+            type: detected.type,
+            keySize: detected.keySize,
           }));
         }
       };
@@ -877,6 +882,7 @@ echo $3 >> "$FILE"`);
       {/* Slide-out Panel */}
       {panel.type !== "closed" && (
         <AsidePanel
+          dataSection="keychain-security-panel"
           open={true}
           onClose={closePanel}
           title={panelTitle}

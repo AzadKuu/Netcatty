@@ -1,6 +1,10 @@
+import { MonitorPanels } from './MonitorPanels';
+import { MonitorNavButton } from './MonitorNavButton';
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { Combobox } from "../ui/combobox";
 import React, { useCallback } from "react";
 import { deleteVaultKey } from "../../application/defaultKeyPassphrases";
+import { VaultGroupDeletionConfirmationChangedError } from "../../application/state/useVaultGroupDeletion";
 import { usePluginImporterCommit } from "../../application/state/usePluginImporterCommit";
 import { preserveConcurrentHostLineTimestampUpdate } from "../../domain/host";
 import {
@@ -11,6 +15,7 @@ import {
 } from "../../domain/vaultGroupSelection";
 import { STORAGE_KEY_VAULT_HOST_PANEL_WIDTH } from "@/infrastructure/config/storageKeys.ts";
 import { VaultHostListSection } from "./VaultHostListSection";
+import { LocalShellHostDetailsPanel } from "../LocalShellHostDetailsPanel";
 import { VaultImportProgressPanel } from "./ImportVaultDialog";
 import {
   VaultHeaderSearch,
@@ -23,6 +28,8 @@ import { useNotesStore } from "../../application/state/notesStore";
 import { LazyLoadBoundary } from "../ui/lazy-load-boundary";
 import { toast } from "../ui/toast";
 import { AppWordmark } from "../AppWordmark";
+import { openHostBrowser } from "../../application/hostBrowser";
+import { PluginVaultNavigation, PluginVaultPage } from '../plugins/PluginVaultPages';
 
 type VaultViewLayoutContext = Record<string, any>;
 
@@ -150,6 +157,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     ContextMenuTrigger,
     Copy,
     currentSection,
+    pluginVault,
     customGroups,
     deleteGroupPaths,
     deleteGroupWithHosts,
@@ -171,6 +179,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     Edit2,
     editingGroupPath,
     editingHost,
+    editingLocalShellHost,
     editingHostGroupDefaults,
     FileCode,
     FileSymlink,
@@ -194,6 +203,9 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     handleHostConnect,
     handleImportFileSelected,
     handleNewHost,
+    handleNewLocalShellHost,
+    handleCancelLocalShellHost,
+    handleSaveLocalShellHost,
     handleProtocolSelect,
     handleQuickConnect,
     handleQuickConnectSaveHost,
@@ -213,6 +225,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     isDeleteGroupOpen,
     isGroupPanelOpen,
     isHostPanelOpen,
+    isLocalShellHostPanelOpen,
     isHostsSectionActive,
     isImportOpen,
     isMultiSelectMode,
@@ -236,9 +249,11 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     managedSources,
     moveGroup,
     moveHostToGroup,
+    moveHostsToGroup,
     Network,
     newFolderName,
     newHostGroupPath,
+    onConnect,
     onConnectSerial,
     onCreateLocalTerminal,
     onDeleteHost,
@@ -370,6 +385,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     knownHosts,
     NotebookText,
     NotesManager,
+    onAddKnownHost,
     onOpenHostFromNote,
     onOpenNoteIdHandled,
     onOpenSnippetIdHandled,
@@ -378,6 +394,9 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
   } = ctx;
   const { importProgress, onCommitPluginImporterData, resetImportProgress } =
     ctx;
+  // Host aside panel (SSH/new host) or the local-shell host panel occupies the
+  // aside area — both collapse the header action buttons the same way.
+  const isHostAsideOpen = isHostPanelOpen || isLocalShellHostPanelOpen;
   const pendingDeleteGroupPaths =
     bulkDeleteGroupPaths.length > 0
       ? bulkDeleteGroupPaths
@@ -390,6 +409,19 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
         source.groupName === path || source.groupName.startsWith(path + "/"),
     ),
   );
+  const pendingDeleteManagedFiles: string[] = [];
+  for (const source of managedSources) {
+    if (
+      source.filePath
+      && !pendingDeleteManagedFiles.includes(source.filePath)
+      && pendingDeleteGroupPaths.some(
+        (path) =>
+          source.groupName === path || source.groupName.startsWith(path + "/"),
+      )
+    ) {
+      pendingDeleteManagedFiles.push(source.filePath);
+    }
+  }
   const handleNotesOpenHost = useCallback((host: any, source?: { noteId?: string }) => {
     if (source?.noteId && onOpenHostFromNote) {
       onOpenHostFromNote(host, source);
@@ -421,6 +453,8 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     persistWidthStorageKey: STORAGE_KEY_VAULT_HOST_PANEL_WIDTH,
     resizeAriaLabel: t("vault.panel.resizeWidth"),
   };
+  const [isMoveHostsOpen, setIsMoveHostsOpen] = React.useState(false);
+  const [moveTargetGroup, setMoveTargetGroup] = React.useState("");
   const [isSidebarResizing, setIsSidebarResizing] = React.useState(false);
   const keyListRef = React.useRef(keys);
   keyListRef.current = keys;
@@ -506,7 +540,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
   );
 
   React.useEffect(() => {
-    if (!isHostPanelOpen) return;
+    if (!isHostAsideOpen) return;
     const activeElement = document.activeElement;
     if (!(activeElement instanceof HTMLElement)) return;
     if (
@@ -515,7 +549,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
     ) {
       activeElement.blur();
     }
-  }, [isHostPanelOpen]);
+  }, [isHostAsideOpen]);
 
   return (
     <div
@@ -563,12 +597,13 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
           </div>
 
           <div
-            className={cn("space-y-1", sidebarCollapsed ? "px-1.5" : "px-2.5")}
+            className={cn("min-h-0 flex-1 overflow-y-auto space-y-1", sidebarCollapsed ? "px-1.5" : "px-2.5")}
           >
             <Tooltip>
               <TooltipTrigger asChild>
                 <RippleButton
                   variant={currentSection === "hosts" ? "secondary" : "ghost"}
+                  data-plugin-vault-fallback
                   className={cn(
                     "w-full h-10",
                     sidebarCollapsed
@@ -592,6 +627,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 </TooltipContent>
               )}
             </Tooltip>
+            <MonitorNavButton active={currentSection === "monitor"} collapsed={sidebarCollapsed} onClick={() => setCurrentSection("monitor")} />
             <Tooltip>
               <TooltipTrigger asChild>
                 <RippleButton
@@ -772,11 +808,12 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 </TooltipContent>
               )}
             </Tooltip>
+            {pluginVault && <PluginVaultNavigation model={pluginVault} collapsed={sidebarCollapsed} />}
           </div>
 
           <div
             className={cn(
-              "mt-auto pb-4 space-y-2",
+              "mt-auto shrink-0 pb-4 space-y-2",
               sidebarCollapsed ? "px-1.5" : "px-2.5",
             )}
           >
@@ -831,6 +868,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
             className="flex-1 min-w-0 flex flex-col min-h-0 relative"
             data-section="vault-main"
           >
+            {pluginVault?.selected && <PluginVaultPage key={pluginVault.selected.key} model={pluginVault} />}
             <VaultPageHeader
               className={cn(!isHostsSectionActive && "hidden")}
               dataSection="vault-hosts-header"
@@ -946,12 +984,12 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 ref={newHostActionsRef}
                 className={cn(
                   "flex items-center app-no-drag overflow-hidden transition-[max-width,opacity,margin] duration-200 ease-in-out",
-                  isHostPanelOpen
+                  isHostAsideOpen
                     ? "max-w-0 opacity-0 -ml-2 pointer-events-none"
                     : "max-w-[260px] opacity-100",
                 )}
-                aria-hidden={isHostPanelOpen ? true : undefined}
-                inert={isHostPanelOpen ? true : undefined}
+                aria-hidden={isHostAsideOpen ? true : undefined}
+                inert={isHostAsideOpen ? true : undefined}
               >
                 <Dropdown>
                   <div className="flex items-center rounded-md bg-primary text-primary-foreground">
@@ -959,7 +997,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                       size="sm"
                       className="h-10 px-3 rounded-r-none bg-transparent hover:bg-white/10 shadow-none"
                       onClick={handleNewHost}
-                      tabIndex={isHostPanelOpen ? -1 : 0}
+                      tabIndex={isHostAsideOpen ? -1 : 0}
                     >
                       <Plus size={14} className="mr-2" />{" "}
                       {t("vault.hosts.newHost")}
@@ -968,41 +1006,49 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                       <Button
                         size="sm"
                         className="h-10 px-2 rounded-l-none bg-transparent hover:bg-white/10 border-l border-primary-foreground/20 shadow-none"
-                        tabIndex={isHostPanelOpen ? -1 : 0}
+                        tabIndex={isHostAsideOpen ? -1 : 0}
                       >
                         <ChevronDown size={14} />
                       </Button>
                     </DropdownTrigger>
                   </div>
-                  <DropdownContent className="w-44" align="end" alignToParent>
+                  {/* Fixed w-44 flex-shrinks the shell icon when the label is longer than the siblings. */}
+                  <DropdownContent className="flex w-max min-w-44 flex-col" align="end" alignToParent>
                     <Button
                       variant="ghost"
-                      className="w-full justify-start gap-2"
+                      className="justify-start gap-2"
+                      onClick={handleNewLocalShellHost}
+                    >
+                      <TerminalSquare size={14} className="shrink-0" /> {t("vault.hosts.newLocalShell")}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="justify-start gap-2"
                       onClick={() => {
                         setTargetParentPath(selectedGroupPath);
                         setNewFolderName("");
                         setIsNewFolderOpen(true);
                       }}
                     >
-                      <FolderTree size={14} /> {t("vault.hosts.newGroup")}
+                      <FolderTree size={14} className="shrink-0" /> {t("vault.hosts.newGroup")}
                     </Button>
                     <Button
                       variant="ghost"
-                      className="w-full justify-start gap-2"
+                      className="justify-start gap-2"
                       disabled={importProgress?.status === "running"}
                       onClick={() => {
                         if (importProgress?.status === "running") return;
                         setIsImportOpen(true);
                       }}
                     >
-                      <Upload size={14} /> {t("vault.hosts.import")}
+                      <Upload size={14} className="shrink-0" /> {t("vault.hosts.import")}
                     </Button>
                     <Button
                       variant="ghost"
-                      className="w-full justify-start gap-2"
+                      className="justify-start gap-2"
                       onClick={handleExportHosts}
                     >
-                      <Download size={14} /> {t("vault.hosts.export")}
+                      <Download size={14} className="shrink-0" /> {t("vault.hosts.export")}
                     </Button>
                   </DropdownContent>
                 </Dropdown>
@@ -1014,19 +1060,19 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 ref={sessionActionsRef}
                 className={cn(
                   "flex items-center gap-3 overflow-hidden transition-[max-width,opacity,margin] duration-200 ease-in-out",
-                  isHostPanelOpen
+                  isHostAsideOpen
                     ? "max-w-0 opacity-0 -ml-3 pointer-events-none"
                     : "max-w-[320px] opacity-100",
                 )}
-                aria-hidden={isHostPanelOpen ? true : undefined}
-                inert={isHostPanelOpen ? true : undefined}
+                aria-hidden={isHostAsideOpen ? true : undefined}
+                inert={isHostAsideOpen ? true : undefined}
               >
                 <Button
                   size="sm"
                   variant="secondary"
                   className={vaultHeaderSecondaryButtonClass}
-                  onClick={onCreateLocalTerminal}
-                  tabIndex={isHostPanelOpen ? -1 : 0}
+                  onClick={() => onCreateLocalTerminal()}
+                  tabIndex={isHostAsideOpen ? -1 : 0}
                 >
                   <TerminalSquare size={14} className="mr-2" />{" "}
                   {t("common.terminal")}
@@ -1036,7 +1082,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                   variant="secondary"
                   className={vaultHeaderSecondaryButtonClass}
                   onClick={() => setIsSerialModalOpen(true)}
-                  tabIndex={isHostPanelOpen ? -1 : 0}
+                  tabIndex={isHostAsideOpen ? -1 : 0}
                 >
                   <Usb size={14} className="mr-2" /> {t("serial.button")}
                 </Button>
@@ -1098,6 +1144,19 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                   {t("vault.hosts.connectSelected", {
                     count: selectedHostIds.size,
                   })}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  disabled={selectedHostIds.size === 0}
+                  onClick={() => {
+                    setMoveTargetGroup("");
+                    setIsMoveHostsOpen(true);
+                  }}
+                >
+                  <FolderTree size={12} className="mr-1" />
+                  {t("vault.hosts.moveSelected", { count: selectedHostIds.size })}
                 </Button>
                 <Button
                   variant="destructive"
@@ -1167,6 +1226,11 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 handleEditGroupConfig,
                 handleEditHost,
                 handleHostConnect,
+                handleOpenHostBrowser: (host: any) => {
+                  if (host.protocol && !['ssh', 'mosh', 'local'].includes(host.protocol)) return;
+                  void openHostBrowser({ host, hosts, keys, identities, knownHosts, terminalSettings })
+                    .catch((error) => toast.error(error instanceof Error ? error.message : 'Could not open the host browser'));
+                },
                 handleUnmanageGroup,
                 hasHostsSidePanel,
                 hostListScrollRef,
@@ -1178,6 +1242,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 managedGroupPaths,
                 moveGroup,
                 moveHostToGroup,
+                moveHostsToGroup,
                 onDeleteHost,
                 Pin,
                 pinnedHosts,
@@ -1197,10 +1262,12 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 setDragOverDropTarget,
                 setGroupDragOverDropTarget,
                 setIsDeleteGroupOpen,
+                setIsMultiSelectMode,
                 setIsNewFolderOpen,
                 setLastPinnedId,
                 setNewFolderName,
                 setSelectedGroupPath,
+                setSelectedHostIds,
                 setTargetParentPath,
                 shouldHideEmptyRootHostsSection,
                 showRecentHosts,
@@ -1353,6 +1420,7 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 </Suspense>
               </LazyLoadBoundary>
             )}
+            {currentSection === "monitor" && <MonitorPanels hosts={hosts} customGroups={customGroups} onConnect={onConnect} />}
             {currentSection === "port" && (
               <LazyLoadBoundary
                 name="Port forwarding"
@@ -1456,6 +1524,9 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                 onSnippetsChange={onUpdateSnippets}
                 onHostsChange={onUpdateHosts}
                 onImportKey={onImportOrReuseKey}
+                knownHosts={knownHosts}
+                onAddKnownHost={onAddKnownHost}
+                terminalSettings={terminalSettings}
                 onSave={(host) => {
                   const latestHost = hosts.find(
                     (entry: { id: string }) => entry.id === host.id,
@@ -1505,6 +1576,26 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                   setEditingHost(null);
                   setNewHostGroupPath(null);
                 }}
+                layout="inline"
+                {...vaultHostPanelResizeProps}
+              />
+            )}
+
+          {/* Local Shell Host Details Panel - for editing/saving local shell (CMD) hosts */}
+          {currentSection === "hosts" &&
+            isLocalShellHostPanelOpen && (
+              <LocalShellHostDetailsPanel
+                key={editingLocalShellHost?.id ?? "local-shell-new"}
+                initialData={editingLocalShellHost}
+                groups={allGroupPaths}
+                defaultGroup={
+                  editingLocalShellHost
+                    ? undefined
+                    : newHostGroupPath || selectedGroupPath
+                }
+                onSave={(host) => handleSaveLocalShellHost(host)}
+                onSaveAndConnect={(host) => handleSaveLocalShellHost(host, true)}
+                onCancel={handleCancelLocalShellHost}
                 layout="inline"
                 {...vaultHostPanelResizeProps}
               />
@@ -1654,6 +1745,27 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                     })
                   )}
                 </p>
+                {pendingDeleteHasManagedGroups && (
+                  <div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+                    <p className="text-sm text-destructive">
+                      {t("vault.groups.deleteDialog.managedWarning")}
+                    </p>
+                    {pendingDeleteManagedFiles.length > 0 && (
+                      <div className="max-h-40 space-y-1 overflow-y-auto">
+                        {pendingDeleteManagedFiles.map((filePath) => (
+                          <p
+                            key={filePath}
+                            className="break-all font-mono text-xs text-muted-foreground"
+                          >
+                            {t("vault.groups.deleteDialog.managedFile", {
+                              file: filePath,
+                            })}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {!pendingDeleteHasManagedGroups && (
                   <label className="flex items-center gap-2 text-sm cursor-pointer">
                     <input
@@ -1692,7 +1804,9 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
                       isBulkDelete ? selectedHostIds : new Set<string>(),
                     );
                   } catch (error) {
-                    toast.error(error instanceof Error ? error.message : t("common.error"));
+                    toast.error(error instanceof VaultGroupDeletionConfirmationChangedError
+                      ? t("vault.groups.deleteDialog.sourcesChanged")
+                      : error instanceof Error ? error.message : t("common.error"));
                     return;
                   }
                   if (isBulkDelete) {
@@ -1712,6 +1826,43 @@ export function VaultViewLayout({ ctx }: { ctx: VaultViewLayoutContext }) {
               }}
             >
               {t("common.delete")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={isMoveHostsOpen} onOpenChange={setIsMoveHostsOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("vault.hosts.moveSelected", { count: selectedHostIds.size })}</DialogTitle>
+            <DialogDescription>{t("vault.hosts.moveSelected.description")}</DialogDescription>
+          </DialogHeader>
+          <Combobox
+            options={[
+              { value: "", label: t("vault.hosts.allHosts") },
+              ...allGroupPaths
+                .filter((path: string) => path !== "General"
+                  || customGroups.includes("General")
+                  || allGroupPaths.some((group: string) => group.startsWith("General/")))
+                .map((path: string) => ({ value: path, label: path })),
+            ]}
+            value={moveTargetGroup}
+            onValueChange={setMoveTargetGroup}
+            ariaLabel={t("hostDetails.group.placeholder")}
+            placeholder={t("vault.hosts.allHosts")}
+            clearable={false}
+          />
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setIsMoveHostsOpen(false)}>{t("common.cancel")}</Button>
+            <Button
+              disabled={selectedHostIds.size === 0}
+              onClick={() => {
+                moveHostsToGroup(selectedHostIds, moveTargetGroup || null);
+                setIsMoveHostsOpen(false);
+                clearHostSelection();
+              }}
+            >
+              {t("vault.hosts.moveSelected", { count: selectedHostIds.size })}
             </Button>
           </DialogFooter>
         </DialogContent>

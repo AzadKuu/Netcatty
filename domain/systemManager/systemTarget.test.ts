@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   allowSystemManagerMutations,
   buildSystemManagerTabs,
+  hasContainerSource,
   shouldCollectServerStats,
   shouldShowGpuTab,
   shouldShowPortsTab,
@@ -57,6 +58,23 @@ test("gpu tab appears only after nvidia-smi or npu-smi is detected", () => {
   );
 });
 
+test("the single container tab appears for podman, nerdctl, or kubectl without a docker binary", () => {
+  const networkHost = {
+    id: "host-podman",
+    label: "Podman",
+    hostname: "podman.local",
+    username: "root",
+    tags: [],
+    os: "linux" as const,
+    deviceType: "network" as const,
+  };
+  assert.equal(hasContainerSource(caps()), false);
+  assert.equal(hasContainerSource(caps({ hasPodman: true })), true);
+  assert.equal(buildSystemManagerTabs(networkHost, caps({ hasPodman: true }), null).includes("docker"), true);
+  assert.equal(buildSystemManagerTabs(networkHost, caps({ hasKubectl: true }), null).includes("docker"), true);
+  assert.equal(buildSystemManagerTabs(networkHost, caps(), null).includes("docker"), false);
+});
+
 test("ports and services tabs are detect-first like GPU", () => {
   assert.equal(shouldShowPortsTab(undefined), false);
   assert.equal(shouldShowPortsTab(caps({ hasSs: true })), true);
@@ -103,6 +121,27 @@ test("network devices hide processes until OS probe confirms a real target", () 
   assert.deepEqual(
     buildSystemManagerTabs(host, caps({ targetOs: "linux", hasSs: true }), null),
     ["overview", "processes", "ports"],
+  );
+});
+
+
+test("system overview stats ignore a legacy single-channel host field", () => {
+  assert.equal(
+    shouldCollectServerStats(
+      {
+        id: "host-1",
+        label: "Bastion",
+        hostname: "bastion.local",
+        username: "user",
+        tags: [],
+        os: "linux",
+        distro: "ubuntu",
+        singleChannelSsh: true,
+      } as never,
+      undefined,
+      null,
+    ),
+    true,
   );
 });
 

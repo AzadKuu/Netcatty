@@ -16,6 +16,7 @@ const { Client: SSHClient, utils: sshUtils } = require("ssh2");
 const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
+const fidoPromptHandler = require("./fidoPromptHandler.cjs");
 const hostKeyVerifier = require("./hostKeyVerifier.cjs");
 const { createProxySocket, runWhenProxyConnectionReady } = require("./proxyUtils.cjs");
 const { attachX11Forwarding } = require("./x11Forwarding.cjs");
@@ -44,6 +45,8 @@ const {
   loadFirstIdentityFileForAuth,
   hasUserConfiguredKey,
   isPasswordProvided,
+  looksLikeSkOpenSshMaterial,
+  identityFilesLookLikeSk,
   PassphraseCancelledError,
   isPassphraseCancelledError,
 } = require("./sshAuthHelper.cjs");
@@ -56,7 +59,7 @@ const {
   _resetAlgorithmSupportCacheForTests,
 } = require("./sshAlgorithms.cjs");
 const { enableSshNoDelay, enableTcpNoDelay } = require("./tcpNoDelay.cjs");
-const { createTcpConnectLatencyProbe } = require("./tcpConnectLatency.cjs");
+const { createSshPingLatencyProbe } = require("./sshBridge/sshPingLatency.cjs");
 const {
   configureTerminalSessionDataEmitter,
 } = require("./emitTerminalSessionData.cjs");
@@ -67,6 +70,7 @@ const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
 const {
   createStartSessionApi,
+  cancelTestConnection,
   resolveSshConnectionTimeouts,
 } = require("./sshBridge/startSession.cjs");
 const { ensureMacLocalNetworkAccess, attachMacLocalNetworkProbeResult } = require("./macLocalNetworkAccess.cjs");
@@ -525,6 +529,10 @@ function init(deps) {
 }
 
 function openTerminalOutputSession(sessionId, webContents) {
+  require("./rendererSessionLifetime.cjs").trackRendererSessionLifetime(
+    sessions, sessionId, webContents,
+    (event, payload) => require("./terminalBridge.cjs").closeSession(event, payload),
+  );
   terminalOutputChannel?.openSession?.(sessionId, webContents);
 }
 
@@ -535,7 +543,7 @@ function closeTerminalOutputSession(sessionId) {
 /**
  * Connect through a chain of jump hosts
  */
-async function connectThroughChain(event, options, jumpHosts, targetHost, targetPort, sessionId) {
+async function connectThroughChain(event, options, jumpHosts, targetHost, targetPort, sessionId, onHostKeyAccepted) {
   const targetConnectionTimeouts = resolveSshConnectionTimeouts(options);
   const sender = event.sender;
   const connections = options?._connectionsRef || [];
@@ -623,6 +631,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         knownHosts: options.knownHosts,
         verifyHostKeys: jump.verifyHostKeys ?? options.verifyHostKeys,
         bootEpoch: options.bootEpoch,
+        onAccepted: onHostKeyAccepted,
       });
       attachSshDebugLogger(connOpts, sshDiagnosticLogger);
       logSshAlgorithms("Jump host", connOpts.algorithms, {
@@ -637,9 +646,38 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       const hasCertificate =
         typeof jump.certificate === "string" && jump.certificate.trim().length > 0;
 
-      const systemAuthAgent = hasCertificate
+      let isJumpFidoSk = looksLikeSkOpenSshMaterial(jump.privateKey)
+        || (Array.isArray(jump.agentPublicKeys)
+          && jump.agentPublicKeys.some((key) => looksLikeSkOpenSshMaterial(key)))
+        || jump.useFidoAgent === true;
+      if (!isJumpFidoSk && jump.authMethod !== "password"
+        && Array.isArray(jump.identityFilePaths)
+        && jump.identityFilePaths.length > 0) {
+        try {
+          isJumpFidoSk = await identityFilesLookLikeSk(jump.identityFilePaths);
+        } catch {
+          // ignore
+        }
+      }
+      const forceJumpFidoAgent = isJumpFidoSk && jump.authMethod !== "password";
+
+      // FIDO SK + certificate still needs the agent for hardware signing.
+      const systemAuthAgent = (hasCertificate && !forceJumpFidoAgent)
         ? null
-        : await prepareSystemSshAgentForAuth(jump, `[Chain] Hop ${i + 1}:`);
+        : await prepareSystemSshAgentForAuth({
+          ...jump,
+          useSshAgent: forceJumpFidoAgent ? true : jump.useSshAgent,
+          useFidoAgent: forceJumpFidoAgent || jump.useFidoAgent === true,
+          loadIdentityFilesIntoAgent: forceJumpFidoAgent || jump.loadIdentityFilesIntoAgent,
+          addKeysToAgent: jump.addKeysToAgent || (forceJumpFidoAgent ? "yes" : jump.addKeysToAgent),
+          resolveWebContents: () => {
+            try {
+              return sender && !sender.isDestroyed?.() ? sender : null;
+            } catch {
+              return null;
+            }
+          },
+        }, `[Chain] Hop ${i + 1}:`);
 
       const identityFile = !jump.privateKey && !systemAuthAgent
         ? await loadFirstIdentityFileForAuth({
@@ -668,7 +706,9 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           },
         })
         : null;
-      const inlineKey = jump.privateKey && !systemAuthAgent
+      const inlineKey = jump.privateKey
+        && !systemAuthAgent
+        && !looksLikeSkOpenSshMaterial(jump.privateKey)
         ? await preparePrivateKeyForAuth({
           sender,
           privateKey: jump.privateKey,
@@ -694,8 +734,9 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       let authAgent = null;
       if (systemAuthAgent) {
         connOpts.agent = systemAuthAgent;
+        require("./attachFidoAgentRelease.cjs").attachFidoAgentRelease(conn, systemAuthAgent);
       }
-      if (hasCertificate) {
+      if (hasCertificate && !forceJumpFidoAgent) {
         authAgent = new NetcattyAgent({
           mode: "certificate",
           webContents: event.sender,
@@ -707,7 +748,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           },
         });
         connOpts.agent = authAgent;
-      } else if (effectivePrivateKey) {
+      } else if (effectivePrivateKey && !forceJumpFidoAgent) {
         connOpts.privateKey = effectivePrivateKey;
         if (effectivePassphrase) {
           connOpts.passphrase = effectivePassphrase;
@@ -833,7 +874,12 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           }
           resolve();
         });
-        conn.once('error', (err) => {
+        conn.on('error', (err) => {
+          // ssh2 continues to the next auth method after agent errors.
+          if (err.level === 'agent') {
+            console.log(`[Chain] Hop ${i + 1} non-fatal agent auth error (will try next method):`, err.message);
+            return;
+          }
           if (settled) return;
           settled = true;
           clearAuthReadyTimer();
@@ -876,13 +922,16 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           hostId: jump.hostId,
           hostname: hopLabel,
           password: jump.password,
+          totp: jump.totp,
           logPrefix: `[Chain] Hop ${i + 1}/${totalHops}`,
           scope: keyboardInteractiveScope,
+          allowSavePassword: options._monitorMode !== true,
           bootEpoch: options.bootEpoch,
           getAuthBanner: () => authBanner,
           shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(hopAuthPhase),
-          onAutoFill: () => sendProgress(
-            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'using saved password',
+          onAutoFill: (kind) => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt',
+            kind === 'totp' ? 'using authenticator code' : 'using saved password',
           ),
           onPromptShown: () => sendProgress(
             i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...',
@@ -1030,6 +1079,25 @@ async function generateKeyPair(event, options) {
   const { type, bits, comment } = options;
 
   try {
+    // FIDO2 / security-key types require OpenSSH + libfido2 hardware interaction.
+    // Generate via ssh-keygen so the key handle is created on the token.
+    if (type === "ED25519-SK" || type === "ECDSA-SK") {
+      const { generateFidoSshKeyPair } = require("./fidoSshKeygen.cjs");
+      return await generateFidoSshKeyPair({
+        type,
+        comment: comment || "netcatty-fido-key",
+        resident: options?.resident === true,
+        verifyRequired: options?.verifyRequired === true,
+        resolveWebContents: () => {
+          try {
+            return event?.sender && !event.sender.isDestroyed?.() ? event.sender : null;
+          } catch {
+            return null;
+          }
+        },
+      });
+    }
+
     let keyType;
     let keyBits = bits;
 
@@ -1383,6 +1451,31 @@ async function startSSHSessionWrapper(event, options) {
 }
 
 /**
+ * Headless "test connection" for the host editor. Establishes a fresh SSH
+ * connection through the same dial/auth/host-key/jump-host/proxy machinery as
+ * a terminal session (`startSSHSession`), reports success the moment
+ * authentication completes, and tears down without ever opening a shell.
+ * Connection reuse and retry wrappers are deliberately skipped so a test is
+ * always an honest fresh dial. The renderer consumes `netcatty:test:result`
+ * plus the shared `netcatty:chain:progress` / host-key / keyboard-interactive
+ * channels.
+ */
+async function testConnection(event, options) {
+  const payload = options && typeof options === "object" ? options : {};
+  const sessionId = payload.sessionId || require("node:crypto").randomUUID();
+  // Same macOS Local Network preflight as terminal starts (#2663 / #2673):
+  // trigger the TCC prompt from the main process and carry the resolved
+  // first-hop address so private-LAN / split-DNS failures get annotated.
+  const probeResult = await ensureMacLocalNetworkAccess(payload);
+  return startSSHSession(event, {
+    ...attachMacLocalNetworkProbeResult(payload, probeResult),
+    sessionId,
+    testMode: true,
+    reuseTransport: false,
+  });
+}
+
+/**
  * Get current working directory from an active SSH session
  * This sends 'pwd' to the existing shell stream and captures the output
  * using unique markers to identify the command output boundaries
@@ -1416,7 +1509,7 @@ const { ensureMoshStatsConnection, ensureEtStatsConnection } = createMoshStatsCo
 });
 
 const { createSessionOpsApi } = require("./sshBridge/sessionOps.cjs");
-const measureTcpConnectLatency = createTcpConnectLatencyProbe({ net });
+const measureSshPingLatency = createSshPingLatencyProbe();
 const sessionOpsApi = createSessionOpsApi({
   get sessions() { return sessions; },
   get electronModule() { return electronModule; },
@@ -1424,11 +1517,12 @@ const sessionOpsApi = createSessionOpsApi({
   getSessionDecoder, resetSessionDecoders, sessionEncodings, normalizeTerminalEncoding,
   safeSend,
   quoteShellArg, log, ensureMoshStatsConnection, ensureEtStatsConnection,
-  measureTcpConnectLatency,
+  measureSshPingLatency,
   execOnEtSession: (...args) => require("./terminalBridge.cjs").execOnEtSession(...args),
   getServerStats: undefined,
 });
 const {
+  getStatsForContext,
   getSessionRemoteInfo,
   getSessionDistroInfo,
   readRemoteHistory,
@@ -1440,6 +1534,18 @@ const {
   getServerStats,
   setSessionEncoding,
 } = sessionOpsApi;
+
+const { createMonitorService } = require("./monitorBridge.cjs");
+const monitorService = createMonitorService({ startConnection: startSSHSession, cancelConnection: cancelTestConnection, getStats: getStatsForContext,
+  prepareOptions: (options) => require("./sshBridge/startSession.cjs").prepareAgentForwardingOptions(options, getAvailableForwardingAgentSocket),
+});
+const monitorHandlers = {
+  "netcatty:monitor:update": (event, payload) => monitorService.reconcile(event, payload),
+  "netcatty:monitor:snapshot": (event, cursor) => monitorService.snapshot(event, cursor),
+  "netcatty:monitor:stop-all": () => monitorService.stopAll(),
+  "netcatty:monitor:owner-close": (_event, owner) => monitorService.removeOwner(owner),
+  "netcatty:monitor:retry": (event, hostId) => monitorService.retry(event, hostId),
+};
 
 /**
  * Register IPC handlers for SSH operations
@@ -1481,6 +1587,24 @@ function registerOwnedAuthResponseHandler(ipcMain, terminalWorkerManager, channe
 
 function registerHandlers(ipcMain, options = {}) {
   const terminalWorkerManager = options.terminalWorkerManager || null;
+  const trackedMonitorOwners = new WeakSet();
+  for (const [channel, handler] of Object.entries(monitorHandlers)) {
+    ipcMain.handle(channel, (event, payload) => {
+      const owner = event.sender.id;
+      if (typeof event.sender.once === "function" && !trackedMonitorOwners.has(event.sender)) {
+        trackedMonitorOwners.add(event.sender);
+        event.sender.once("destroyed", () => {
+          if (terminalWorkerManager) {
+            void terminalWorkerManager.request("netcatty:monitor:owner-close", owner, { webContentsId: owner }).catch(() => {});
+          } else monitorService.removeOwner(owner);
+        });
+      }
+      return terminalWorkerManager
+        ? terminalWorkerManager.request(channel, payload, { webContentsId: owner })
+        : handler(event, payload);
+    });
+  }
+
   if (terminalWorkerManager) {
     [
       "netcatty:start",
@@ -1511,13 +1635,21 @@ function registerHandlers(ipcMain, options = {}) {
       "netcatty:host-key:respond",
       hostKeyVerifier,
     );
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:fido-prompt:respond",
+      fidoPromptHandler,
+    );
     ipcMain.on("netcatty:zmodem:overwrite-response", (event, payload) => {
       terminalWorkerManager.send("netcatty:zmodem:overwrite-response", payload, {
         webContentsId: event?.sender?.id,
       });
     });
   } else {
-    ipcMain.handle("netcatty:start", startSSHSessionWrapper);
+    ipcMain.handle("netcatty:start", options.manageSessionLogRestart === true
+      ? sessionLogStreamManager.withSessionLogRestart(startSSHSessionWrapper)
+      : startSSHSessionWrapper);
     ipcMain.handle("netcatty:ssh:exec", execCommand);
     ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
     ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
@@ -1534,10 +1666,14 @@ function registerHandlers(ipcMain, options = {}) {
     keyboardInteractiveHandler.registerHandler(ipcMain);
     // Register the passphrase response handler
     passphraseHandler.registerHandler(ipcMain);
+    // FIDO2 PIN / touch presence prompts (ssh-sk-helper / ssh-add / ssh-keygen)
+    fidoPromptHandler.registerHandler(ipcMain);
     // Register the SSH host key verification response handler
     hostKeyVerifier.registerHandler(ipcMain);
   }
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
+  ipcMain.handle("netcatty:test-connection", testConnection);
+  ipcMain.handle("netcatty:test-connection:cancel", (_event, sessionId) => cancelTestConnection(sessionId));
   ipcMain.handle("netcatty:sshDebugLog:info", getSshDebugLogInfo);
   ipcMain.handle("netcatty:sshDebugLog:openDir", openSshDebugLogDir);
   ipcMain.handle("netcatty:ssh:check-agent", async (_event, options = {}) => {
@@ -1575,6 +1711,7 @@ function registerHandlers(ipcMain, options = {}) {
 
 module.exports = {
   init,
+  stopAllMonitoring: () => monitorService.stopAll(),
   registerHandlers,
   connectThroughChain,
   buildAlgorithms,

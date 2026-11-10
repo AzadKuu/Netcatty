@@ -18,11 +18,23 @@ function fakeCreateError(code, message) {
 
 test("getCliRpcMethod resolves implemented cli commands to rpc methods", () => {
   assert.equal(getCliRpcMethod(["exec"]), "netcatty/exec");
+  assert.equal(getCliRpcMethod(["session-reconnect"]), "session/reconnect");
+  assert.equal(getCliRpcMethod(["session-recover"]), "session/recover");
   assert.equal(getCliRpcMethod(["attachment", "read"]), "netcatty/readAttachment");
   assert.equal(getCliRpcMethod(["sftp", "list"]), "netcatty/sftp/list");
   assert.equal(getCliRpcMethod(["vault", "host", "get"]), "vault/host/get");
   assert.equal(getCliRpcMethod(["portforward", "rules", "list"]), "portforward/rules/list");
   assert.equal(getCliRpcMethod(["capabilities"]), null);
+});
+
+test('reconnect CLI requires the explicit target session', () => {
+  assert.deepEqual(buildCatalogCliParams('session.reconnect', { sessionId: 's' }, fakeCreateError), { sessionId: 's' });
+  assert.throws(() => buildCatalogCliParams('session.reconnect', {}, fakeCreateError), /session/i);
+});
+
+test('recovery CLI requires an existing explicit session', () => {
+  assert.deepEqual(buildCatalogCliParams('session.recover', { sessionId: 's' }, fakeCreateError), { sessionId: 's' });
+  assert.throws(() => buildCatalogCliParams('session.recover', {}, fakeCreateError), /session/i);
 });
 
 test("listCliCapabilities returns implemented commands by default", () => {
@@ -43,6 +55,12 @@ test("listCliCapabilities can include planned commands", () => {
 test("buildCatalogCliParams maps vault host get flags", () => {
   const params = buildCatalogCliParams("vault.host.get", { hostId: "host-1" }, fakeCreateError);
   assert.deepEqual(params, { hostId: "host-1" });
+});
+
+test("host open CLI carries typed fresh-tab and workspace placement options", () => {
+  assert.deepEqual(buildCatalogCliParams("vault.host.open", {
+    hostId: "host-1", newTab: "true", workspaceId: "current",
+  }, fakeCreateError), { hostId: "host-1", newTab: "true", workspaceId: "current" });
 });
 
 test("buildCatalogCliParams maps attachment filename", () => {
@@ -81,6 +99,90 @@ test("buildCatalogCliParams maps dynamic script group targets", () => {
   }, fakeCreateError);
   assert.equal(params.scriptId, "script-1");
   assert.equal(params.targetGroups, '["Production","Staging/Web"]');
+});
+
+test("buildCatalogCliParams maps vault note create and import flags", () => {
+  const created = buildCatalogCliParams("vault.note.create", {
+    title: "Runbook",
+    content: "# Steps",
+    group: "ops",
+  }, fakeCreateError);
+  assert.equal(created.title, "Runbook");
+  assert.equal(created.content, "# Steps");
+  assert.equal(created.group, "ops");
+
+  const imported = buildCatalogCliParams("vault.note.import", {
+    fileName: "runbook.md",
+    content: "# Steps",
+    documents: "[{\"fileName\":\"a.md\",\"content\":\"# A\"}]",
+  }, fakeCreateError);
+  assert.equal(imported.fileName, "runbook.md");
+  assert.equal(imported.documents, "[{\"fileName\":\"a.md\",\"content\":\"# A\"}]");
+});
+
+test("buildCatalogCliParams keeps an explicit empty note create body", () => {
+  const created = buildCatalogCliParams("vault.note.create", {
+    title: "Empty",
+    content: "",
+  }, fakeCreateError);
+  assert.equal(created.title, "Empty");
+  assert.equal(created.content, "");
+
+  assert.throws(
+    () => buildCatalogCliParams("vault.note.create", { title: "Empty" }, fakeCreateError),
+    /Missing required --content for vault\.note\.create/,
+  );
+  assert.throws(
+    () => buildCatalogCliParams("vault.note.create", { title: "", content: "" }, fakeCreateError),
+    /Missing required --title for vault\.note\.create/,
+  );
+});
+
+test("buildCatalogCliParams keeps explicit empty note clears and empty imports", () => {
+  const cleared = buildCatalogCliParams("vault.note.update", {
+    noteId: "n1",
+    content: "",
+    group: "",
+  }, fakeCreateError);
+  assert.equal(cleared.noteId, "n1");
+  assert.equal(cleared.content, "");
+  assert.equal(cleared.group, "");
+  assert.equal("title" in cleared, false);
+
+  const imported = buildCatalogCliParams("vault.note.import", {
+    fileName: "empty.md",
+    content: "",
+  }, fakeCreateError);
+  assert.equal(imported.fileName, "empty.md");
+  assert.equal(imported.content, "");
+});
+
+test("buildCatalogCliParams still omits absent note fields and other empty optionals", () => {
+  const updated = buildCatalogCliParams("vault.note.update", {
+    noteId: "n1",
+  }, fakeCreateError);
+  assert.deepEqual(updated, { noteId: "n1" });
+
+  const searched = buildCatalogCliParams("vault.note.get", {
+    noteId: "note-1",
+    query: "",
+  }, fakeCreateError);
+  assert.deepEqual(searched, { noteId: "note-1" });
+});
+
+test("buildCatalogCliParams maps vault note read continuation flags", () => {
+  const params = buildCatalogCliParams("vault.note.get", {
+    noteId: "note-1",
+    offset: "6000",
+    maxChars: "2000",
+    expectedUpdatedAt: "10",
+    query: "Steps",
+  }, fakeCreateError);
+  assert.equal(params.noteId, "note-1");
+  assert.equal(params.offset, 6000);
+  assert.equal(params.maxChars, 2000);
+  assert.equal(params.expectedUpdatedAt, 10);
+  assert.equal(params.query, "Steps");
 });
 
 test("buildCatalogCliParams throws for missing required fields", () => {

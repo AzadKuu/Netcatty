@@ -33,6 +33,8 @@ import {
   filterQuickMessages,
   filterSystemSlashCommands,
   filterUserSkillsForSlash,
+  getRebindSlashCommandArg,
+  getRenameSlashCommandTitle,
   getSlashCommandItemKey,
   getSystemSlashCommand,
   SYSTEM_BUILTIN_SLASH_COMMANDS,
@@ -79,6 +81,19 @@ const THINKING_PICKER_WIDTH = 168;
 const MENU_VIEWPORT_GUTTER = 8;
 const CONTEXT_USAGE_RING_RADIUS = 10;
 const CONTEXT_USAGE_RING_CIRCUMFERENCE = 2 * Math.PI * CONTEXT_USAGE_RING_RADIUS;
+
+export function replaceSlashQueryWithCommand(
+  text: string,
+  range: { start: number; end: number } | null,
+  command: string,
+): string {
+  const replacement = `/${command} `;
+  return range ? `${text.slice(0, range.start)}${replacement}${text.slice(range.end)}` : replacement;
+}
+
+export function replaceSlashQueryWithRename(text: string, range: { start: number; end: number } | null): string {
+  return replaceSlashQueryWithCommand(text, range, 'rename');
+}
 
 function formatContextTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
@@ -206,6 +221,22 @@ interface ChatInputProps {
   placeholder?: string;
   /** Available model presets for the current agent */
   modelPresets?: AgentModelPreset[];
+  /** Live agent model catalog is still loading. */
+  modelCatalogLoading?: boolean;
+  /** Provenance of the active model list, rendered as the picker status chip. */
+  modelCatalogSource?: 'live' | 'last-known-good' | 'presets';
+  /** ISO timestamp of the successful fetch backing `modelCatalogSource`. */
+  modelCatalogFetchedAt?: string;
+  /** The catalog warning text behind the host's retry banner, when present. */
+  modelCatalogWarning?: string;
+  /** Manual refresh action for the picker's refresh button (force path). */
+  onRefreshModelCatalog?: () => void;
+  /**
+   * Offer the picker's "use custom model" action. Disable when the current
+   * agent locks the model (e.g. managed Codex `model` config overrides the
+   * selection on every send).
+   */
+  allowCustomModelEntry?: boolean;
   /** Currently selected model ID */
   selectedModelId?: string;
   /** Callback when user selects a model */
@@ -250,6 +281,12 @@ interface ChatInputProps {
   onThinkingLevelChange?: (level: string) => void;
   /** Hidden retained panels must not leave body-portaled menus open. */
   parked?: boolean;
+  /** `/rename <title>`: rename the current chat (panel action, never sent to the agent). */
+  onRenameSession?: (title: string) => void;
+  /** `/chats`: list the chats visible to this panel (panel action, never sent to the agent). */
+  onListChats?: () => void;
+  /** `/rebind <n>`: rebind a dangling chat to this panel's scope (panel action, never sent to the agent). */
+  onRebindChat?: (arg: string) => void;
 }
 
 const ChatInput: React.FC<ChatInputProps> = ({
@@ -271,6 +308,12 @@ const ChatInput: React.FC<ChatInputProps> = ({
   agentName,
   placeholder,
   modelPresets = [],
+  modelCatalogLoading = false,
+  modelCatalogSource,
+  modelCatalogFetchedAt,
+  modelCatalogWarning,
+  onRefreshModelCatalog,
+  allowCustomModelEntry = true,
   selectedModelId,
   onModelSelect,
   files = [],
@@ -291,6 +334,9 @@ const ChatInput: React.FC<ChatInputProps> = ({
   thinkingLevel,
   onThinkingLevelChange,
   parked = false,
+  onRenameSession,
+  onListChats,
+  onRebindChat,
 }) => {
   const { t } = useI18n();
   const hasTerminalSelectionAttachment = files.some((file) => file.terminalSelection || file.vaultNoteId);
@@ -728,6 +774,20 @@ const ChatInput: React.FC<ChatInputProps> = ({
         onCompact?.();
       }
       if (command === 'stop') onStop?.();
+      if (command === 'chats') onListChats?.();
+      if (command === 'rebind') {
+        // Replace a partial slash query (e.g. `/re`) with `/rebind ` so the
+        // user can finish the dangling-chat number; never leave `/re 1` to
+        // be sent to the agent.
+        commitComposerText(replaceSlashQueryWithCommand(readComposerText(), slashRange, 'rebind'));
+        closeAllMenus();
+        return;
+      }
+      if (command === 'rename') {
+        commitComposerText(replaceSlashQueryWithRename(readComposerText(), slashRange));
+        closeAllMenus();
+        return;
+      }
       commitComposerText('');
       closeAllMenus();
       return;
@@ -737,7 +797,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       return;
     }
     insertUserSkillToken(item.skill);
-  }, [canCompact, closeAllMenus, commitComposerText, insertQuickMessage, insertUserSkillToken, onCompact, onStop]);
+  }, [canCompact, closeAllMenus, commitComposerText, insertQuickMessage, insertUserSkillToken, onCompact, onListChats, onStop, readComposerText, slashRange]);
 
   // Reset active highlight when a menu opens or when the *identity* of the
   // visible items changes. Watching only `.length` misses cases where the
@@ -940,6 +1000,21 @@ const ChatInput: React.FC<ChatInputProps> = ({
           commitComposerText('');
           return;
         }
+        if (systemCommand === 'rename') {
+          onRenameSession?.(getRenameSlashCommandTitle(submittedText));
+          commitComposerText('');
+          return;
+        }
+        if (systemCommand === 'chats') {
+          onListChats?.();
+          commitComposerText('');
+          return;
+        }
+        if (systemCommand === 'rebind') {
+          onRebindChat?.(getRebindSlashCommandArg(submittedText));
+          commitComposerText('');
+          return;
+        }
         return;
       }
       if (isStreaming && canSteer) {
@@ -950,7 +1025,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       // abort; the parent clears value only after the user message is accepted.
       onSend();
     },
-    [canCompact, canSteer, commitComposerText, isStreaming, onCompact, onSend, onSteer, onStop, readComposerText],
+    [canCompact, canSteer, commitComposerText, isStreaming, onCompact, onListChats, onRebindChat, onRenameSession, onSend, onSteer, onStop, readComposerText],
   );
 
   const status: PromptInputStatus = isStreaming ? 'streaming' : 'idle';
@@ -990,7 +1065,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
     ? providerSwitcherChipLabel
     : (selectedPreset?.name || modelName || providerName || t('ai.chat.noModel'));
   const modelChipMaxWidth = hasProviderSwitcher ? 'max-w-[168px]' : 'max-w-[96px]';
-  const hasModelPicker = hasProviderSwitcher || (modelPresets.length > 0 && !!onModelSelect);
+  // Keep the picker open-able while an SDK catalog load is pending: the host
+  // now shows build-time presets during loading, with the loading row when
+  // presets are still empty (#3584).
+  const hasModelPicker = hasProviderSwitcher
+    || ((modelPresets.length > 0 || modelCatalogLoading) && !!onModelSelect);
   const thinkingLevels = useMemo(
     () => (
       hasProviderSwitcher && onThinkingLevelChange
@@ -1526,7 +1605,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               ) : (
                 <Cpu size={11} className="text-muted-foreground/64" />
               )}
-              <span className={`truncate min-w-0 ${modelChipMaxWidth}`}>{modelLabel}</span>
+              <span className={`truncate min-w-0 ${modelChipMaxWidth}`} title={modelLabel}>{modelLabel}</span>
               {hasModelPicker && <ChevronDown size={9} className="text-muted-foreground/50" />}
             </button>
             {contextUsage && (
@@ -1585,19 +1664,27 @@ const ChatInput: React.FC<ChatInputProps> = ({
                     selectedProviderId={providerSwitcher?.selectedProviderId}
                     selectedModelId={hasProviderSwitcher ? providerSwitcher?.selectedModelId : selectedBaseModelId}
                     modelPresets={hasProviderSwitcher ? undefined : modelPresets}
+                    loading={!hasProviderSwitcher ? modelCatalogLoading : undefined}
+                    catalogSource={!hasProviderSwitcher ? modelCatalogSource : undefined}
+                    catalogFetchedAt={!hasProviderSwitcher ? modelCatalogFetchedAt : undefined}
+                    catalogWarning={!hasProviderSwitcher ? modelCatalogWarning : undefined}
+                    onRefreshCatalog={!hasProviderSwitcher ? onRefreshModelCatalog : undefined}
+                    allowCustomEntry={allowCustomModelEntry}
                     prefs={modelPrefs}
                     onSelectProviderModel={(providerId, modelId, contextWindow) => {
                       providerSwitcher?.onSelect(providerId, modelId, contextWindow);
                       setModelPrefs(rememberComposerRecentModel(pickerScope, { providerId, modelId }));
                       closeAllMenus();
                     }}
-                    onSelectModel={(modelId) => {
+                    onSelectModel={(modelId, options) => {
                       const preset = modelPresets.find((item) => item.id === modelId);
                       const nextId = preset
                         ? resolveModelSelectionWithThinking(preset, selectedPresetThinking)
                         : modelId;
                       onModelSelect?.(nextId);
-                      setModelPrefs(rememberComposerRecentModel(pickerScope, { modelId }));
+                      setModelPrefs(rememberComposerRecentModel(pickerScope, options?.custom
+                        ? { modelId, custom: true }
+                        : { modelId }));
                       closeAllMenus();
                     }}
                     onTogglePinned={(entry) => {
@@ -1612,6 +1699,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
               <ComposerThinkingChip
                 levels={thinkingLevels}
                 selectedLevel={visibleThinking}
+                allowDefault={hasProviderSwitcher && !!onThinkingLevelChange}
                 disabled={lockTurnConfiguration}
                 open={showThinkingPicker}
                 menuPos={showThinkingPicker ? menuPos : null}
@@ -1794,6 +1882,12 @@ function chatInputPropsAreEqual(prev: ChatInputProps, next: ChatInputProps): boo
     && prev.agentName === next.agentName
     && prev.placeholder === next.placeholder
     && prev.modelPresets === next.modelPresets
+    && prev.modelCatalogLoading === next.modelCatalogLoading
+    && prev.modelCatalogSource === next.modelCatalogSource
+    && prev.modelCatalogFetchedAt === next.modelCatalogFetchedAt
+    && prev.modelCatalogWarning === next.modelCatalogWarning
+    && prev.onRefreshModelCatalog === next.onRefreshModelCatalog
+    && prev.allowCustomModelEntry === next.allowCustomModelEntry
     && prev.selectedModelId === next.selectedModelId
     && prev.onModelSelect === next.onModelSelect
     && prev.files === next.files

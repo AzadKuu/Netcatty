@@ -52,6 +52,12 @@ let sendWhenRendererReady = null;
 let getSystemMenuMainWindow = null;
 let tray = null;
 let closeToTray = false;
+// User preference for whether the tray/menu bar icon is shown at all.
+// Independent of close-to-tray: the app keeps running in the background with
+// the icon hidden, and window close still hides (not quits) when close-to-tray
+// was explicitly enabled.
+let showTrayIcon = true;
+let windowsTrayScaleListener = null;
 let currentHotkey = null;
 let hotkeyEnabled = false;
 // True while a hidden auto-launch cold start has no visible window yet.
@@ -475,6 +481,7 @@ function ensureTrayPanelWindow() {
     // see-through. On Windows, disable OS rounding so it does not stack under
     // the CSS radius (#2505 / Electron #46468).
     ...windowsCssRoundedOverlayChromeOptions(),
+    ...(process.platform === "darwin" ? { visualEffectState: "active" } : {}),
     webPreferences: {
       preload: path.join(__dirname, "../preload.cjs"),
       contextIsolation: true,
@@ -485,6 +492,8 @@ function ensureTrayPanelWindow() {
       zoomFactor: 1,
     },
   });
+
+  require("./windowManager.cjs").applyTrayPanelBackgroundBlur(trayPanelWindow);
 
   trayPanelWindow.webContents.on("console-message", (_event, level, message) => {
     // Forward renderer logs to main process output for easy debugging.
@@ -616,6 +625,155 @@ function toggleTrayPanel(eventBounds) {
   } else {
     showTrayPanel(eventBounds);
   }
+}
+
+function windowsSmallIconPx() {
+  let scale = 1;
+  try {
+    const reported = electronModule?.screen?.getPrimaryDisplay?.()?.scaleFactor;
+    if (typeof reported === "number" && Number.isFinite(reported) && reported > 0) {
+      scale = reported;
+    }
+  } catch {
+    scale = 1;
+  }
+  // SM_CXSMICON is 16px at 100% and scales with the system DPI.
+  return Math.max(16, Math.round(16 * scale));
+}
+
+function loadPackagedTrayImage() {
+  const { nativeImage } = electronModule;
+  const iconPath = resolveTrayIconPath();
+  if (!iconPath || !nativeImage?.createFromPath) return null;
+  return nativeImage.createFromPath(iconPath);
+}
+
+// Variant PNGs keep the Apple-style transparent margin (about 6% per side).
+// The packaged tray ico is full-bleed, so leaving that margin in place makes
+// every other style look smaller in the same 16px slot. Crop to the opaque
+// artwork, then scale.
+function cropTransparentMargin(image) {
+  if (!image?.getSize || !image?.toBitmap || !image?.crop) return image;
+  let size;
+  let bitmap;
+  try {
+    size = image.getSize(1);
+    bitmap = image.toBitmap({ scaleFactor: 1 });
+  } catch {
+    return image;
+  }
+  const width = size?.width;
+  const height = size?.height;
+  if (!width || !height || bitmap?.length !== width * height * 4) return image;
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width * 4;
+    for (let x = 0; x < width; x += 1) {
+      if (bitmap[row + x * 4 + 3] <= 16) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < minX || maxY < minY) return image;
+
+  const pad = 1;
+  const boxLeft = Math.max(0, minX - pad);
+  const boxTop = Math.max(0, minY - pad);
+  const boxRight = Math.min(width - 1, maxX + pad);
+  const boxBottom = Math.min(height - 1, maxY + pad);
+  let side = Math.max(boxRight - boxLeft + 1, boxBottom - boxTop + 1);
+  side = Math.min(side, width, height);
+  let left = Math.round((boxLeft + boxRight) / 2 - (side - 1) / 2);
+  let top = Math.round((boxTop + boxBottom) / 2 - (side - 1) / 2);
+  left = Math.max(0, Math.min(left, width - side));
+  top = Math.max(0, Math.min(top, height - side));
+  if (left === 0 && top === 0 && side === width && side === height) return image;
+
+  try {
+    const cropped = image.crop({ x: left, y: top, width: side, height: side });
+    if (!cropped || cropped.isEmpty?.()) return image;
+    return cropped;
+  } catch {
+    return image;
+  }
+}
+
+// Windows Tray::SetImage asks NativeImage for an HICON at SM_CXSMICON.
+// An .ico path keeps that lookup. A variant PNG is one 1024px bitmap, and
+// GetHICON would pass the whole bitmap through, so scale it down first.
+function loadWindowsTrayImage() {
+  const { nativeImage } = electronModule;
+  let variant = "original";
+  let variantPath = null;
+  try {
+    const appIconManager = require("./appIconManager.cjs");
+    variant = appIconManager.getAppIconVariant();
+    if (variant !== "original") {
+      variantPath = appIconManager.getAppIconPath();
+    }
+  } catch {
+    variant = "original";
+  }
+
+  if (variant === "original" || !variantPath || !fs.existsSync(variantPath)) {
+    return loadPackagedTrayImage();
+  }
+
+  try {
+    const source = nativeImage.createFromBuffer
+      ? nativeImage.createFromBuffer(fs.readFileSync(variantPath))
+      : nativeImage.createFromPath(variantPath);
+    if (!source || source.isEmpty?.()) return loadPackagedTrayImage();
+    const artwork = cropTransparentMargin(source);
+    const size = windowsSmallIconPx();
+    const sized = artwork?.resize
+      ? artwork.resize({ width: size, height: size, quality: "best" })
+      : artwork;
+    if (!sized || sized.isEmpty?.()) return loadPackagedTrayImage();
+    return sized;
+  } catch {
+    return loadPackagedTrayImage();
+  }
+}
+
+function applyWindowsTrayImage() {
+  if (process.platform !== "win32" || !tray || !electronModule) return false;
+  const image = loadWindowsTrayImage();
+  if (!image || !tray.setImage) return false;
+  try {
+    tray.setImage(image);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function bindWindowsTrayScaleListener() {
+  if (process.platform !== "win32" || windowsTrayScaleListener) return;
+  const screen = electronModule?.screen;
+  if (!screen?.on) return;
+  windowsTrayScaleListener = () => {
+    applyWindowsTrayImage();
+  };
+  screen.on("display-metrics-changed", windowsTrayScaleListener);
+}
+
+function unbindWindowsTrayScaleListener() {
+  const screen = electronModule?.screen;
+  if (windowsTrayScaleListener && screen?.removeListener) {
+    try {
+      screen.removeListener("display-metrics-changed", windowsTrayScaleListener);
+    } catch {
+      // ignore
+    }
+  }
+  windowsTrayScaleListener = null;
 }
 
 function resolveTrayIconPath() {
@@ -905,14 +1063,16 @@ function createTray() {
     // Load the tray icon
     let trayIcon;
     const resolvedIconPath = resolveTrayIconPath();
-    if (resolvedIconPath) {
+    if (process.platform === "win32") {
+      // Original uses the multi-size .ico. Any other app-icon choice is
+      // drawn from that variant, scaled to the notification-area slot.
+      trayIcon = loadWindowsTrayImage();
+      bindWindowsTrayScaleListener();
+    } else if (resolvedIconPath) {
       trayIcon = nativeImage.createFromPath(resolvedIconPath);
       if (process.platform === "darwin") {
         trayIcon = trayIcon.resize({ width: 16, height: 16 });
         trayIcon.setTemplateImage(true);
-      } else if (process.platform === "win32") {
-        // The .ico already carries 16/20/24/32/40/48/64 — Windows picks the
-        // right size per DPI scale on its own. Do not resize.
       } else {
         // Linux: attach the @2x representation so the shell can pick the
         // right pixel size on HiDPI. Leaving the base at its native size
@@ -1168,12 +1328,16 @@ function setTrayMenuData(data) {
   if (data.portForwardRules !== undefined) {
     trayMenuData.portForwardRules = data.portForwardRules;
   }
-  if (data.hosts !== undefined) {
+  const hostsChanged = data.hosts !== undefined;
+  if (hostsChanged) {
     trayMenuData.hosts = data.hosts;
   }
-  // Rebuild menu with new data
+  // Rebuild menu with new data. The Dock menu only lists hosts, and rebuilding
+  // it sorts every host and creates one native item per host, so skip it for
+  // the frequent session/port-forward-only updates (lock changes rebuild it
+  // separately).
   updateTrayMenu();
-  updateDockMenu();
+  if (hostsChanged) updateDockMenu();
   pushTrayMenuDataToPanel();
 }
 
@@ -1199,18 +1363,12 @@ function setCloseToTray(enabled) {
   closeToTray = !!enabled;
 
   if (closeToTray) {
-    // Create tray if it doesn't exist
-    if (!tray) {
+    // Tray visibility is controlled separately by showTrayIcon.
+    if (!tray && showTrayIcon) {
       createTray();
     }
   } else {
     clearPendingFullscreenHide(getMainWindow());
-    // A hidden auto-launch cold start pins the tray regardless of this
-    // preference until its window is actually shown once — otherwise a user
-    // with close-to-tray off would get a windowless, trayless zombie process.
-    if (!hiddenLaunchTrayPinned) {
-      destroyTray();
-    }
   }
 
   return { success: true, enabled: closeToTray };
@@ -1228,16 +1386,43 @@ function pinTrayForHiddenLaunch() {
 }
 
 /**
- * Release the hidden-launch tray pin once its window has been shown. If the
- * user's close-to-tray preference is off, the tray is destroyed now instead
- * of lingering until the next close-to-tray toggle.
+ * Release the hidden-launch tray pin once its window has been shown. The
+ * hidden icon preference can now take effect safely.
  */
 function releaseHiddenLaunchTrayPin() {
   if (!hiddenLaunchTrayPinned) return;
   hiddenLaunchTrayPinned = false;
-  if (!closeToTray) {
+  if (!showTrayIcon) {
     destroyTray();
   }
+}
+
+/**
+ * Show or hide the tray icon without changing close-to-tray behavior. The
+ * app keeps running in the background while the icon is hidden; close-to-tray
+ * still hides the window on close.
+ */
+function setShowTrayIcon(enabled) {
+  showTrayIcon = !!enabled;
+
+  if (showTrayIcon) {
+    if (!tray) {
+      createTray();
+    }
+  } else if (!hiddenLaunchTrayPinned) {
+    // A hidden auto-launch cold start keeps its safety pin until its window
+    // is shown once, so a trayless zombie never appears without consent.
+    destroyTray();
+  }
+
+  return { success: true, enabled: showTrayIcon };
+}
+
+/**
+ * Check if the tray icon is currently meant to be shown
+ */
+function isShowTrayIconEnabled() {
+  return showTrayIcon;
 }
 
 /**
@@ -1261,7 +1446,10 @@ function getHotkeyStatus() {
  * Handle window close event - hide to tray instead of closing
  */
 function handleWindowClose(event, win) {
-  if (closeToTray && tray) {
+  // With the tray icon hidden by preference there is no `tray` object, but a
+  // user who enabled close-to-tray still expects the window to hide (app
+  // stays in the background), not to quit.
+  if (closeToTray && (tray || !showTrayIcon)) {
     event.preventDefault();
     hideWindowRespectingMacFullscreen(win);
     return true; // Prevented close
@@ -1299,6 +1487,16 @@ function registerHandlers(ipcMain) {
     return { enabled: closeToTray };
   });
 
+  // Show/hide the tray icon itself (independent of close-to-tray)
+  ipcMain.handle("netcatty:tray:setShowTrayIcon", async (_event, { enabled }) => {
+    return setShowTrayIcon(enabled);
+  });
+
+  // Get show-tray-icon status
+  ipcMain.handle("netcatty:tray:isShowTrayIcon", async () => {
+    return { enabled: showTrayIcon };
+  });
+
   // Update tray menu data
   ipcMain.handle("netcatty:tray:updateMenuData", async (_event, data) => {
     setTrayMenuData(data);
@@ -1330,6 +1528,22 @@ function registerHandlers(ipcMain) {
     return { success: true };
   });
 
+  ipcMain.handle("netcatty:trayPanel:startPortForward", async (_event, ruleId) => {
+    if (isAppRuntimeLocked()) {
+      const win = await openMainWindowReady();
+      if (!win) return { success: false, error: "Main window is not available" };
+      sendOrQueuePortForwardToggle(win, ruleId, true);
+      return { success: true };
+    }
+    const delivered = await sendToMainWindow("netcatty:trayPanel:startPortForward", ruleId, {
+      focus: false,
+      createIfMissing: true,
+    });
+    return delivered
+      ? { success: true }
+      : { success: false, error: "Main window is not ready" };
+  });
+
   ipcMain.handle("netcatty:trayPanel:closeSession", async (_event, sessionId) => {
     const delivered = await sendToMainWindow("netcatty:trayPanel:closeSession", sessionId, {
       focus: false,
@@ -1355,6 +1569,7 @@ function registerHandlers(ipcMain) {
  */
 function cleanup() {
   unregisterGlobalHotkey();
+  unbindWindowsTrayScaleListener();
   destroyTray();
   pendingPortForwardToggles = [];
   pendingHostConnections = [];
@@ -1398,6 +1613,8 @@ module.exports = {
   clearPendingFullscreenHide,
   cleanup,
   createTray,
+  updateTrayIcon: applyWindowsTrayImage,
+  __cropTransparentMarginForTests: cropTransparentMargin,
   pinTrayForHiddenLaunch,
   releaseHiddenLaunchTrayPin,
   getTray: () => tray,

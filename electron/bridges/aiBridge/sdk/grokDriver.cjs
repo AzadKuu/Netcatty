@@ -32,6 +32,18 @@ const GROK_REASONING_EFFORTS = new Set([
   "max",
 ]);
 const GROK_REASONING_FALLBACKS = Object.freeze({
+  // Live catalogs may omit reasoning metadata for newer models; reuse the
+  // 4.6 family's effort levels so grok-4.7 stays effort-selectable (#3496).
+  "grok-4.7": {
+    name: "Grok 4.7",
+    thinkingLevels: ["xhigh", "high", "medium", "low"],
+    defaultThinkingLevel: "high",
+  },
+  "grok-4.7-build-fast": {
+    name: "Grok 4.7 Build Fast",
+    thinkingLevels: ["xhigh", "high", "medium", "low"],
+    defaultThinkingLevel: "high",
+  },
   "grok-4.5": {
     name: "Grok 4.5",
     thinkingLevels: ["high", "medium", "low"],
@@ -724,6 +736,7 @@ async function runGrokTurn({
   mergeMcp,
   abortGraceMs = GROK_ABORT_GRACE_MS,
   forceKillImpl,
+  assertSessionValid,
 }) {
   const cliPath = String(binPath || "").trim();
   if (!cliPath) {
@@ -777,6 +790,7 @@ async function runGrokTurn({
   };
 
   try {
+    assertSessionValid?.();
     child = spawnGrokProcess(spawnImpl, cliPath, args, {
       cwd: effectiveCwd,
       env: childEnv,
@@ -924,8 +938,10 @@ function parseGrokModelsOutput(stdout) {
       continue;
     }
 
-    // "* grok-4.5 (default)" or "  * model-id"
-    const bullet = trimmed.match(/^\*+\s*([a-zA-Z0-9][a-zA-Z0-9._-]*)\s*(.*)$/);
+    // "  * grok-4.7 (default)" — the CLI marks the default with "*"; other
+    // entries use "-" (grok 1.0.50: "* grok-4.7 (default)", "- grok-4.6").
+    // Accept any bullet marker so live catalogs never silently shrink.
+    const bullet = trimmed.match(/^[*•‣-]+\s*([a-zA-Z0-9][a-zA-Z0-9._-]*)\s*(.*)$/);
     if (!bullet) continue;
     const id = bullet[1];
     if (seen.has(id)) continue;
@@ -948,6 +964,41 @@ function parseGrokModelsOutput(stdout) {
   }
 
   return { currentModelId, models: models.map(applyGrokReasoningFallback) };
+}
+
+/**
+ * Union the ACP initialize catalog with the `grok models` CLI catalog.
+ *
+ * The two probes disagree by design: ACP's `_meta.modelState` reflects the
+ * negotiated agent session and has been observed to advertise only a subset
+ * of the account's models (e.g. grok-4.6/4.5 without the 4.7 family), while
+ * the CLI lists the full account set (grok 1.0.50: 4.7, 4.7-build-fast,
+ * 4.6, 4.5). The reverse is equally possible across CLI versions. Unioning
+ * keeps the picker from shrinking below either source; when an id appears
+ * in both, the ACP entry wins because it carries live vendor `_meta`
+ * (reasoning efforts, description). Missing descriptive fields can come from
+ * the CLI, but its inferred reasoning defaults must not override ACP's
+ * deliberate absence of reasoning support.
+ */
+function mergeGrokCatalogModels(acpModels, cliModels) {
+  const acpList = Array.isArray(acpModels) ? acpModels.filter((m) => m?.id) : [];
+  const cliList = Array.isArray(cliModels) ? cliModels.filter((m) => m?.id) : [];
+  const byId = new Map();
+  for (const model of acpList) {
+    byId.set(model.id, { ...model });
+  }
+  for (const model of cliList) {
+    const existing = byId.get(model.id);
+    if (!existing) {
+      byId.set(model.id, { ...model });
+      continue;
+    }
+    for (const key of Object.keys(model)) {
+      if (key === "thinkingLevels" || key === "defaultThinkingLevel") continue;
+      if (existing[key] === undefined) existing[key] = model[key];
+    }
+  }
+  return [...byId.values()];
 }
 
 function applyGrokReasoningFallback(model) {
@@ -1071,6 +1122,7 @@ module.exports = {
   formatGrokErrorForUser,
   isGrokAuthFailureMessage,
   listGrokModels,
+  mergeGrokCatalogModels,
   mergeWorkspaceGrokMcpToml,
   parseGrokModelsOutput,
   resetGrokMcpMergeRefcountsForTests,

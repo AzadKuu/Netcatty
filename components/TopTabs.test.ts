@@ -32,7 +32,7 @@ const {
 } = await import("../application/state/terminalDragData.ts");
 const {
   activateLogViewTab,
-  createTopTabCopyDoubleClickHandler,
+  createTopTabSessionDoubleClickHandler,
   formatSessionTopTabLabel,
   formatSessionTopTabTooltip,
   resolveSessionTabCodingCliIconState,
@@ -41,6 +41,7 @@ const {
 const { activeTabStore } = await import("../application/state/activeTabStore.ts");
 const indexCss = readFileSync(new URL("../index.css", import.meta.url), "utf8");
 const topTabsSource = readFileSync(new URL("./TopTabs.tsx", import.meta.url), "utf8");
+const topTabItemsSource = readFileSync(new URL("./top-tabs/TopTabItems.tsx", import.meta.url), "utf8");
 const topTabsQuickControlsSource = readFileSync(new URL("./TopTabsQuickControls.tsx", import.meta.url), "utf8");
 const syncStatusButtonSource = readFileSync(new URL("./SyncStatusButton.tsx", import.meta.url), "utf8");
 const switchSource = readFileSync(new URL("./ui/switch.tsx", import.meta.url), "utf8");
@@ -53,7 +54,6 @@ const appSource = [
 ].join("\n");
 const externalMcpToggleSource = readFileSync(new URL("../application/state/useExternalMcpToggleState.ts", import.meta.url), "utf8");
 const zhTwAiSource = readFileSync(new URL("../application/i18n/locales/zh-TW/ai.ts", import.meta.url), "utf8");
-const topTabItemsSource = readFileSync(new URL("./top-tabs/TopTabItems.tsx", import.meta.url), "utf8");
 const terminalViewSource = readFileSync(new URL("./terminal/TerminalView.tsx", import.meta.url), "utf8");
 
 test("host tree tab gutter fills the remaining sidebar width", () => {
@@ -248,17 +248,106 @@ test("disabling dynamic titles freezes a stored coding CLI icon and stops title 
   );
 });
 
-test("session top tabs copy the session on double click through the existing copy handler", () => {
+test("session top tab double click dispatches the configured behavior", () => {
   const copiedSessionIds: string[] = [];
-  const handleDoubleClick = createTopTabCopyDoubleClickHandler(
-    (sessionId) => copiedSessionIds.push(sessionId),
-    "session-1",
+  const duplicatedSessionIds: string[] = [];
+  const handlers = (["duplicate", "copy", "disabled"] as const).map((behavior) =>
+    createTopTabSessionDoubleClickHandler({
+      behavior,
+      onCopySession: (sessionId) => copiedSessionIds.push(sessionId),
+      onDuplicateSession: (sessionId) => duplicatedSessionIds.push(sessionId),
+      sessionId: `session-${behavior}`,
+    }),
   );
+
+  handlers.forEach((handler) => handler({} as Parameters<typeof handler>[0]));
+
+  assert.deepEqual(duplicatedSessionIds, ["session-duplicate"]);
+  assert.deepEqual(copiedSessionIds, ["session-copy"]);
+  assert.match(topTabItemsSource, /behavior: tabDoubleClickBehavior/);
+  assert.match(topTabItemsSource, /onDoubleClick=\{handleDoubleClick\}/);
+});
+
+test("duplicate double-click behavior falls back to copying when unavailable", () => {
+  const copiedSessionIds: string[] = [];
+  const handleDoubleClick = createTopTabSessionDoubleClickHandler({
+    behavior: "duplicate",
+    onCopySession: (sessionId) => copiedSessionIds.push(sessionId),
+    sessionId: "session-1",
+  });
 
   handleDoubleClick({} as Parameters<typeof handleDoubleClick>[0]);
 
   assert.deepEqual(copiedSessionIds, ["session-1"]);
-  assert.match(topTabItemsSource, /onDoubleClick=\{handleDoubleClick\}/);
+});
+
+test("draggable top-tab close buttons cancel the drag gesture on mousedown", () => {
+  const closeButtonLabels = [
+    "tabs.closePluginViewAria",
+    "Close editor tab",
+    "tabs.closeSessionAria",
+    "tabs.closeLogViewAria",
+  ];
+
+  for (const label of closeButtonLabels) {
+    const labelIndex = topTabItemsSource.indexOf(label);
+    assert.notEqual(labelIndex, -1, `missing close label ${label}`);
+    const buttonStart = topTabItemsSource.lastIndexOf("<button", labelIndex);
+    const buttonEnd = topTabItemsSource.indexOf(">", labelIndex);
+    const openingTag = topTabItemsSource.slice(buttonStart, buttonEnd);
+    assert.match(
+      openingTag,
+      /onMouseDown=\{handleTabCloseButtonMouseDown\}/,
+      `${label} close button must guard mousedown`,
+    );
+  }
+
+  assert.equal(
+    topTabItemsSource.match(/onMouseDown=\{handleTabCloseButtonMouseDown\}/g)?.length,
+    4,
+  );
+
+  const workspaceSource = topTabItemsSource.slice(
+    topTabItemsSource.indexOf("export const WorkspaceTopTab"),
+    topTabItemsSource.indexOf("WorkspaceTopTab.displayName"),
+  );
+  assert.equal(workspaceSource.includes("handleTabCloseButtonMouseDown"), false);
+  assert.equal(workspaceSource.includes("<button"), false);
+});
+
+test("draggable top tab roots activate sub-threshold presses and still reorder past the threshold", () => {
+  const tabTypes = ["plugin-view", "editor", "session", "workspace", "logView"];
+
+  for (const tabType of tabTypes) {
+    const marker = `data-tab-type="${tabType}"`;
+    const start = topTabItemsSource.indexOf(marker);
+    assert.notEqual(start, -1, marker);
+    const classNameAt = topTabItemsSource.indexOf("className={cn(", start);
+    assert.notEqual(classNameAt, -1, tabType);
+    const openingHandlers = topTabItemsSource.slice(start, classNameAt);
+    assert.match(openingHandlers, /onMouseDown=\{handleTabDragThresholdMouseDown\}/, tabType);
+    assert.match(openingHandlers, /onMouseUp=\{\(event\) => handleTabDragThresholdRelease\(event,/, tabType);
+    assert.match(
+      openingHandlers,
+      /onDragStart=\{\(event\) => \{\s*handleTabDragThresholdDragStart\(event\);\s*onTabDragStart\(event,/,
+      tabType,
+    );
+    assert.match(
+      openingHandlers,
+      /onDrag=\{\(event\) => \{\s*if \(!handleTabDragThresholdDrag\(event\)\) return;\s*onTabDragStart\(event,/,
+      tabType,
+    );
+    assert.match(
+      openingHandlers,
+      /onDragEnd=\{\(event\) => \{\s*handleTabDragThresholdRelease\(event,[\s\S]*?onTabDragEnd\(\);\s*\}\}/,
+      tabType,
+    );
+    assert.equal(openingHandlers.includes("handleTabCloseButtonMouseDown"), false, tabType);
+    assert.equal(openingHandlers.includes("preventDefault"), false, tabType);
+  }
+
+  assert.equal(topTabItemsSource.match(/onMouseDown=\{handleTabMiddleMouseDown\}/g)?.length ?? 0, 0);
+  assert.equal(topTabItemsSource.match(/handleTabDragThresholdRelease\(/g)?.length, 10);
 });
 
 test("session close button double click stays on the close button", () => {
@@ -272,6 +361,26 @@ test("session close button double click stays on the close button", () => {
 
   assert.equal(stopPropagationCount, 1);
   assert.match(topTabItemsSource, /onDoubleClick=\{stopCloseButtonDoubleClickPropagation\}/);
+});
+
+test("main window controls keep mouse presses from taking focus", () => {
+  const windowControlsSource = topTabItemsSource.slice(
+    topTabItemsSource.indexOf("export const WindowControls"),
+    topTabItemsSource.indexOf("WindowControls.displayName"),
+  );
+
+  assert.match(
+    windowControlsSource,
+    /const preventWindowControlFocus: React\.MouseEventHandler<HTMLButtonElement> = \(event\) => \{\s*event\.preventDefault\(\);\s*\};/,
+  );
+  assert.equal(windowControlsSource.match(/onMouseDown=\{preventWindowControlFocus\}/g)?.length, 2);
+  const closeButton = windowControlsSource.match(
+    /<button type="button" className=\{closeControlClassName\}[^>]*>/,
+  )?.[0] ?? "";
+  assert.equal(closeButton.includes("onMouseDown"), false);
+  assert.match(windowControlsSource, /onClick=\{handleMinimize\}/);
+  assert.match(windowControlsSource, /onClick=\{handleMaximize\}/);
+  assert.match(windowControlsSource, /onClick=\{handleClose\}/);
 });
 
 test("session top tab label only shows the host label for ssh sessions", () => {
@@ -633,4 +742,25 @@ test("App shell retains presentation-stable sessions for domain memos", () => {
   assert.match(appSource, /orphanSessionsForShell/);
   assert.match(appSource, /sessions: sessionsForShell/);
   assert.match(appSource, /orphanSessions: orphanSessionsForShell/);
+});
+
+test("bulk close context menu offers symmetric close-to-left option", () => {
+  const bulkCloseBlock = topTabsSource.slice(
+    topTabsSource.indexOf("Bulk-close menu items shared by session and workspace context menus"),
+    topTabsSource.indexOf("// Render the tabs"),
+  );
+  // Left of the anchor is symmetric with close-to-right: slice(0, anchorIdx).
+  assert.match(bulkCloseBlock, /orderedTabs\.slice\(0, anchorIdx\)/);
+  assert.match(bulkCloseBlock, /tabs\.closeToLeft/);
+  assert.match(bulkCloseBlock, /onCloseTabsBatch\(leftIds\)/);
+
+  // Locale parity: the new key is translated in every terminal locale.
+  const locales = ["en", "es", "ru", "zh-CN", "zh-TW"] as const;
+  for (const locale of locales) {
+    const source = readFileSync(
+      new URL(`../application/i18n/locales/${locale}/terminal.ts`, import.meta.url),
+      "utf8",
+    );
+    assert.match(source, /'tabs\.closeToLeft':/);
+  }
 });

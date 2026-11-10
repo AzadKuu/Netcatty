@@ -3,6 +3,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+// Keep bridge discovery writes/deletes off the installed app's live file.
+const { isolateCliDiscoveryFile } = require("../../bridges/cliDiscoveryTestIsolation.cjs");
+isolateCliDiscoveryFile();
+
 function loadFreshBridge() {
   const bridgePath = require.resolve("../../bridges/mcpServerBridge.cjs");
   delete require.cache[bridgePath];
@@ -22,6 +26,8 @@ test("MCP environment resource serializes terminal tool hints from Netcatty cont
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
 
+  // Mirror renderer startup: managed requests wait until the saved policy is known.
+  require("../../shared/aiPrivacyService.cjs").configure({ enabled: false });
   const bridge = loadFreshBridge();
   const chatSessionId = `chat-resource-${Date.now()}`;
   let client = null;

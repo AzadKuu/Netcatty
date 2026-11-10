@@ -5,6 +5,15 @@ const assert = require("node:assert/strict");
 
 const { createVaultService } = require("./vaultService.cjs");
 
+test("host opening forwards workspace and fresh-tab selection with caller scope", async () => {
+  let received;
+  const service = createVaultService({ invokeVaultAgent: async (_op, params) => { received = params; return { ok: true }; } });
+  await service.openHost({ hostId: "host-1", chatSessionId: "chat-1", workspaceId: "current", newTab: true });
+  assert.equal(received.workspaceId, "current");
+  assert.equal(received.newTab, true);
+  assert.equal(received.chatSessionId, "chat-1");
+});
+
 test("vault service delegates host notes read to vault agent bridge", async () => {
   let invokedOp = null;
   const service = createVaultService({
@@ -36,10 +45,11 @@ test("vault service delegates host open to vault agent bridge", async () => {
       return { ok: true, sessionId: "sess-1", hostId: params.hostId, status: "connecting" };
     },
   });
-  const result = await service.openHost({ hostId: "host-1", chatSessionId: "chat-1" });
+  const result = await service.openHost({ hostId: "host-1", chatSessionId: "chat-1", newTab: "true" });
   assert.equal(invokedOp, "host.open");
   assert.equal(invokedParams.hostId, "host-1");
   assert.equal(invokedParams.chatSessionId, "chat-1");
+  assert.equal(invokedParams.newTab, "true");
   assert.equal(result.ok, true);
   assert.equal(result.sessionId, "sess-1");
 });
@@ -60,6 +70,22 @@ test("vault service delegates host update and delete to vault agent bridge", asy
   assert.equal(calls[0].params.label, "new");
   assert.equal(calls[1].op, "host.delete");
   assert.deepEqual(calls[1].params, { hostId: "host-1" });
+});
+
+test("vault service delegates note import", async () => {
+  let invokedOp = null;
+  let invokedParams = null;
+  const service = createVaultService({
+    invokeVaultAgent: async (op, params) => {
+      invokedOp = op;
+      invokedParams = params;
+      return { ok: true, importedCount: 1 };
+    },
+  });
+  const result = await service.importNotes({ content: "# Steps", fileName: "runbook.md" });
+  assert.equal(invokedOp, "note.import");
+  assert.equal(invokedParams.fileName, "runbook.md");
+  assert.equal(result.importedCount, 1);
 });
 
 test("vault service delegates identities, groups, proxies, and note deletion", async () => {

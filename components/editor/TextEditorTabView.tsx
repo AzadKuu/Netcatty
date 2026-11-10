@@ -5,7 +5,7 @@
  * on tab-switch — we just toggle CSS visibility via the `isVisible` prop.
  */
 import type * as Monaco from 'monaco-editor';
-import React, { useCallback } from 'react';
+import React, { useCallback, useMemo } from 'react';
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { saveEditorTab } from '../../application/state/editorTabSave';
@@ -26,6 +26,7 @@ export interface TextEditorTabViewProps {
   /** Routed into Monaco's Cmd/Ctrl+W command so closing the editor tab works
    * even when focus is inside the editor (Monaco otherwise swallows the event). */
   onRequestClose: (tabId: EditorTabId) => void;
+  onPopOut?: (tabId: EditorTabId) => void;
 }
 
 export function getTextEditorTabShellStyle(isVisible: boolean, hostTreeLayoutWidth: number): React.CSSProperties {
@@ -36,12 +37,13 @@ export function getTextEditorTabShellStyle(isVisible: boolean, hostTreeLayoutWid
   };
 }
 
-export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
+const TextEditorTabViewImpl: React.FC<TextEditorTabViewProps> = ({
   tabId,
   hotkeyScheme,
   keyBindings,
   hostById,
   onRequestClose,
+  onPopOut,
 }) => {
   const { t } = useI18n();
   const tab = useEditorTab(tabId);
@@ -62,6 +64,11 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
       editorTabStore.setLanguage(tabId, lang);
     },
     [tabId],
+  );
+
+  const handlePopOut = useMemo(
+    () => (onPopOut ? () => onPopOut(tabId) : undefined),
+    [onPopOut, tabId],
   );
 
   const handleToggleWordWrap = useCallback(() => {
@@ -124,9 +131,14 @@ export const TextEditorTabView: React.FC<TextEditorTabViewProps> = ({
         onToggleWordWrap={handleToggleWordWrap}
         onSave={handleSave}
         initialViewState={tab.viewState}
+        onPopOut={handlePopOut}
       />
     </div>
   );
 };
+
+// Memoized: AppView re-renders for unrelated shell state; an editor tab only
+// needs to render when its own props or subscribed tab state change.
+export const TextEditorTabView = React.memo(TextEditorTabViewImpl);
 
 export default TextEditorTabView;

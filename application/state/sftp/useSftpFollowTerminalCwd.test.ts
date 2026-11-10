@@ -85,6 +85,60 @@ test("first-open follow uses a fresh terminal cwd instead of the cached home pat
   await act(async () => renderer?.unmount());
 });
 
+test("first-open follow stays put when the terminal cwd is still an unresolved ~", async () => {
+  const navigatedPaths: string[] = [];
+  const connection = {
+    id: "conn-1",
+    hostId: "host-1",
+    currentPath: "/root",
+    homeDir: "/root",
+    status: "connected",
+    isLocal: false,
+  };
+  const sftpRef = {
+    current: {
+      leftPane: { connection, loading: false },
+      navigateTo: async (_side: "left", path: string) => {
+        navigatedPaths.push(path);
+        connection.currentPath = path;
+        return "reached" as const;
+      },
+    },
+  };
+  let renderer: ReactTestRenderer | null = null;
+
+  function Probe() {
+    useSftpFollowTerminalCwd({
+      activeSessionId: "session-1",
+      activeTerminalCwd: "~",
+      canFollowTerminalCwd: true,
+      connectionId: connection.id,
+      connectionIsLocal: connection.isLocal,
+      connectionLoading: false,
+      connectionPath: connection.currentPath,
+      connectionStatus: connection.status,
+      effectiveFollowTerminalCwd: true,
+      followTerminalCwdHost: host,
+      hasActiveWork: false,
+      isVisible: true,
+      ownerPanelOpen: true,
+      onGetTerminalCwd: async () => "~",
+      onPendingFollowOverride: () => {},
+      sftpRef,
+    });
+    return null;
+  }
+
+  await act(async () => {
+    renderer = create(React.createElement(Probe));
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  assert.deepEqual(navigatedPaths, []);
+  assert.equal(connection.currentPath, "/root");
+  await act(async () => renderer?.unmount());
+});
+
 test("first-open follow does not use a stale cached cwd while the fresh probe is pending", async () => {
   let resolveCwd: ((cwd: string) => void) | null = null;
   const navigatedPaths: string[] = [];
@@ -476,8 +530,12 @@ test("only trusted live terminal cwd recovery resumes follow after initial probe
   await act(async () => renderer?.unmount());
 });
 
-test("an in-flight follow probe cannot navigate after the focused session changes", async () => {
+test("regular follow waits for trusted live cwd instead of polling after command clear", async () => {
+  // Regression for #3588: command submit clears cwd to null and schedules a
+  // backend-strict probe. Auto-follow must not preferFreshBackend-poll in that
+  // gap — that race aborted the navigate and left the panel stuck.
   const navigatedPaths: string[] = [];
+  let probeCalls = 0;
   const connection = {
     id: "conn-1",
     hostId: "host-1",
@@ -496,20 +554,15 @@ test("an in-flight follow probe cannot navigate after the focused session change
       },
     },
   };
-  let activeSessionId = "session-a";
   let activeTerminalCwd: string | null = "/home/alice";
-  let resolveCwd: ((cwd: string) => void) | null = null;
-  let deferProbe = false;
+  let activeTerminalCwdTrusted = false;
   let renderer: ReactTestRenderer | null = null;
-  const onGetTerminalCwd = () => {
-    if (!deferProbe) return Promise.resolve("/root/session-a");
-    return new Promise<string>((resolve) => { resolveCwd = resolve; });
-  };
 
   function Probe() {
     useSftpFollowTerminalCwd({
-      activeSessionId,
+      activeSessionId: "session-1",
       activeTerminalCwd,
+      activeTerminalCwdTrusted,
       canFollowTerminalCwd: true,
       connectionId: connection.id,
       connectionIsLocal: connection.isLocal,
@@ -521,7 +574,11 @@ test("an in-flight follow probe cannot navigate after the focused session change
       hasActiveWork: false,
       isVisible: true,
       ownerPanelOpen: true,
-      onGetTerminalCwd,
+      onGetTerminalCwd: async () => {
+        probeCalls += 1;
+        // First-open may probe; keep the pane where it already is.
+        return connection.currentPath;
+      },
       onPendingFollowOverride: () => {},
       sftpRef,
     });
@@ -532,23 +589,28 @@ test("an in-flight follow probe cannot navigate after the focused session change
     renderer = create(React.createElement(Probe));
     await new Promise((resolve) => setImmediate(resolve));
   });
-  assert.deepEqual(navigatedPaths, ["/root/session-a"]);
+  const probesAfterOpen = probeCalls;
+  assert.ok(probesAfterOpen >= 1, "first-open sync still probes");
+  assert.deepEqual(navigatedPaths, []);
 
-  deferProbe = true;
+  // Command-submit style clear: no trusted cwd yet.
   activeTerminalCwd = null;
+  activeTerminalCwdTrusted = false;
   await act(async () => {
     renderer?.update(React.createElement(Probe));
     await new Promise((resolve) => setImmediate(resolve));
   });
-  assert.ok(resolveCwd);
+  assert.equal(probeCalls, probesAfterOpen, "regular follow must not poll while cwd is cleared");
+  assert.deepEqual(navigatedPaths, []);
 
-  activeSessionId = "session-b";
-  await act(async () => renderer?.update(React.createElement(Probe)));
+  // Post-command backend-strict (or OSC 7) publishes a trusted live cwd.
+  activeTerminalCwd = "/etc";
+  activeTerminalCwdTrusted = true;
   await act(async () => {
-    resolveCwd?.("/root/from-session-a");
+    renderer?.update(React.createElement(Probe));
     await new Promise((resolve) => setImmediate(resolve));
   });
-
-  assert.deepEqual(navigatedPaths, ["/root/session-a"]);
+  assert.deepEqual(navigatedPaths, ["/etc"]);
+  assert.equal(probeCalls, probesAfterOpen, "trusted live cwd must navigate without another poll");
   await act(async () => renderer?.unmount());
 });

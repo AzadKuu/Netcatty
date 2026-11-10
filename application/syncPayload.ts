@@ -1,3 +1,6 @@
+import { readMonitorPanels, applyMonitorPanels } from './state/monitorPanelsStorage';
+import { normalizeMonitorPanels } from '../domain/monitorPanels';
+import { decryptProviderHeaders, encryptProviderHeaders } from '../infrastructure/ai/providerHeaderCredentials';
 /**
  * Sync Payload Builders - Single source of truth for constructing and applying
  * the encrypted cloud-sync payload.
@@ -24,11 +27,13 @@ import {
   SYNC_PAYLOAD_ENTITY_KEYS,
   SYNC_STORAGE_KEYS,
   hasSyncPayloadEntityData,
+  reconcileInboundAutoCloseOnExit,
   retainLocalHostLastConnectedAt,
   sanitizeHostsForSync,
   type SyncPayload,
 } from '../domain/sync';
 import { migrateLegacyCommandBlocklist } from '../domain/commandBlocklist';
+import { normalizeGlobalDefaultProxyProfileId } from '../domain/globalDefaultProxy';
 import { migrateHostsFromLegacyLineTimestamps } from '../domain/host';
 import { toPersistedPortForwardingRules } from '../domain/portForwardingPersistence';
 import {
@@ -45,11 +50,23 @@ import { decryptField, encryptField } from '../infrastructure/persistence/secure
 import { sanitizeQuickMessages } from '../infrastructure/ai/quickMessages';
 import { emitAIStateChanged } from './state/aiStateEvents';
 import {
+  isAiSessionsHydrationComplete,
+  latestAISessionsSnapshot,
+  getPersistedAiSessionsSnapshot,
+  setLatestAISessionsSnapshot,
+  writeSessionsForStorage,
+  cleanupSdkAgentSessions,
+  cleanupDeletedAIChatSessions,
+} from './state/aiStateSnapshots';
+import { getAISessionsSnapshot, publishAISessionsSnapshot } from './state/aiSessionsStore';
+import {
   persistCommandBlocklistSetting,
   readCommandBlocklistSetting,
 } from './state/commandBlocklistSettings';
 import { rehydrateGlobalSftpBookmarks } from './state/sftp/globalSftpBookmarks';
+import { applyHostBrowserBookmarks, collectHostBrowserBookmarks, getCachedHostBrowserBookmarks } from './hostBrowserBookmarks';
 import {
+  clampTerminalFontSizeValue,
   nextTerminalFontSizeSyncVersion,
   parseTerminalFontSizeRecord,
   serializeTerminalFontSizeRecord,
@@ -58,7 +75,10 @@ import {
   parseCustomAccentRecord,
   serializeCustomAccentRecord,
 } from './state/customAccentSync';
+import { isValidHslToken } from './state/settingsStateDefaults';
 import {
+  STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED,
+  STORAGE_KEY_VAULT_RESTORE_IN_PROGRESS_UNTIL,
   STORAGE_KEY_THEME,
   STORAGE_KEY_UI_THEME_LIGHT,
   STORAGE_KEY_UI_THEME_DARK,
@@ -76,6 +96,8 @@ import {
   STORAGE_KEY_TERM_SETTINGS,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB,
   STORAGE_KEY_CUSTOM_KEY_BINDINGS,
   STORAGE_KEY_EDITOR_WORD_WRAP,
   STORAGE_KEY_SFTP_DOUBLE_CLICK_BEHAVIOR,
@@ -93,6 +115,7 @@ import {
   STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
   STORAGE_KEY_SHOW_SFTP_TAB,
   STORAGE_KEY_SHOW_HOST_TREE_SIDEBAR,
+  STORAGE_KEY_GLOBAL_DEFAULT_PROXY_PROFILE,
   STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS,
   STORAGE_KEY_SHOW_TAB_NUMBER_BADGES,
   STORAGE_KEY_DISABLE_TERMINAL_FONT_ZOOM,
@@ -118,7 +141,10 @@ import {
   STORAGE_KEY_VAULT_NOTES_FONT_FAMILY,
   STORAGE_KEY_VAULT_NOTES_FONT_SIZE,
   STORAGE_KEY_VAULT_NOTES_CODE_FONT_SIZE,
+  STORAGE_KEY_AI_SESSIONS,
+  STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS,
 } from '../infrastructure/config/storageKeys';
+import { mergeAiSessionLists, mergeSyncPayloads, stripAiSessionDeviceState, stripAiSessionPayloadForSync } from '../domain/syncMerge';
 import { isTerminalSidePanelAutoOpenTab } from '../domain/terminalSidePanelAutoOpen';
 import { prepareRestoredPayloadConvergentWrites } from './convergentSyncReplica';
 
@@ -164,6 +190,7 @@ function hasMeaningfulPluginSidecars(payload: SyncPayload): boolean {
  */
 export function hasMeaningfulSyncData(payload: SyncPayload): boolean {
   if (hasSyncPayloadEntityData(payload, SYNC_PAYLOAD_ENTITY_KEYS)) return true;
+  if (Array.isArray(payload.aiSessions) && payload.aiSessions.length > 0) return true;
 
   if (
     payload.settings && Object.values(payload.settings).some((value) => value !== undefined)
@@ -193,11 +220,11 @@ export function hasMeaningfulCloudSyncData(payload: SyncPayload): boolean {
 
 /**
  * Returns true only when the payload contains synced vault entities.
- * Settings are intentionally ignored so default settings written on first
- * launch do not make a new device look non-empty during cloud restore checks.
+ * Settings, chat history, and browser bookmarks are ignored: none proves that the vault's
+ * hosts and keys survived local data loss.
  */
 export function hasCloudSyncEntityData(payload: SyncPayload): boolean {
-  return hasSyncPayloadEntityData(payload, CLOUD_SYNC_PAYLOAD_ENTITY_KEYS);
+  return hasSyncPayloadEntityData(payload, CLOUD_SYNC_PAYLOAD_ENTITY_KEYS.filter((key) => key !== 'aiSessions' && key !== 'browserBookmarks'));
 }
 
 export function shouldPromptCloudVaultRecovery(
@@ -254,16 +281,18 @@ const SYNCABLE_TERMINAL_KEYS = [
   'startupCommandDelayMs',
   'scrollback', 'drawBoldInBrightColors', 'terminalEmulationType',
   'fontLigatures', 'fontSmoothing', 'fontWeight', 'fontWeightBold', 'fallbackFont',
-  'linePadding', 'cursorShape', 'cursorBlink', 'highlightCursorLine', 'minimumContrastRatio',
+  'linePadding', 'cursorShape', 'cursorBlink', 'cursorBarWidth', 'highlightCursorLine', 'minimumContrastRatio',
   'altAsMeta', 'optionArrowWordJump', 'shiftEnterNewlineEnabled', 'shiftEnterNewlineText',
+  'shiftEnterForceText',
   'kittyKeyboardProtocolEnabled',
   'scrollOnInput', 'scrollOnOutput', 'scrollOnKeyPress', 'scrollOnPaste',
   'smoothScrolling',
-  'rightClickBehavior', 'showContextMenuOverFullscreenApps', 'middleClickBehavior', 'copyOnSelect', 'normalizeTextOnCopy', 'middleClickPaste', 'wordSeparators',
+  'rightClickBehavior', 'rightClickLongPressMenu', 'showContextMenuOverFullscreenApps', 'middleClickBehavior', 'copyOnSelect', 'normalizeTextOnCopy', 'middleClickPaste', 'wordSeparators',
   'linkModifier', 'keywordHighlightEnabled', 'keywordHighlightRules',
   'keepaliveInterval', 'keepaliveCountMax', 'disableBracketedPaste', 'clearWipesScrollback',
   'autoUploadClipboardImageOnPaste',
-  'preserveSelectionOnInput', 'forcePromptNewLine', 'osc52Clipboard', 'oscNotifications', 'dynamicTabTitleMode',
+  'confirmBeforeMultilinePaste', 'multilinePasteConfirmMinLines',
+  'preserveSelectionOnInput', 'forcePromptNewLine', 'osc52Clipboard', 'oscNotifications', 'dynamicTabTitleMode', 'tabDoubleClickBehavior',
   'autoCloseOnExit', 'disconnectedNoticeMode',
   'showHostInfoBar', 'hostInfoBarTitleMode', 'showServerStats',
   'serverStatsRefreshInterval',
@@ -299,6 +328,8 @@ export const SYNCABLE_SETTING_STORAGE_KEYS = [
   STORAGE_KEY_TERM_SETTINGS,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB,
   STORAGE_KEY_CUSTOM_THEMES,
   STORAGE_KEY_CUSTOM_KEY_BINDINGS,
   STORAGE_KEY_EDITOR_WORD_WRAP,
@@ -318,6 +349,7 @@ export const SYNCABLE_SETTING_STORAGE_KEYS = [
   STORAGE_KEY_SHELL_ONLY_TAB_NUMBER_SHORTCUTS,
   STORAGE_KEY_SHOW_TAB_NUMBER_BADGES,
   STORAGE_KEY_WORKSPACE_FOCUS_STYLE,
+  STORAGE_KEY_GLOBAL_DEFAULT_PROXY_PROFILE,
   STORAGE_KEY_AI_PROVIDERS,
   STORAGE_KEY_AI_ACTIVE_PROVIDER,
   STORAGE_KEY_AI_ACTIVE_MODEL,
@@ -399,13 +431,13 @@ const mergeAiProvidersPreservingLocalApiKeys = (
     if (typeof provider?.id === 'string') localById.set(provider.id, provider);
   }
   return incoming.map((provider) => {
-    if (provider.apiKey != null) return provider;
     const id = typeof provider.id === 'string' ? provider.id : undefined;
     const localProvider = id != null ? localById.get(id) : undefined;
-    if (localProvider && typeof localProvider.apiKey === 'string') {
-      return { ...provider, apiKey: localProvider.apiKey };
-    }
-    return provider;
+    return {
+      ...provider,
+      ...(provider.apiKey == null && typeof localProvider?.apiKey === 'string' ? { apiKey: localProvider.apiKey } : {}),
+      ...(provider.customHeaders == null && localProvider?.customHeaders != null ? { customHeaders: localProvider.customHeaders } : {}),
+    };
   });
 };
 
@@ -477,6 +509,12 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   if (isTerminalSidePanelAutoOpenTab(terminalSidePanelAutoOpenTab)) {
     settings.terminalSidePanelAutoOpenTab = terminalSidePanelAutoOpenTab;
   }
+  const localShellSidePanelAutoOpen = localStorageAdapter.readBoolean(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN);
+  if (localShellSidePanelAutoOpen != null) settings.localShellSidePanelAutoOpen = localShellSidePanelAutoOpen;
+  const localShellSidePanelAutoOpenTab = localStorageAdapter.readString(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB);
+  if (isTerminalSidePanelAutoOpenTab(localShellSidePanelAutoOpenTab)) {
+    settings.localShellSidePanelAutoOpenTab = localShellSidePanelAutoOpenTab;
+  }
 
   // Terminal settings (syncable subset only)
   const termSettingsRaw = localStorageAdapter.readString(STORAGE_KEY_TERM_SETTINGS);
@@ -489,6 +527,9 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
       }
       if (Object.keys(subset).length > 0) settings.terminalSettings = subset;
     } catch { /* ignore corrupt data */ }
+  }
+  if (localStorageAdapter.readBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED)) {
+    settings.autoCloseOnExitDefaultMigrated = true;
   }
 
   // Custom terminal themes
@@ -556,10 +597,18 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   if (workspaceFocusStyle === 'dim' || workspaceFocusStyle === 'border') {
     settings.workspaceFocusStyle = workspaceFocusStyle;
   }
+  const storedDefaultProxyProfileId = localStorageAdapter.readString(STORAGE_KEY_GLOBAL_DEFAULT_PROXY_PROFILE);
+  if (storedDefaultProxyProfileId !== null) {
+    settings.defaultProxyProfileId = normalizeGlobalDefaultProxyProfileId(storedDefaultProxyProfileId) ?? '';
+  }
 
   const ai: NonNullable<SyncPayload['settings']>['ai'] = {};
   const providers = readArraySetting(STORAGE_KEY_AI_PROVIDERS);
-  if (providers) ai.providers = providers.map(stripDeviceBoundApiKey);
+  if (providers) ai.providers = providers.map((provider) => {
+    const next = { ...stripDeviceBoundApiKey(provider) };
+    delete next.customHeaders;
+    return next;
+  });
   const activeProviderId = localStorageAdapter.readString(STORAGE_KEY_AI_ACTIVE_PROVIDER);
   if (activeProviderId != null) ai.activeProviderId = activeProviderId;
   const activeModelId = localStorageAdapter.readString(STORAGE_KEY_AI_ACTIVE_MODEL);
@@ -621,7 +670,12 @@ export async function collectCloudSyncableSettings(): Promise<SyncPayload['setti
   };
 
   if (providers) {
-    ai.providers = await Promise.all(providers.map(withPortableApiKey));
+    ai.providers = await Promise.all(providers.map(async (provider) => {
+      const next = await withPortableApiKey(provider);
+      return isRecord(provider.customHeaders)
+        ? { ...next, customHeaders: await decryptProviderHeaders(provider.customHeaders as Record<string, string>) }
+        : next;
+    }));
   }
   if (webSearchConfig) {
     ai.webSearchConfig = await withPortableApiKey(webSearchConfig);
@@ -658,22 +712,35 @@ function collectLocalBackupSettings(): SyncPayload['settings'] {
  * Apply synced settings to localStorage. Merges terminal settings
  * to preserve platform-specific fields.
  */
-async function applySyncableSettings(settings: NonNullable<SyncPayload['settings']>): Promise<void> {
+async function applySyncableSettings(
+  settings: NonNullable<SyncPayload['settings']>,
+  preparedProviders: Record<string, unknown>[] | undefined,
+): Promise<void> {
   // Theme & Appearance
   if (settings.theme != null) localStorageAdapter.writeString(STORAGE_KEY_THEME, settings.theme);
   if (settings.lightUiThemeId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_LIGHT, settings.lightUiThemeId);
   if (settings.darkUiThemeId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_DARK, settings.darkUiThemeId);
   if (settings.accentMode != null) localStorageAdapter.writeString(STORAGE_KEY_ACCENT_MODE, settings.accentMode);
   if (settings.customAccent != null) {
-    const existing = parseCustomAccentRecord(localStorageAdapter.readString(STORAGE_KEY_COLOR));
-    localStorageAdapter.writeString(
-      STORAGE_KEY_COLOR,
-      serializeCustomAccentRecord({
-        color: parseCustomAccentRecord(settings.customAccent).color,
-        // Bump so peer windows' version gates accept the synced value.
-        version: Math.max(existing.version, 0) + 1,
-      }),
+    const storedColor = localStorageAdapter.readString(STORAGE_KEY_COLOR);
+    const existing = parseCustomAccentRecord(storedColor);
+    const incomingColor = parseCustomAccentRecord(settings.customAccent).color;
+    // A missing or malformed record parses to the fallback color, but still
+    // needs to be replaced by an explicit incoming value.
+    const storedColorIsValid = storedColor !== null && (
+      isValidHslToken(storedColor.trim())
+      || storedColor === serializeCustomAccentRecord(existing)
     );
+    if (!storedColorIsValid || incomingColor !== existing.color) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_COLOR,
+        serializeCustomAccentRecord({
+          color: incomingColor,
+          // Bump so peer windows' version gates accept the synced value.
+          version: Math.max(existing.version, 0) + 1,
+        }),
+      );
+    }
   }
   if (settings.uiFontFamilyId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_FONT_FAMILY, settings.uiFontFamilyId);
   if (settings.uiLanguage != null) localStorageAdapter.writeString(STORAGE_KEY_UI_LANGUAGE, settings.uiLanguage);
@@ -695,24 +762,38 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
   if (settings.terminalThemeLight != null) localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME_LIGHT, settings.terminalThemeLight);
   if (settings.terminalFontFamily != null) localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, settings.terminalFontFamily);
   if (settings.terminalFontSize != null) {
-    const existing = parseTerminalFontSizeRecord(
-      localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_SIZE),
+    const storedFontSize = localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_SIZE);
+    const existing = parseTerminalFontSizeRecord(storedFontSize);
+    const incomingFontSize = clampTerminalFontSizeValue(settings.terminalFontSize);
+    // A missing or malformed record parses to the default font size. A
+    // supported legacy number remains valid without forcing migration.
+    const storedFontSizeIsValid = storedFontSize !== null && (
+      storedFontSize.trim() === String(existing.fontSize)
+      || storedFontSize === serializeTerminalFontSizeRecord(existing)
     );
-    localStorageAdapter.writeString(
-      STORAGE_KEY_TERM_FONT_SIZE,
-      serializeTerminalFontSizeRecord({
-        fontSize: settings.terminalFontSize,
-        // Bump so peer windows' version gates accept the synced value.
-        version: nextTerminalFontSizeSyncVersion(existing.version, existing.version),
-        origin: 'sync-payload',
-      }),
-    );
+    if (!storedFontSizeIsValid || incomingFontSize !== existing.fontSize) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_TERM_FONT_SIZE,
+        serializeTerminalFontSizeRecord({
+          fontSize: incomingFontSize,
+          // Bump so peer windows' version gates accept the synced value.
+          version: nextTerminalFontSizeSyncVersion(existing.version, existing.version),
+          origin: 'sync-payload',
+        }),
+      );
+    }
   }
   if (settings.terminalSidePanelAutoOpen != null) {
     localStorageAdapter.writeBoolean(STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN, settings.terminalSidePanelAutoOpen);
   }
   if (isTerminalSidePanelAutoOpenTab(settings.terminalSidePanelAutoOpenTab)) {
     localStorageAdapter.writeString(STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB, settings.terminalSidePanelAutoOpenTab);
+  }
+  if (settings.localShellSidePanelAutoOpen != null) {
+    localStorageAdapter.writeBoolean(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN, settings.localShellSidePanelAutoOpen);
+  }
+  if (isTerminalSidePanelAutoOpenTab(settings.localShellSidePanelAutoOpenTab)) {
+    localStorageAdapter.writeString(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB, settings.localShellSidePanelAutoOpenTab);
   }
 
   // Terminal settings - merge with existing to preserve platform-specific keys
@@ -744,6 +825,23 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
         ? 'disabled'
         : 'paste';
     }
+    if ('autoCloseOnExit' in settings.terminalSettings) {
+      merged.autoCloseOnExit = reconcileInboundAutoCloseOnExit(
+        settings.terminalSettings.autoCloseOnExit,
+        settings.autoCloseOnExitDefaultMigrated,
+      );
+    }
+    // A legacy true is the old default. A migrated peer's explicit choice must
+    // stick, so record the marker before the next local migration pass.
+    if (
+      settings.autoCloseOnExitDefaultMigrated === true
+      || (
+        settings.terminalSettings.autoCloseOnExit === true
+        && settings.autoCloseOnExitDefaultMigrated !== true
+      )
+    ) {
+      localStorageAdapter.writeBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED, true);
+    }
     localStorageAdapter.writeString(STORAGE_KEY_TERM_SETTINGS, JSON.stringify(merged));
   }
 
@@ -754,17 +852,21 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
 
   // Keyboard
   if (settings.customKeyBindings != null) {
-    const previous = parseCustomKeyBindingsStorageRecord(
-      localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS),
-    );
-    localStorageAdapter.writeString(
-      STORAGE_KEY_CUSTOM_KEY_BINDINGS,
-      serializeCustomKeyBindingsStorageRecord({
-        version: nextCustomKeyBindingsSyncVersion(previous?.version || 0),
-        origin: CUSTOM_KEY_BINDINGS_SYNC_PAYLOAD_ORIGIN,
-        bindings: settings.customKeyBindings,
-      }),
-    );
+    const storedBindings = localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS);
+    const previous = parseCustomKeyBindingsStorageRecord(storedBindings);
+    // Keep an explicit empty binding set when this device has no record.
+    const incomingBindings = JSON.stringify(settings.customKeyBindings);
+    const existingBindings = JSON.stringify(previous?.bindings ?? []);
+    if (previous === null || incomingBindings !== existingBindings) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_CUSTOM_KEY_BINDINGS,
+        serializeCustomKeyBindingsStorageRecord({
+          version: nextCustomKeyBindingsSyncVersion(previous?.version || 0),
+          origin: CUSTOM_KEY_BINDINGS_SYNC_PAYLOAD_ORIGIN,
+          bindings: settings.customKeyBindings,
+        }),
+      );
+    }
   }
 
   // Editor
@@ -813,14 +915,19 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
   if (settings.workspaceFocusStyle != null) {
     localStorageAdapter.writeString(STORAGE_KEY_WORKSPACE_FOCUS_STYLE, settings.workspaceFocusStyle);
   }
+  if (typeof settings.defaultProxyProfileId === 'string') {
+    localStorageAdapter.writeString(
+      STORAGE_KEY_GLOBAL_DEFAULT_PROXY_PROFILE,
+      normalizeGlobalDefaultProxyProfileId(settings.defaultProxyProfileId) ?? '',
+    );
+  }
 
   const ai = settings.ai;
   if (ai) {
-    if (ai.providers != null) {
-      const providers = await Promise.all(ai.providers.map(withLocalEncryptedApiKey));
+    if (preparedProviders != null) {
       localStorageAdapter.write(
         STORAGE_KEY_AI_PROVIDERS,
-        mergeAiProvidersPreservingLocalApiKeys(providers),
+        mergeAiProvidersPreservingLocalApiKeys(preparedProviders),
       );
     }
     if (ai.activeProviderId != null) localStorageAdapter.writeString(STORAGE_KEY_AI_ACTIVE_PROVIDER, ai.activeProviderId);
@@ -953,16 +1060,47 @@ function pruneOrphanPerAgentBindings(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a complete `SyncPayload` from local data.
- *
- * Port-forwarding rules are optional because they are managed by a separate
- * state hook (`usePortForwardingState`).  Callers should strip transient
- * runtime fields (status, error, lastUsedAt) before passing them in.
+ * AI chat sessions only leave the device when the user opted in.
+ * Attachments are stripped — see {@link stripAiSessionPayloadForSync}.
  */
+export function collectAiSessionsForSync(): SyncPayload['aiSessions'] {
+  const enabled = localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS);
+  if (enabled?.enabled !== true) return undefined;
+  // Issue #4125 review P1①: never collect before the boot hydration has
+  // settled. A pre-hydration collect falls back to the stale legacy
+  // localStorage store and the writeSessionsForStorage() call below would
+  // overwrite newer IndexedDB records with pre-migration data. Skip this
+  // sync round; the next auto-sync picks up the hydrated store.
+  if (!isAiSessionsHydrationComplete()) return undefined;
+  const sessions = collectLocalAiSessions();
+  if (!writeSessionsForStorage(sessions)) {
+    throw new Error('Unable to persist chat history for cloud sync');
+  }
+  return stripAiSessionPayloadForSync(sessions);
+}
+
+function collectLocalAiSessions(): NonNullable<SyncPayload['aiSessions']> {
+  return latestAISessionsSnapshot
+    ?? getPersistedAiSessionsSnapshot();
+}
+
+/** Build the portable payload; device-local data is added by the backup builder. */
 export function buildSyncPayload(
   vault: SyncableVaultData,
   portForwardingRules?: PortForwardingRule[],
 ): SyncPayload {
+  const aiSessions = collectAiSessionsForSync();
+  return {
+    ...buildVaultSyncPayload(vault, portForwardingRules),
+    ...(aiSessions !== undefined ? { aiSessions } : {}),
+  };
+}
+
+function buildVaultSyncPayload(
+  vault: SyncableVaultData,
+  portForwardingRules?: PortForwardingRule[],
+): SyncPayload {
+  const browserBookmarks = getCachedHostBrowserBookmarks();
   return {
     hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
@@ -974,7 +1112,9 @@ export function buildSyncPayload(
     notes: vault.notes,
     noteGroups: vault.noteGroups,
     groupConfigs: vault.groupConfigs,
+    monitorPanels: readMonitorPanels(),
     portForwardingRules: sanitizePortForwardingRulesForSync(portForwardingRules),
+    ...(browserBookmarks !== undefined ? { browserBookmarks } : {}),
     settings: collectSyncableSettings(),
     syncedAt: Date.now(),
   };
@@ -1048,6 +1188,8 @@ export async function buildCloudSyncPayload(
     collectPluginSidecars?: PluginSyncSidecarCollector;
   },
 ): Promise<SyncPayload> {
+  const aiSessions = collectAiSessionsForSync();
+  const browserBookmarks = await collectHostBrowserBookmarks();
   const base: SyncPayload = {
     hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
@@ -1059,7 +1201,10 @@ export async function buildCloudSyncPayload(
     notes: vault.notes,
     noteGroups: vault.noteGroups,
     groupConfigs: vault.groupConfigs,
+    monitorPanels: readMonitorPanels(),
     portForwardingRules: sanitizePortForwardingRulesForSync(portForwardingRules),
+    ...(aiSessions !== undefined ? { aiSessions } : {}),
+    ...(browserBookmarks !== undefined ? { browserBookmarks } : {}),
     settings: await collectCloudSyncableSettings(),
     syncedAt: Date.now(),
   };
@@ -1074,11 +1219,13 @@ export function buildLocalVaultPayload(
   portForwardingRules?: PortForwardingRule[],
 ): SyncPayload {
   const base: SyncPayload = {
-    ...buildSyncPayload(vault, portForwardingRules),
+    ...buildVaultSyncPayload(vault, portForwardingRules),
     // Keep device-local recent-connection timestamps in protective backups.
     hosts: vault.hosts,
     settings: collectLocalBackupSettings(),
     knownHosts: vault.knownHosts,
+    // Cloud consent and cloud attachment stripping do not apply to local backups.
+    aiSessions: collectLocalAiSessions(),
   };
   // Protective backups must capture plugin sidecars so restore can recover
   // plugin settings/baselines. Prefer the last successful host collect cache
@@ -1108,6 +1255,8 @@ export async function buildLocalVaultPayloadAsync(
   portForwardingRules?: PortForwardingRule[],
 ): Promise<SyncPayload> {
   const base = buildLocalVaultPayload(vault, portForwardingRules);
+  const browserBookmarks = await collectHostBrowserBookmarks();
+  if (browserBookmarks !== undefined) base.browserBookmarks = browserBookmarks;
   const {
     collectPluginSyncSidecarsFromHost,
     isPluginSidecarHostUnavailableError,
@@ -1131,13 +1280,102 @@ export async function buildLocalVaultPayloadAsync(
   return base;
 }
 
-/**
- * Apply a downloaded `SyncPayload` to local state via the provided importers.
- *
- * This ensures both vault data and port-forwarding rules are imported
- * consistently across windows.
- */
-function applyPayload(
+/** Merge downloaded chat data through the existing state and persistence boundary. */
+async function applyAiSessionData(sessions: NonNullable<SyncPayload['aiSessions']>, includeLocalOnlyData: boolean): Promise<void> {
+  const { isAIChatSessionStreaming, stopAIChatSessionBeforeReplacement } = await import('./state/useAIChatStreaming');
+  const preserveActive = (id: string) => !includeLocalOnlyData && isAIChatSessionStreaming(id);
+  const incoming = includeLocalOnlyData
+    ? sessions
+    : sessions.map(stripAiSessionDeviceState);
+  const incomingIds = new Set(incoming.map((session) => session.id));
+  const incomingById = new Map(incoming.map((session) => [session.id, session]));
+  const portableMessages = (value: typeof incoming[number]) => stripAiSessionPayloadForSync([value])[0].messages;
+  const affectedIds = collectLocalAiSessions().filter((local) => {
+    if (preserveActive(local.id)) return false;
+    const next = incomingById.get(local.id);
+    if (!next) return true;
+    const candidate = includeLocalOnlyData ? next : mergeAiSessionLists([local], [next])[0];
+    return JSON.stringify(portableMessages(local)) !== JSON.stringify(portableMessages(candidate));
+  }).map((session) => session.id);
+  if (affectedIds.length > 0) {
+    await Promise.all(affectedIds.map(stopAIChatSessionBeforeReplacement));
+  }
+  // Stop finalizers can finish the last local message. Read it again before
+  // merging so the stopped turn cannot write into a replaced/deleted session.
+  const localSessions = collectLocalAiSessions();
+  const localById = new Map(localSessions.map((session) => [session.id, session]));
+  const removedIds = localSessions.filter((session) => !incomingIds.has(session.id) && !preserveActive(session.id)).map((session) => session.id);
+  const resetSdkSessions: string[] = [];
+  // The sync merge has already decided which session IDs survive. Backups
+  // restore their exact transcript; cloud survivors still retain local turns.
+  const candidates = includeLocalOnlyData ? incoming
+    : mergeAiSessionLists(localSessions.filter((session) => incomingIds.has(session.id)), incoming);
+  // Keep active cloud sessions intact until a later sync, including remote deletions.
+  const retainedActive = localSessions.filter((session) => preserveActive(session.id));
+  const mergedSessions = [...candidates.filter((session) => !preserveActive(session.id)), ...retainedActive].map((session) => {
+    if (preserveActive(session.id)) return session;
+    // Native SDK threads belong to this device. Reuse the local thread
+    // only while it already contains the entire merged transcript.
+    const local = localById.get(session.id);
+    const transcriptChanged = local
+      && JSON.stringify(portableMessages(local)) !== JSON.stringify(portableMessages(session));
+    if (transcriptChanged) resetSdkSessions.push(session.id);
+    const { externalSessionId: _remoteThread, ...portable } = session;
+    return local?.externalSessionId && !transcriptChanged
+      ? { ...portable, externalSessionId: local.externalSessionId }
+      : portable;
+  });
+  if (!writeSessionsForStorage(mergedSessions)) {
+    throw new Error('Unable to save downloaded AI chat history');
+  }
+  cleanupDeletedAIChatSessions(removedIds);
+  await cleanupSdkAgentSessions(resetSdkSessions);
+  setLatestAISessionsSnapshot(mergedSessions);
+  publishAISessionsSnapshot({ ...getAISessionsSnapshot(), sessions: mergedSessions });
+  emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
+}
+
+/** Read existing cloud chats before an enabled empty local list can overwrite them. */
+export async function setAiSessionsSyncPreference(
+  enabled: boolean,
+  loadRemotePayloads: () => Promise<SyncPayload[]>,
+  preserveDeletions = false,
+): Promise<void> {
+  const wasEnabled = localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled === true;
+  if (enabled && !wasEnabled) {
+    const remotes = await loadRemotePayloads();
+    // Reuse the ordinary no-base deletion rules, including cloud tombstones,
+    // while retaining local-only chats when this is a first-time opt-in.
+    const local: SyncPayload = { hosts: [], keys: [], identities: [], snippets: [], customGroups: [],
+      aiSessions: collectLocalAiSessions(), syncedAt: 0 };
+    const merged = remotes.reduce((current, remote) =>
+      mergeSyncPayloads(null, current, remote, { preserveDeletions }).payload, local);
+    const previous = localStorageAdapter.readString(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS);
+    const { withRestoreBarrier } = await import('./localVaultBackups');
+    await withRestoreBarrier(async () => {
+      if ((localStorageAdapter.readNumber(STORAGE_KEY_VAULT_RESTORE_IN_PROGRESS_UNTIL) ?? 0) <= Date.now()) {
+        throw new Error('Unable to pause sync while enabling chat history');
+      }
+      if (!localStorageAdapter.write(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS, { enabled })) {
+        throw new Error('Unable to save the chat sync preference');
+      }
+      try {
+        await applyAiSessionData(merged.aiSessions ?? [], false);
+      } catch (error) {
+        if (previous === null) localStorageAdapter.remove(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS);
+        else localStorageAdapter.writeString(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS, previous);
+        throw error;
+      }
+    });
+    return;
+  }
+  if (!localStorageAdapter.write(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS, { enabled })) {
+    throw new Error('Unable to save the chat sync preference');
+  }
+}
+
+/** Apply downloaded vault data and supported settings through their state boundaries. */
+async function preparePayloadApply(
   payload: SyncPayload,
   importers: SyncPayloadImporters,
   options: {
@@ -1145,11 +1383,21 @@ function applyPayload(
     applyPluginSidecars?: PluginSyncSidecarApplier;
     currentHosts?: Host[];
   },
-): Promise<void> {
+): Promise<() => Promise<void>> {
   // Portable payloads must never keep device-bound enc:v1 blobs. Strip them
   // so a previously poisoned cloud/backup snapshot can still restore host
   // shells and let the user re-enter secrets (#2702).
   const sanitizedPayload = stripSyncPayloadEncryptedCredentials(payload);
+  const monitorPanelsAtPrepare = readMonitorPanels();
+  // Prepare credentials before any vault or settings mutation. Encryption can
+  // fail when local credential storage is unavailable; reuse the result below.
+  const providers = sanitizedPayload.settings?.ai?.providers;
+  const preparedProviders = providers == null ? undefined : await Promise.all(providers.map(async (provider) => {
+    const next = await withLocalEncryptedApiKey(provider);
+    return isRecord(provider.customHeaders)
+      ? { ...next, customHeaders: await encryptProviderHeaders(await decryptProviderHeaders(provider.customHeaders as Record<string, string>)) }
+      : next;
+  }));
   const legacyLineTimestampsEnabled = sanitizedPayload.settings?.terminalSettings?.showLineTimestamps === true;
   let hosts = migrateHostsFromLegacyLineTimestamps(sanitizedPayload.hosts, legacyLineTimestampsEnabled);
   if (!options.includeLocalOnlyData) {
@@ -1181,7 +1429,8 @@ function applyPayload(
     vaultImport.groupConfigs = sanitizedPayload.groupConfigs;
   }
 
-  return Promise.resolve(importers.importVaultData(JSON.stringify(vaultImport))).then(async () => {
+  return () => Promise.resolve(importers.importVaultData(JSON.stringify(vaultImport))).then(async () => {
+    if (sanitizedPayload.monitorPanels !== undefined) await applyMonitorPanels(normalizeMonitorPanels(sanitizedPayload.monitorPanels), monitorPanelsAtPrepare, options.includeLocalOnlyData);
     // Only import port-forwarding rules when the payload explicitly carries
     // them.  Absent field = "payload was created before this feature existed",
     // so local rules are preserved.  Explicitly present [] = "remote has no
@@ -1189,10 +1438,21 @@ function applyPayload(
     if (sanitizedPayload.portForwardingRules !== undefined && importers.importPortForwardingRules) {
       importers.importPortForwardingRules(sanitizedPayload.portForwardingRules);
     }
+    if (sanitizedPayload.browserBookmarks !== undefined) {
+      await applyHostBrowserBookmarks(sanitizedPayload.browserBookmarks);
+    }
+
+    // AI chat sessions merge append-only: a cloud snapshot may be missing
+    // turns that only exist on this device, so union instead of replace.
+    const applyAiSessions = options.includeLocalOnlyData
+      || localStorageAdapter.read<{ enabled?: boolean }>(STORAGE_KEY_CLOUD_SYNC_AI_SESSIONS)?.enabled === true;
+    if (applyAiSessions && Array.isArray(sanitizedPayload.aiSessions)) {
+      await applyAiSessionData(sanitizedPayload.aiSessions, options.includeLocalOnlyData);
+    }
 
     // Apply synced settings
     if (sanitizedPayload.settings) {
-      await applySyncableSettings(sanitizedPayload.settings);
+      await applySyncableSettings(sanitizedPayload.settings, preparedProviders);
       // Rehydrate in-memory bookmark snapshot after localStorage was updated
       if (sanitizedPayload.settings.sftpGlobalBookmarks != null) rehydrateGlobalSftpBookmarks();
       importers.onSettingsApplied?.();
@@ -1207,19 +1467,26 @@ function applyPayload(
   });
 }
 
-export function applySyncPayload(
+export function prepareSyncPayloadApply(
   payload: SyncPayload,
   importers: SyncPayloadImporters,
   options?: {
     applyPluginSidecars?: PluginSyncSidecarApplier;
     currentHosts?: Host[];
   },
-): Promise<void> {
-  return applyPayload(payload, importers, {
+): Promise<() => Promise<void>> {
+  return preparePayloadApply(payload, importers, {
     includeLocalOnlyData: false,
     applyPluginSidecars: options?.applyPluginSidecars,
     currentHosts: options?.currentHosts,
   });
+}
+
+export async function applySyncPayload(
+  ...args: Parameters<typeof prepareSyncPayloadApply>
+): Promise<void> {
+  const applyPreparedPayload = await prepareSyncPayloadApply(...args);
+  await applyPreparedPayload();
 }
 
 export async function prepareLocalVaultPayloadApply(
@@ -1236,9 +1503,10 @@ export async function prepareLocalVaultPayloadApply(
   const sanitizedPayload = stripSyncPayloadEncryptedCredentials(payload);
   const prepareConvergentRestore = dependencies.prepareConvergentRestore
     ?? prepareRestoredPayloadConvergentWrites;
+  const applyPreparedPayload = await preparePayloadApply(sanitizedPayload, importers, { includeLocalOnlyData: true });
   const commitConvergentRestore = await prepareConvergentRestore(sanitizedPayload);
   return async () => {
-    await applyPayload(sanitizedPayload, importers, { includeLocalOnlyData: true });
+    await applyPreparedPayload();
     await commitConvergentRestore();
   };
 }

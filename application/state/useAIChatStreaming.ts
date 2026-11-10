@@ -18,6 +18,7 @@ import type {
 } from '../../infrastructure/ai/types';
 import type { ExecutorContext } from '../../infrastructure/ai/cattyAgent/executor';
 import { getAgentRuntime } from '../../infrastructure/ai/harness/globalAgentRuntime';
+import { stopAgentTurn } from '../../infrastructure/ai/harness/agentStop';
 import type {
   TurnSteerInput,
   TurnSteerResult,
@@ -31,6 +32,7 @@ import {
   type TerminalSessionInfo,
 } from '../../infrastructure/ai/aiChatStreamingSupport';
 import { useAgentCompactionUi } from './useAgentCompactionUi';
+import { useI18n } from '../i18n/I18nProvider';
 
 export { getNetcattyBridge } from '../../infrastructure/ai/aiChatStreamingSupport';
 export type { ActiveCompactionUi } from './useAgentCompactionUi';
@@ -43,6 +45,16 @@ const streamingSubscribers = new Set<() => void>();
 /** Whether a chat session still has an active stream (used to keep panel mounted while hidden). */
 export function isAIChatSessionStreaming(sessionId: string | null | undefined): boolean {
   return !!sessionId && sharedStreamingSessionIds.has(sessionId);
+}
+
+/** Use the same stop entry and controllers as the UI before replacing history. */
+export async function stopAIChatSessionBeforeReplacement(sessionId: string): Promise<void> {
+  const controller = sharedAbortControllers.get(sessionId);
+  if (controller || sharedStreamingSessionIds.has(sessionId)) {
+    await stopAgentTurn({ chatSessionId: sessionId, abortController: controller, bridge: getNetcattyBridge() });
+  }
+  await getAgentRuntime().waitForActiveTurn(sessionId);
+  if (controller && sharedAbortControllers.get(sessionId) === controller) sharedAbortControllers.delete(sessionId);
 }
 
 function emitStreamingStoreChange(): void {
@@ -115,6 +127,8 @@ export interface SendToCattyContext {
 }
 
 export interface SendToExternalContext {
+  scopeType?: 'terminal' | 'workspace' | 'global';
+  scopeTargetId?: string;
   existingSessionId?: string;
   updateExternalSessionId?: (sessionId: string, externalSessionId: string | undefined) => void;
   historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -134,6 +148,7 @@ export function useAIChatStreaming({
   updateMessageById,
   persistContextCompaction,
 }: UseAIChatStreamingParams): UseAIChatStreamingReturn {
+  const { t } = useI18n();
   const [streamingSessionIds, setStreamingSessions] = useState<Set<string>>(
     () => new Set(sharedStreamingSessionIds),
   );
@@ -195,7 +210,8 @@ export function useAIChatStreaming({
     setStreamingForScope,
     getLatestSession: (sessionId: string) => latestAISessionsSnapshot?.find(s => s.id === sessionId),
     persistContextCompaction,
-  }), [addMessageToSession, updateLastMessage, updateMessageById, reportStreamError, setStreamingForScope, persistContextCompaction]);
+    translate: t,
+  }), [addMessageToSession, updateLastMessage, updateMessageById, reportStreamError, setStreamingForScope, persistContextCompaction, t]);
 
   const sendToExternalAgent = useCallback(async (
     sessionId: string,

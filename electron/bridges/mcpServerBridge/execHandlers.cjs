@@ -1,9 +1,12 @@
 /* eslint-disable no-undef */
 // Module-level require: code inside createExecHandlerApi runs under `with (ctx)`
 // where bare `require` resolves to ctx.require (based in electron/bridges/).
+const { clearSessionFlowState } = require("../terminalFlowAck.cjs");
+const { getVisibleIdlePrompt } = require("../ai/shellUtils.cjs");
+const { emitJobDiag } = require("../ai/jobStartupDiagnostics.cjs");
 const {
   ensureSessionShellKind,
-  ensureSessionShellKindForExec,
+  remoteDisallowsExecChannelProbe, sessionDisallowsExtraSshChannel, ensureSessionShellKindForExec,
 } = require("../ai/sessionShellKind.cjs");
 
 function createExecHandlerApi(ctx) {
@@ -71,7 +74,7 @@ function createExecHandlerApi(ctx) {
       };
     }
     
-    function handleExec(params) {
+    function handleExec(params, executionContext = {}) {
       const resolved = resolveExecContext(params);
       if (!resolved.ok) return resolved;
       const {
@@ -101,6 +104,7 @@ function createExecHandlerApi(ctx) {
     
       const runExecution = (factory) => {
         try {
+          executionContext.beforeExecute?.();
           return Promise.resolve(factory()).finally(() => {
             releaseSessionExecution(sessionId, sessionToken);
             executionLock.release();
@@ -136,19 +140,27 @@ function createExecHandlerApi(ctx) {
             chatSessionId,
           });
           if (!probed.ok) return probed;
+          executionContext.beforeExecute?.();
           const safety = checkCommandSafetyForShell(command, resolveSessionBlocklistShellKind(session));
           if (safety.blocked) {
             debugLog("handleExec:blocklisted", { sessionId, matchedPattern: safety.matchedPattern });
             return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
           }
           return execViaPty(ptyStream, command, {
+            beforeInput: executionContext.beforeExecute,
+            onInterrupt: () => clearSessionFlowState(session),
             trackForCancellation: activePtyExecs,
             timeoutMs: commandTimeoutMs,
             shellKind: session.shellKind,
             loginShellHint: session._loginShellKind,
             probeLiveShell: true,
+            bastionKeystrokes: remoteDisallowsExecChannelProbe(session.remoteSshVersion),
+            skipPendingInputClear: session.singleChannelSsh === true,
             onProbeAborted: (marker) => echoCommandToSession(session, sessionId, `${marker}_R`, { syntheticEcho: false }),
+            onEchoSuppressionPrime: (marker) => echoCommandToSession(session, sessionId, `${marker}_I`, { syntheticEcho: false }),
             expectedPrompt: getFreshIdlePrompt(session),
+            getReadyPrompt: typeof session._promptTrackTail === "string"
+              ? () => getFreshIdlePrompt(session) || getVisibleIdlePrompt(session) : undefined,
             typedInput: true,
             echoCommand: (rawCommand) => echoCommandToSession(session, sessionId, rawCommand),
             chatSessionId,
@@ -169,13 +181,14 @@ function createExecHandlerApi(ctx) {
     
       // Fallback: SSH exec channel (invisible to terminal).
       // At this point ptyStream is not writable (already returned above if it was).
-      if (sshClient && typeof sshClient.exec === "function") {
+      if (!session.singleChannelSsh && sshClient && typeof sshClient.exec === "function") {
         return runExecution(async () => {
           const probed = await ensureSessionShellKindForExec(session, {
             trackForCancellation: activePtyExecs,
             chatSessionId,
           });
           if (!probed.ok) return probed;
+          executionContext.beforeExecute?.();
           const safety = checkCommandSafetyForShell(command, resolveSessionBlocklistShellKind(session));
           if (safety.blocked) {
             debugLog("handleExec:blocklisted", { sessionId, matchedPattern: safety.matchedPattern });
@@ -211,7 +224,7 @@ function createExecHandlerApi(ctx) {
       return { ok: false, error: "Session does not support command execution" };
     }
     
-    function handleJobStart(params) {
+    function handleJobStart(params, executionContext = {}) {
       const resolved = resolveExecContext(params);
       if (!resolved.ok) return resolved;
       const {
@@ -307,18 +320,29 @@ function createExecHandlerApi(ctx) {
 
         let handle;
         try {
+          executionContext.beforeExecute?.();
           handle = startPtyJob(ptyStream, command, {
+            beforeInput: executionContext.beforeExecute,
+            onInterrupt: () => clearSessionFlowState(session),
             // Intentionally do NOT register in activePtyExecs: terminal_start jobs
             // are designed to survive SDK agent "Stop" so the model can stop polling
             // without aborting a long-running build/scan/log stream. The job is
             // managed via terminal_stop and the per-session execution lock.
             timeoutMs,
+            sessionId,
+            jobId,
+            diagnosticsSession: session,
             shellKind: session.shellKind,
             loginShellHint: session._loginShellKind,
             probeLiveShell: true,
+            bastionKeystrokes: remoteDisallowsExecChannelProbe(session.remoteSshVersion),
+            skipPendingInputClear: session.singleChannelSsh === true,
             onProbeAborted: (marker) => echoCommandToSession(session, sessionId, `${marker}_R`, { syntheticEcho: false }),
+            onEchoSuppressionPrime: (marker) => echoCommandToSession(session, sessionId, `${marker}_I`, { syntheticEcho: false }),
             chatSessionId,
             expectedPrompt: getFreshIdlePrompt(session),
+            getReadyPrompt: typeof session._promptTrackTail === "string"
+              ? () => getFreshIdlePrompt(session) || getVisibleIdlePrompt(session) : undefined,
             typedInput: true,
             echoCommand: (rawCommand) => echoCommandToSession(session, sessionId, rawCommand),
             maxBufferedChars: MAX_BACKGROUND_JOB_OUTPUT_CHARS,
@@ -339,6 +363,7 @@ function createExecHandlerApi(ctx) {
         handle.resultPromise.then((result) => {
           job.updatedAt = Date.now();
           job.exitCode = result.exitCode ?? null;
+          job.code = result.code;
           storeCompletedJobOutput(job, result.stdout || "", result);
           const isForcedCancel = typeof result.error === "string" && result.error.includes("forced");
           if (result.error === "Cancelled" || isForcedCancel) {
@@ -413,11 +438,25 @@ function createExecHandlerApi(ctx) {
       return job;
     }
     
+    // A worker job whose route is gone falls through to these handlers, so the
+    // miss must be logged here as well as in the worker-route handlers.
+    function logJobLookupMiss(op, jobId, chatSessionId) {
+      emitJobDiag("job-stop-miss", {
+        jobId,
+        chatSessionId: chatSessionId || null,
+        op,
+        reason: backgroundJobs.has(jobId) ? "scope-mismatch" : "job-missing",
+      });
+    }
+
     function handleJobPoll(params) {
       const { jobId, offset = 0, chatSessionId, scopedSessionIds } = params || {};
       if (!jobId) throw new Error("jobId is required");
       const job = getScopedJob(jobId, chatSessionId || null);
-      if (!job) return { ok: false, error: "Background job not found" };
+      if (!job) {
+        logJobLookupMiss("poll", jobId, chatSessionId);
+        return { ok: false, error: "Background job not found" };
+      }
       // Re-check session scope so a caller that lost access to the host
       // cannot continue reading output from jobs on that session.
       // Covers dynamic (chatSessionId) and static (scopedSessionIds) modes.
@@ -432,7 +471,10 @@ function createExecHandlerApi(ctx) {
       const { jobId, chatSessionId, scopedSessionIds } = params || {};
       if (!jobId) throw new Error("jobId is required");
       const job = getScopedJob(jobId, chatSessionId || null);
-      if (!job) return { ok: false, error: "Background job not found" };
+      if (!job) {
+        logJobLookupMiss("stop", jobId, chatSessionId);
+        return { ok: false, error: "Background job not found" };
+      }
       // For statically scoped MCP clients, validate that the job's session is
       // within the caller's static scope so a foreign jobId cannot cancel jobs
       // outside the caller's allowed sessions. Dynamic chat scope is already

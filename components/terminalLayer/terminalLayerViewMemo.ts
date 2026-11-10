@@ -228,18 +228,22 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
   'mountedSftpTabIds',
   'mountedAiTabIds',
   'notesMountedTabIds',
+  'browserMountedTabIds',
   'notesOpenNoteByTab',
   'scriptsMountedTabIds',
   'systemMountedTabIds',
   'themeMountedTabIds',
   'handleHistoryPaste',
   'handleHistoryDelete',
+  'handleHistoryClear',
   'handleHistoryRun',
   'handleOpenHistory',
   'HistorySidePanel',
   'History',
   'sidePanelWidth',
+  'sidePanelHeight',
   'sidePanelPosition',
+  'isComposeBarOpen',
   'sidePanelOpenTabs',
   'sidePanelLayouts',
   'sftpHostForTab',
@@ -250,6 +254,7 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
   // SFTP Connected picker reads live terminal sessions from stable ctx.
   'sessions',
   'sessionHostsMap',
+  'sftpAuthHostBySessionId',
   'workspaceById',
   'keys',
   'identities',
@@ -304,11 +309,17 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
   'handlePendingTerminalSelectionConsumed',
   'setSidePanelWidth',
   'persistSidePanelWidth',
+  'setSidePanelHeight',
+  'persistSidePanelHeight',
   'handleToggleSftpFromBar',
   'handleOpenScripts',
   'handleOpenTheme',
   'handleOpenAI',
   'handleOpenNotes',
+  'getActiveTerminalSessionId',
+  'handleSwitchSidePanelTab',
+  'handleWithdrawPluginSidebarPane',
+  'handleOpenBrowser',
   'handleBackFromNotes',
   'handleOpenHostFromNotes',
   'handleOpenSystem',
@@ -335,6 +346,11 @@ const SIDE_PANEL_STABLE_CTX_KEYS = [
 ] as const;
 
 const WORKSPACE_CTX_KEYS = [
+  // Stay. Solo SSH A->B already keeps TerminalPanesHost equal when the sessions
+  // ref is unchanged (this compare does not feed the panes host). The visible
+  // pane still pays reveal flush + repaint, and focus retries at 50ms.
+  // Dropping activeTabId only skips one workspace-section pass; the live-store
+  // host/theme update still renders the section. That is not the settle cost.
   'activeTabId',
   'workspaceInnerRef',
   'workspaceOuterRef',
@@ -345,8 +361,10 @@ const WORKSPACE_CTX_KEYS = [
   'setDropHint',
   'computeSplitHint',
   'handleWorkspaceDrop',
+  'onRequestAddToWorkspace',
   'sessions',
   'sessionHostsMap',
+  'sftpAuthHostBySessionId',
   'sessionChainHostsMap',
   'sessionSudoAutofillPasswordsMap',
   'sessionSudoAutofillCandidatesMap',
@@ -403,8 +421,11 @@ const WORKSPACE_CTX_KEYS = [
   'handleCommandExecuted',
   'handleCommandSubmitted',
   'onSetWorkspaceFocusedSession',
+  'onSetWorkspaceAnchorChat',
   'onSplitSession',
   'isBroadcastEnabled',
+  'isComposeSendToAll',
+  'onToggleComposeSendTarget',
   'handleBroadcastInput',
   'handleBroadcastInterruptPriorityChange',
   'handleToggleWorkspaceComposeBar',
@@ -430,9 +451,12 @@ const WORKSPACE_CTX_KEYS = [
   'onReorderTabs',
   'onStartSessionDrag',
   'onEndSessionDrag',
+  'onDropWorkspacePane',
   'isGlobalBroadcastEnabled',
+  'isGlobalComposeSendToAll',
   'canUseGlobalBroadcast',
   'onToggleGlobalBroadcast',
+  'onToggleGlobalComposeSendTarget',
 ] as const;
 
 export function terminalLayerSidePanelStableCtxEqual(prev: Ctx, next: Ctx): boolean {
@@ -468,6 +492,10 @@ export function terminalLayerViewCtxEqual(prev: Ctx, next: Ctx): boolean {
   if (prev.refocusTerminalSession !== next.refocusTerminalSession) return false;
   if (prev.setIsComposeBarOpen !== next.setIsComposeBarOpen) return false;
   if (prev.isBroadcastEnabled !== next.isBroadcastEnabled) return false;
+  if (prev.isComposeSendToAll !== next.isComposeSendToAll) return false;
+  if (prev.onToggleComposeSendTarget !== next.onToggleComposeSendTarget) return false;
+  if (prev.isGlobalComposeSendToAll !== next.isGlobalComposeSendToAll) return false;
+  if (prev.onToggleGlobalComposeSendTarget !== next.onToggleGlobalComposeSendTarget) return false;
   if (prev.composeBarThemeColors !== next.composeBarThemeColors) return false;
   if (prev.workspaceOuterRef !== next.workspaceOuterRef) return false;
   // Use stable side-panel equal only: LIVE fields (cwd, theme focus, etc.) flow
@@ -506,6 +534,7 @@ export function terminalLayerFocusSidebarPropsEqual(prev: Ctx, next: Ctx): boole
     && eq(prev, next, 'onCopySessionToNewWindow')
     && eq(prev, next, 'onRemoveSessionFromWorkspace')
     && eq(prev, next, 'onSetWorkspaceFocusedSession')
+    && eq(prev, next, 'onSetWorkspaceAnchorChat')
     && eq(prev, next, 'onToggleWorkspaceViewMode')
     && eq(prev, next, 'onSubmitSessionRename');
 }

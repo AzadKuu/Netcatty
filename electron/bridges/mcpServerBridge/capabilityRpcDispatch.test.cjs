@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 
 const { createCapabilityRpcDispatcher, UNROUTED } = require("./capabilityRpcDispatch.cjs");
 const { CAPABILITY_SURFACES, PERMISSION_MODES } = require("../../capabilities/constants.cjs");
+const { evaluatePermissionWithGrants } = require("../../capabilities/policy.cjs");
 
 function createTestDispatcher(overrides = {}) {
   const invokeVaultAgent = overrides.invokeVaultAgent || (async (op, params) => ({
@@ -31,6 +32,50 @@ function createTestDispatcher(overrides = {}) {
     ...overrides,
   });
 }
+
+test('reconnect respects observer mode and denial before touching transport', async () => {
+  let calls = 0;
+  for (const mode of [PERMISSION_MODES.OBSERVER, PERMISSION_MODES.CONFIRM]) {
+    const dispatch = createTestDispatcher({ permissionMode: mode, evaluatePermissionWithGrants,
+      validateSessionReconnect: () => ({ ok: true }),
+      requestApprovalFromRenderer: async () => false,
+      invokeVaultAgent: async () => { calls++; return { ok: true }; } });
+    assert.equal((await dispatch('session/reconnect', { sessionId: 's', chatSessionId: 'chat' })).ok, false);
+    assert.equal((await dispatch('session/recover', { sessionId: 's', chatSessionId: 'chat' })).ok, false);
+  }
+  assert.equal(calls, 0);
+});
+
+test('reconnect revalidates scope after approval and supports public RPC', async () => {
+  let allowed = true;
+  let calls = 0;
+  const dispatch = createTestDispatcher({ evaluatePermissionWithGrants,
+    validateSessionReconnect: () => allowed ? { ok: true } : { ok: false, error: 'scope revoked' },
+    requestApprovalFromRenderer: async () => { allowed = false; return true; },
+    invokeVaultAgent: async () => { calls++; return { ok: true }; } });
+  const result = await dispatch('public/session/reconnect', { sessionId: 's', chatSessionId: 'chat' });
+  assert.equal(result.error, 'scope revoked');
+  assert.equal(calls, 0);
+});
+
+test("host open does not report success after its scope binding was revoked", async () => {
+  const dispatch = createTestDispatcher({
+    invokeVaultAgent: async () => ({ ok: true, sessionId: "opened-1" }),
+    onHostOpened: async () => false,
+  });
+  const result = await dispatch("vault/hosts/open", { hostId: "host-1", chatSessionId: "chat-1" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "SESSION_SCOPE_BIND_FAILED");
+});
+
+test("host open confirms binding only after the ownership callback completes", async () => {
+  const dispatch = createTestDispatcher({
+    invokeVaultAgent: async () => ({ ok: true, sessionId: "opened-1" }),
+    onHostOpened: async () => true,
+  });
+  const result = await dispatch("vault/hosts/open", { hostId: "host-1", chatSessionId: "chat-1" });
+  assert.equal(result.scopeBound, true);
+});
 
 test("dispatchCapabilityRpc returns UNROUTED for netcatty builtin methods", async () => {
   const dispatch = createTestDispatcher();
@@ -82,6 +127,131 @@ test("dispatchCapabilityRpc routes public vault host notes set through approval"
   assert.equal(approvalCalls[0].toolName, "host_notes_set");
   assert.equal(result.ok, true);
   assert.equal(result.notes, "updated");
+});
+
+test("vault host deletion cannot borrow a different session's host grant", async () => {
+  let approvalTarget;
+  let deleted = false;
+  const dispatch = createTestDispatcher({
+    evaluatePermissionWithGrants,
+    permissionGrantsSnapshot: [{
+      id: "trusted-host", capabilityId: "*", sessionPattern: "host:trusted", createdAt: 1,
+    }],
+    getApprovalTarget: () => ({ sessionId: "trusted-session", hostId: "trusted", label: "Trusted" }),
+    requestApprovalFromRenderer: async (_name, _args, _chatSessionId, context) => {
+      approvalTarget = context.target;
+      return false;
+    },
+    invokeVaultAgent: async () => {
+      deleted = true;
+      return { ok: true };
+    },
+  });
+
+  const result = await dispatch("public/vault/hosts/delete", {
+    chatSessionId: "__external_mcp__",
+    sessionId: "trusted-session",
+    hostId: "other-host",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(deleted, false);
+  assert.equal(approvalTarget, null);
+});
+
+test("host_open names its vault host and cannot borrow another host's grant", async () => {
+  const approvals = [];
+  const opened = [];
+  const hosts = {
+    test: { id: "test", label: "Test server", hostname: "test.example" },
+    prod: { id: "prod", label: "Production", hostname: "prod.example" },
+    temporary: { id: "temporary", label: "Temporary", hostname: "temp.example", ephemeral: true },
+    serial: { id: "serial", label: "Serial device", hostname: "ttyUSB0", protocol: "serial" },
+  };
+  const dispatch = createTestDispatcher({
+    evaluatePermissionWithGrants,
+    permissionGrantsSnapshot: [{
+      id: "test-only", capabilityId: "vault.host.open", sessionPattern: "host:test", createdAt: 1,
+    }],
+    requestApprovalFromRenderer: async (_name, _args, _chat, context) => {
+      approvals.push(context.target);
+      return false;
+    },
+    invokeVaultAgent: async (op, params) => {
+      if (op === "host.get") return { ok: true, host: hosts[params.hostId] };
+      if (op === "host.open") {
+        opened.push(params.hostId);
+        return { ok: true, sessionId: `session-${params.hostId}` };
+      }
+      return { ok: false };
+    },
+  });
+
+  assert.equal((await dispatch("public/vault/hosts/open", { hostId: "test" })).ok, true);
+  assert.equal((await dispatch("public/vault/hosts/open", { hostId: "prod" })).ok, false);
+  assert.equal((await dispatch("public/vault/hosts/open", { hostId: "temporary" })).ok, false);
+  assert.equal((await dispatch("public/vault/hosts/open", { hostId: "serial" })).ok, false);
+  assert.deepEqual(opened, ["test"]);
+  assert.deepEqual(approvals, [
+    { sessionId: "", hostId: "prod", label: "Production", hostname: "prod.example" },
+    { sessionId: "", hostId: "", label: "Temporary", hostname: "temp.example" },
+    { sessionId: "", hostId: "", label: "Serial device", hostname: "ttyUSB0" },
+  ]);
+});
+
+test("dispatchCapabilityRpc asks for approval before importing vault notes from the CLI rpc", async () => {
+  const approvalCalls = [];
+  let invokedOp = null;
+  const dispatch = createTestDispatcher({
+    evaluatePermissionWithGrants: () => ({
+      allowed: true,
+      requiresApproval: true,
+    }),
+    requestApprovalFromRenderer: async (toolName, args, chatSessionId) => {
+      approvalCalls.push({ toolName, args, chatSessionId });
+      return true;
+    },
+    invokeVaultAgent: async (op) => {
+      invokedOp = op;
+      return { ok: true, importedCount: 1, notes: [] };
+    },
+  });
+
+  const result = await dispatch("vault/notes/import", {
+    chatSessionId: "chat-1",
+    content: "# Steps",
+    fileName: "runbook.md",
+  });
+
+  assert.equal(approvalCalls.length, 1);
+  assert.equal(approvalCalls[0].toolName, "vault_notes_import");
+  assert.equal(approvalCalls[0].chatSessionId, "chat-1");
+  assert.equal(approvalCalls[0].args.content, "# Steps");
+  assert.equal(invokedOp, "note.import");
+  assert.equal(result.importedCount, 1);
+});
+
+test("dispatchCapabilityRpc denies vault note import when the user rejects it", async () => {
+  let invoked = false;
+  const dispatch = createTestDispatcher({
+    evaluatePermissionWithGrants: () => ({
+      allowed: true,
+      requiresApproval: true,
+    }),
+    requestApprovalFromRenderer: async () => false,
+    invokeVaultAgent: async () => {
+      invoked = true;
+      return { ok: true };
+    },
+  });
+
+  const result = await dispatch("vault/notes/import", {
+    chatSessionId: "chat-1",
+    content: "# Steps",
+  });
+
+  assert.equal(invoked, false);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /denied/i);
 });
 
 test("dispatchCapabilityRpc denies public vault host notes set when approval rejected", async () => {
@@ -318,4 +488,45 @@ test("implemented vault capabilities do not return CAPABILITY_NOT_IMPLEMENTED", 
   const dispatch = createTestDispatcher();
   const result = await dispatch("vault/host/get", { hostId: "host-1" });
   assert.notEqual(result.code, "CAPABILITY_NOT_IMPLEMENTED");
+});
+
+test("managed privacy is revalidated after capability approval and before writes", async () => {
+  const { createAiPrivacyService } = require("../../shared/aiPrivacyService.cjs");
+  const { createManagedPrivacyBoundary } = require("../../shared/managedPrivacyBoundary.cjs");
+  const privacy = createAiPrivacyService();
+  privacy.configure({ enabled: true });
+  const token = privacy.redact("approval-chat", "192.0.2.14");
+  let invoked = false;
+  const dispatch = createManagedPrivacyBoundary(createTestDispatcher({
+    evaluatePermissionWithGrants: () => ({ allowed: true, requiresApproval: true }),
+    requestApprovalFromRenderer: async (_tool, args) => {
+      assert.equal(args.notes, "192.0.2.14");
+      privacy.configure({ enabled: false });
+      return true;
+    },
+    invokeVaultAgent: async () => { invoked = true; return { ok: true }; },
+  }), privacy);
+  await assert.rejects(dispatch("public/vault/hostNotes/set", {
+    chatSessionId: "approval-chat", hostId: "host-1", notes: token,
+  }), /settings changed|unavailable/);
+  assert.equal(invoked, false);
+});
+
+test("managed session close revalidates privacy after asynchronous close preparation", async () => {
+  const { createAiPrivacyService } = require("../../shared/aiPrivacyService.cjs");
+  const { createManagedPrivacyBoundary } = require("../../shared/managedPrivacyBoundary.cjs");
+  const privacy = createAiPrivacyService();
+  privacy.configure({ enabled: true });
+  let invoked = false;
+  let outcome;
+  const dispatch = createManagedPrivacyBoundary(createTestDispatcher({
+    beforeSessionClose: async () => { privacy.configure({ enabled: false }); },
+    afterSessionClose: async (_params, result) => { outcome = result; },
+    invokeVaultAgent: async () => { invoked = true; return { ok: true }; },
+  }), privacy);
+  await assert.rejects(dispatch("public/session/close", {
+    chatSessionId: "closing-chat", sessionId: "session-1",
+  }), /settings changed|unavailable/);
+  assert.equal(invoked, false);
+  assert.equal(outcome.closed, false);
 });

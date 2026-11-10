@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
 
 export interface DiskInfo {
+  diskReadSpeed?: number | null; // Mounted block-device I/O, bytes/sec
+  diskWriteSpeed?: number | null;
   capacityKey?: string;       // Filesystem or shared-pool identity for deduplication
   filesystemType?: string;    // Filesystem type reported by df (for network/FUSE filtering)
   mountPoint: string;
@@ -24,6 +26,14 @@ export interface ProcessInfo {
   command: string;
 }
 
+export interface GpuDeviceStats {
+  index: number;
+  name: string;
+  utilization: number | null; // percent, null when nvidia-smi reports N/A
+  memoryUsed: number | null;  // MiB
+  memoryTotal: number | null; // MiB
+}
+
 export interface ServerStats {
   hostname?: string;            // Remote hostname
   osName?: string;              // Remote operating system name
@@ -33,6 +43,11 @@ export interface ServerStats {
   cpu: number | null;           // CPU usage percentage (0-100)
   cpuCores: number | null;      // Number of CPU cores
   cpuPerCore: number[];         // Per-core CPU usage array
+  gpu: number | null;           // NVIDIA GPU utilization percentage (0-100), null when no GPU data
+  gpuName: string | null;       // First GPU name (tooltip)
+  gpuMemUsed: number | null;    // Summed VRAM used in MB
+  gpuMemTotal: number | null;   // Summed VRAM total in MB
+  gpus: GpuDeviceStats[];       // Per-GPU utilization and VRAM
   memTotal: number | null;      // Total memory in MB
   memUsed: number | null;       // Used memory in MB (excluding buffers/cache)
   memFree: number | null;       // Free memory in MB
@@ -41,13 +56,15 @@ export interface ServerStats {
   swapTotal: number | null;     // Total swap in MB
   swapUsed: number | null;      // Used swap in MB
   topProcesses: ProcessInfo[];  // Top 10 processes by memory
+  diskReadSpeed?: number | null; // Aggregate Linux hardware-backed block I/O, bytes/sec
+  diskWriteSpeed?: number | null;
   diskPercent: number | null;   // Disk usage percentage for root partition
   diskUsed: number | null;      // Disk used in GB
   diskTotal: number | null;     // Total disk in GB
   disks: DiskInfo[];            // All mounted disks
   netRxSpeed: number;           // Total network receive speed (bytes/sec)
   netTxSpeed: number;           // Total network transmit speed (bytes/sec)
-  latencyMs: number | null;     // TCP connection establishment latency to the SSH endpoint
+  latencyMs: number | null;     // SSH transport ping round-trip to the SSH endpoint
   netInterfaces: NetInterfaceInfo[];  // Per-interface network stats
   lastUpdated: number | null;   // Timestamp of last successful update
 }
@@ -82,6 +99,7 @@ interface SharedServerStatsSession {
   clients: Map<number, ServerStatsClient>;
   intervalRef: ReturnType<typeof setInterval> | null;
   initialTimerRef: ReturnType<typeof setTimeout> | null;
+  retryTimerRef: ReturnType<typeof setTimeout> | null;
   connectedAt: number;
   hasFetched: boolean;
   fetchGeneration: number;
@@ -107,6 +125,11 @@ function createEmptyServerStats(): ServerStats {
     cpu: null,
     cpuCores: null,
     cpuPerCore: [],
+    gpu: null,
+    gpuName: null,
+    gpuMemUsed: null,
+    gpuMemTotal: null,
+    gpus: [],
     memTotal: null,
     memUsed: null,
     memFree: null,
@@ -146,6 +169,7 @@ function getSharedServerStatsSession(sessionId: string): SharedServerStatsSessio
     clients: new Map(),
     intervalRef: null,
     initialTimerRef: null,
+    retryTimerRef: null,
     connectedAt: 0,
     hasFetched: false,
     fetchGeneration: 0,
@@ -172,6 +196,10 @@ function updateServerStatsState(session: SharedServerStatsSession, patch: Partia
 }
 
 function clearServerStatsTimers(session: SharedServerStatsSession): void {
+  if (session.retryTimerRef) {
+    clearTimeout(session.retryTimerRef);
+    session.retryTimerRef = null;
+  }
   if (session.initialTimerRef) {
     clearTimeout(session.initialTimerRef);
     session.initialTimerRef = null;
@@ -200,6 +228,11 @@ function normalizeServerStats(stats: Partial<ServerStats>): ServerStats {
     cpu: stats.cpu ?? null,
     cpuCores: stats.cpuCores ?? null,
     cpuPerCore: stats.cpuPerCore || [],
+    gpu: stats.gpu ?? null,
+    gpuName: stats.gpuName ?? null,
+    gpuMemUsed: stats.gpuMemUsed ?? null,
+    gpuMemTotal: stats.gpuMemTotal ?? null,
+    gpus: Array.isArray(stats.gpus) ? stats.gpus : [],
     memTotal: stats.memTotal ?? null,
     memUsed: stats.memUsed ?? null,
     memFree: stats.memFree ?? null,
@@ -211,6 +244,8 @@ function normalizeServerStats(stats: Partial<ServerStats>): ServerStats {
     diskPercent: stats.diskPercent ?? null,
     diskUsed: stats.diskUsed ?? null,
     diskTotal: stats.diskTotal ?? null,
+    diskReadSpeed: stats.diskReadSpeed ?? null,
+    diskWriteSpeed: stats.diskWriteSpeed ?? null,
     disks: stats.disks || [],
     netRxSpeed: stats.netRxSpeed || 0,
     netTxSpeed: stats.netTxSpeed || 0,
@@ -224,10 +259,17 @@ function markServerStatsFailure(session: SharedServerStatsSession, message: stri
   session.consecutiveFailures += 1;
   updateServerStatsState(session, { error: message });
   if (session.consecutiveFailures >= CONSECUTIVE_FAILURE_LIMIT) {
-    // Stop polling this session. This covers network devices that advertise
-    // OpenSSH but do not support the POSIX stats shell command.
+    // Back off unsupported or temporarily unavailable probes, then recover
+    // automatically. Three transient failures must not disable the panel for
+    // the entire lifetime of an otherwise healthy terminal session.
     session.givenUp = true;
     clearServerStatsTimers(session);
+    session.retryTimerRef = setTimeout(() => {
+      session.retryTimerRef = null;
+      session.givenUp = false;
+      session.consecutiveFailures = 0;
+      reconcileSharedServerStatsSession(session);
+    }, 30_000);
   }
 }
 
@@ -244,6 +286,10 @@ async function fetchSharedServerStats(session: SharedServerStatsSession, force =
   if (!bridge?.getServerStats) return;
 
   if (force) {
+    if (session.retryTimerRef) {
+      clearTimeout(session.retryTimerRef);
+      session.retryTimerRef = null;
+    }
     session.givenUp = false;
     session.consecutiveFailures = 0;
   }
@@ -307,6 +353,11 @@ function reconcileSharedServerStatsSession(session: SharedServerStatsSession): v
     // (or re-enabling a terminal stats strip) can paint immediately instead of
     // flashing "No system overview data yet." Still clear give-up / failure so a
     // later resume can auto-retry (old reset wiped stats + flags together).
+    // Invalidate a request before pausing: a late reply must not publish data
+    // or re-arm failure/retry timers after disconnect/disable.
+    if (session.pollingActive || session.inflight || session.givenUp) {
+      session.fetchGeneration += 1;
+    }
     clearServerStatsTimers(session);
     session.givenUp = false;
     session.consecutiveFailures = 0;

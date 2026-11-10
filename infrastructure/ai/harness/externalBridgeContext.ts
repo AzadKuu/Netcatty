@@ -1,5 +1,6 @@
 import type { ChatMessage } from '../types';
 import type { ExternalBridgeHistoryMessage } from './types';
+import { sliceHead } from '../textBoundaries';
 import { buildHistoricalToolResultReplayText, buildHistoricalUserReplayContent } from '../../../components/ai/cattyHistoryReplay';
 import { formatVaultNoteReferences, isVaultNoteAttachment } from '../../../application/state/vaultNoteAttachment';
 
@@ -47,7 +48,7 @@ const TRIVIAL_ASSISTANT_MESSAGE_PATTERNS = [
 
 function truncateText(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
-  return `${value.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n[truncated]`;
+  return `${sliceHead(value, Math.max(0, maxChars - 24)).trimEnd()}\n[truncated]`;
 }
 
 function normalizeWhitespace(value: string): string {
@@ -66,7 +67,7 @@ function getUserHistoryContent(message: ChatMessage): string {
   if (message.role !== "user") return message.content || "";
   return buildHistoricalUserReplayContent(
     message.content || "",
-    message.attachments ?? [],
+    message.attachments ?? message.images ?? [],
   );
 }
 
@@ -174,10 +175,11 @@ function summarizeMessage(
 
 function summarizeDurableUserMessage(message: ChatMessage): string | null {
   if (message.role !== "user") return null;
-  const notes = message.attachments?.filter(isVaultNoteAttachment) ?? [];
+  const attachments = message.attachments ?? message.images;
+  const notes = attachments?.filter(isVaultNoteAttachment) ?? [];
   if (notes.length) {
     // Budget prose separately: the reference instruction must not consume the request's 280 characters.
-    const nonNotes = message.attachments?.filter((attachment) => !isVaultNoteAttachment(attachment));
+    const nonNotes = attachments?.filter((attachment) => !isVaultNoteAttachment(attachment));
     const request = truncateText(normalizeWhitespace(buildHistoricalUserReplayContent(message.content || '', nonNotes)), MAX_DURABLE_USER_MESSAGE_CHARS);
     return `User request: ${request}\n${formatVaultNoteReferences(notes)}`;
   }

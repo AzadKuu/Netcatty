@@ -282,11 +282,23 @@ export interface SyncPayload {
   notes?: import('./models').VaultNote[];
   noteGroups?: string[];
 
+  monitorPanels?: import('./monitorPanels').MonitorPanel[];
+
   // Group configs (connection defaults per host group)
   groupConfigs?: import('./models').GroupConfig[];
 
   // Port forwarding rules
   portForwardingRules?: import('./models').PortForwardingRule[];
+
+  /**
+   * AI chat sessions (optional).
+   *
+   * Opt-in: only present when the user enabled `cloudSync.aiSessions`.
+   * Messages are merged append-only (never dropped), and attachment payloads
+   * are stripped — only their metadata travels.
+   */
+  aiSessions?: import('../infrastructure/ai/types').AISession[];
+  browserBookmarks?: import('./browserBookmark').BrowserBookmark[];
   
   // Known hosts
   knownHosts?: import('./models').KnownHost[];
@@ -313,8 +325,16 @@ export interface SyncPayload {
     terminalFontFamily?: string;
     terminalFontSize?: number;
     terminalSettings?: Record<string, unknown>;
+    /**
+     * Present once the sender has run the autoCloseOnExit default migration.
+     * Legacy payloads omit it; a materialized `true` in those payloads is the
+     * old default, not an explicit opt-in.
+     */
+    autoCloseOnExitDefaultMigrated?: boolean;
     terminalSidePanelAutoOpen?: boolean;
     terminalSidePanelAutoOpenTab?: import('./terminalSidePanelAutoOpen').TerminalSidePanelAutoOpenTab;
+    localShellSidePanelAutoOpen?: boolean;
+    localShellSidePanelAutoOpenTab?: import('./terminalSidePanelAutoOpen').TerminalSidePanelAutoOpenTab;
     customTerminalThemes?: Array<{ id: string; name: string; colors: Record<string, string> }>;
     // Keyboard
     customKeyBindings?: Record<string, { mac?: string; pc?: string }>;
@@ -348,6 +368,11 @@ export interface SyncPayload {
     showHostTreeSidebar?: boolean;
     // Workspace focus indicator style
     workspaceFocusStyle?: 'dim' | 'border';
+    /**
+     * Saved proxy profile for hosts that do not set a proxy and do not inherit
+     * one from a group. An empty string is an explicit direct default.
+     */
+    defaultProxyProfileId?: string;
     // AI configuration
     ai?: {
       providers?: Array<Record<string, unknown>>;
@@ -386,6 +411,27 @@ export interface SyncPayload {
 
   /** Encrypted convergent-sync metadata. The adjacent fields remain a complete v1 snapshot. */
   convergentSync?: ConvergentSyncEnvelopeV2;
+}
+
+/**
+ * Pre-migration snapshots stored autoCloseOnExit: true as the default and do
+ * not carry `autoCloseOnExitDefaultMigrated`. Rewrite that legacy true to
+ * false. A payload that records the migration keeps an explicit true.
+ */
+export function reconcileInboundAutoCloseOnExit(
+  autoCloseOnExit: unknown,
+  payloadRecordsMigratedChoice: unknown,
+): unknown {
+  if (autoCloseOnExit === true && payloadRecordsMigratedChoice !== true) return false;
+  return autoCloseOnExit;
+}
+
+/** True when this side both migrated and explicitly enabled auto-close. */
+export function payloadOptsIntoAutoClose(
+  settings: SyncPayload['settings'] | undefined,
+): boolean {
+  return settings?.autoCloseOnExitDefaultMigrated === true
+    && settings.terminalSettings?.autoCloseOnExit === true;
 }
 
 /**
@@ -441,8 +487,10 @@ export const SYNC_PAYLOAD_ENTITY_KEYS = [
   'notes',
   'noteGroups',
   'portForwardingRules',
+  'browserBookmarks',
   'knownHosts',
   'groupConfigs',
+  'monitorPanels',
 ] as const;
 
 export const CLOUD_SYNC_PAYLOAD_ENTITY_KEYS = [
@@ -456,7 +504,10 @@ export const CLOUD_SYNC_PAYLOAD_ENTITY_KEYS = [
   'notes',
   'noteGroups',
   'portForwardingRules',
+  'browserBookmarks',
   'groupConfigs',
+  'monitorPanels',
+  'aiSessions',
 ] as const;
 
 export type SyncPayloadEntityKey = typeof SYNC_PAYLOAD_ENTITY_KEYS[number];
@@ -551,7 +602,7 @@ export interface ConvergentProviderBaselineV2 {
 
 export function hasSyncPayloadEntityData(
   payload: SyncPayload,
-  keys: readonly SyncPayloadEntityKey[] = SYNC_PAYLOAD_ENTITY_KEYS,
+  keys: readonly (SyncPayloadEntityKey | CloudSyncPayloadEntityKey)[] = SYNC_PAYLOAD_ENTITY_KEYS,
 ): boolean {
   return keys.some((key) => {
     const value = payload[key];

@@ -355,6 +355,32 @@ function createTerminalWorkerRuntime(options = {}) {
     ? options.reportSuppressedError
     : null;
   const ipcMain = createIpcMainHarness();
+  const executionValidations = new Map();
+  let executionValidationCounter = 0;
+  const executionValidationTimeoutMs = options.executionValidationTimeoutMs ?? 10_000;
+  const executionValidationError = "AI privacy session is unavailable or its settings changed; start a new chat";
+
+  function validateExecution(message) {
+    return new Promise((resolve, reject) => {
+      const validationId = `${message.requestId}:${++executionValidationCounter}`;
+      const finish = (ok) => {
+        const entry = executionValidations.get(validationId);
+        if (!entry) return;
+        executionValidations.delete(validationId);
+        clearTimeout(entry.timer);
+        if (ok) resolve();
+        else reject(new Error(executionValidationError));
+      };
+      const timer = setTimeout(() => finish(false), executionValidationTimeoutMs);
+      timer.unref?.();
+      executionValidations.set(validationId, { requestId: message.requestId, timer, finish });
+      try {
+        parentPort.postMessage({ kind: "validate-execution", requestId: message.requestId, validationId });
+      } catch {
+        finish(false);
+      }
+    });
+  }
   let started = false;
   const outputPorts = createOutputPortRegistry();
   const pendingOutputBySession = new Map();
@@ -402,11 +428,11 @@ function createTerminalWorkerRuntime(options = {}) {
     pendingSessionStartBootEpochs.set(sessionId, normalized);
   }
 
-  function shouldSkipStaleEpochClose(sessionId, bootEpoch) {
-    const closeEpoch = normalizeBootEpoch(bootEpoch);
-    if (closeEpoch === undefined || !sessionId) return false;
+  function isStaleSessionBootEpoch(sessionId, bootEpoch) {
+    const requestedEpoch = normalizeBootEpoch(bootEpoch);
+    if (requestedEpoch === undefined || !sessionId) return false;
     const ownerEpoch = pendingSessionStartBootEpochs.get(sessionId);
-    return ownerEpoch !== undefined && ownerEpoch > closeEpoch;
+    return ownerEpoch !== undefined && ownerEpoch > requestedEpoch;
   }
 
   function pruneSessionLifecycleTombstones() {
@@ -499,11 +525,16 @@ function createTerminalWorkerRuntime(options = {}) {
       const requestedSessionGeneration = requestedSessionId
         ? (sessionOutputGenerations.get(requestedSessionId) ?? 0)
         : null;
+      const previousSessionLogToken = requestedSessionId
+        ? require("../bridges/sessionLogStreamManager.cjs").getSessionLogToken(requestedSessionId)
+        : null;
       if (requestedSessionId) {
         sessionRequestIds.set(requestedSessionId, message.requestId);
         sessionLifecycleTombstoneTimes.delete(requestedSessionId);
       }
       const result = await handler({
+        ...(message.requiresExecutionValidation === true
+          ? { beforeExecute: () => validateExecution(message) } : {}),
         sender: createSender(
           parentPort,
           message.webContentsId,
@@ -528,6 +559,14 @@ function createTerminalWorkerRuntime(options = {}) {
         const requestedGenerationStillCurrent = requestedSessionGeneration === null
           || currentGeneration === requestedSessionGeneration;
         if (!exitedDuringRequest && requestedGenerationStillCurrent) {
+          // Failed reconnects retain the previous saved log. After a successful
+          // start without a replacement log, retire only the old inactive
+          // target, never a continuing manual or newly-finalized stream.
+          if (sessionId === requestedSessionId && result.success !== false && !result.error) {
+            require("../bridges/sessionLogStreamManager.cjs").forgetInactiveSessionLog(
+              sessionId, previousSessionLogToken,
+            );
+          }
           sessionRequestIds.set(sessionId, message.requestId);
           sessionStartMarkers.add(sessionId);
           sessionLifecycleTombstoneTimes.delete(sessionId);
@@ -614,20 +653,30 @@ function createTerminalWorkerRuntime(options = {}) {
       void handleRequest(message);
       return;
     }
+    if (isStaleSessionBootEpoch(sessionId, message.payload?.bootEpoch)) {
+      postRequestError(message, new Error("Terminal session start was superseded by a newer boot"));
+      return;
+    }
+    // The replacement cannot register its own controller until the queued
+    // start settles, so cancel that start before waiting for its PATH refresh.
+    const { abortPendingBoot } = require("../bridges/sessionBootEpoch.cjs");
+    abortPendingBoot(sessionId, message.payload?.bootEpoch);
     rememberPendingStartBootEpoch(sessionId, message.payload?.bootEpoch);
     const closeEpoch = sessionCloseEpochs.get(sessionId) ?? 0;
     const previous = sessionOperationTails.get(sessionId);
     const previousKind = sessionOperationKinds.get(sessionId);
     const shouldClosePreviousStart = previousKind === "start" || sessionStartMarkers.has(sessionId);
     const current = (previous || Promise.resolve()).catch(() => {}).then(async () => {
-      if ((sessionCloseEpochs.get(sessionId) ?? 0) !== closeEpoch) {
-        postRequestError(message, new Error("Terminal session start was cancelled by close"));
+      if ((sessionCloseEpochs.get(sessionId) ?? 0) !== closeEpoch
+        || isStaleSessionBootEpoch(sessionId, message.payload?.bootEpoch)) {
+        postRequestError(message, new Error("Terminal session start was cancelled by close or superseded by a newer boot"));
         return;
       }
       try {
         if (shouldClosePreviousStart) await closeSupersededSessionStart(message);
-        if ((sessionCloseEpochs.get(sessionId) ?? 0) !== closeEpoch) {
-          postRequestError(message, new Error("Terminal session start was cancelled by close"));
+        if ((sessionCloseEpochs.get(sessionId) ?? 0) !== closeEpoch
+          || isStaleSessionBootEpoch(sessionId, message.payload?.bootEpoch)) {
+          postRequestError(message, new Error("Terminal session start was cancelled by close or superseded by a newer boot"));
           return;
         }
         sessionStartMarkers.add(sessionId);
@@ -646,7 +695,7 @@ function createTerminalWorkerRuntime(options = {}) {
       else handleSend(message);
       return;
     }
-    if (shouldSkipStaleEpochClose(sessionId, message.payload?.bootEpoch)) {
+    if (isStaleSessionBootEpoch(sessionId, message.payload?.bootEpoch)) {
       if (expectsResponse) {
         parentPort.postMessage({
           kind: "response",
@@ -656,6 +705,10 @@ function createTerminalWorkerRuntime(options = {}) {
       }
       return;
     }
+    // Signal cancellation before waiting for the start operation. Otherwise a
+    // pending PATH refresh can spawn a PTY before its queued close runs.
+    const { abortPendingBoot } = require("../bridges/sessionBootEpoch.cjs");
+    abortPendingBoot(sessionId, message.payload?.bootEpoch);
     sessionCloseEpochs.set(sessionId, (sessionCloseEpochs.get(sessionId) ?? 0) + 1);
     pendingSessionStartBootEpochs.delete(sessionId);
     touchSessionLifecycleTombstone(sessionId);
@@ -681,7 +734,9 @@ function createTerminalWorkerRuntime(options = {}) {
     const listener = ipcMain.listeners.get(message.channel);
     if (!listener) return;
     if (message.channel === "netcatty:interrupt") {
-      terminalDataPipeline?.clearSensitiveInput?.(message.payload?.sessionId);
+      if (message.payload?.cancelPendingWritesOnly !== true) {
+        terminalDataPipeline?.clearSensitiveInput?.(message.payload?.sessionId);
+      }
       const trace = normalizeTrace(message.payload);
       logTerminalInterruptDebug("worker-received-send", {
         channel: message.channel,
@@ -735,6 +790,15 @@ function createTerminalWorkerRuntime(options = {}) {
 
   function handleMessage(eventOrMessage) {
     const { message, ports } = normalizeMessageEvent(eventOrMessage);
+    if (message?.kind === "execution-validation") {
+      const entry = executionValidations.get(message.validationId);
+      if (entry?.requestId === message.requestId) entry.finish(message.ok === true);
+      return;
+    }
+    if (message?.kind === "set-custom-temp-dir") {
+      (options.applyCustomTempDir || require("../bridges/tempDirBridge.cjs").applyCustomTempDir)(message.value);
+      return;
+    }
     if (message?.kind === "set-ssh-transport-idle-ttl") {
       setDefaultTransportIdleTtlMs(message.value);
       return;

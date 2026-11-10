@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { I18nProvider } from "../../application/i18n/I18nProvider.tsx";
 import type { Host } from "../../types.ts";
-import { TerminalToolbar } from "./TerminalToolbar.tsx";
+import { TERMINAL_TOOLBAR_LAYOUT_DEFAULTS, TerminalToolbar } from "./TerminalToolbar.tsx";
 
 const toolbarSource = readFileSync(new URL("./TerminalToolbar.tsx", import.meta.url), "utf8");
 
@@ -68,6 +68,21 @@ test("keeps SFTP visible before the terminal overflow menu for SSH sessions", ()
   assert.ok(sftpIndex < moreIndex);
 });
 
+test("browser action remains available when an SSH terminal is disconnected", () => {
+  const disconnectedSsh = renderToolbar(sshHost, "disconnected", { onOpenBrowser: () => {} });
+  const serial = renderToolbar(serialHost, "connected", { onOpenBrowser: () => {} });
+  assert.match(disconnectedSsh, /aria-label="Open Browser"/);
+  assert.doesNotMatch(disconnectedSsh, /aria-label="Open Browser"[^>]*disabled/);
+  assert.doesNotMatch(serial, /aria-label="Open Browser"/);
+});
+
+test("browser action is available for supported local and mosh terminals", () => {
+  for (const protocol of ['local', 'mosh'] as const) {
+    const markup = renderToolbar({ ...sshHost, protocol }, "connected", { onOpenBrowser: () => {} });
+    assert.match(markup, /aria-label="Open Browser"/);
+  }
+});
+
 test("keeps Scripts visible before the terminal overflow menu", () => {
   const markup = renderToolbar(sshHost);
 
@@ -108,14 +123,14 @@ test("marks manual session log button active while logging", () => {
   );
 });
 
-test("hides SFTP for local terminal sessions", () => {
+test("shows SFTP for local terminal sessions", () => {
   const markup = renderToolbar({
     ...sshHost,
     id: "local-1",
     protocol: "local",
   });
 
-  assert.equal(markup.includes('aria-label="Open SFTP"'), false);
+  assert.equal(markup.includes('aria-label="Open SFTP"'), true);
 });
 
 test("hides SSH history for plugin terminal sessions", () => {
@@ -191,4 +206,33 @@ test("compact scripts popover hosts bulk-delete confirm outside the popover", ()
     toolbarSource.includes("document.querySelector('[data-vault-delete-confirm=\"true\"]')"),
     false,
   );
+});
+
+for (const host of [serialHost, pluginHost]) {
+  test(`hides SFTP for ${host.protocol} sessions`, () => {
+    assert.equal(renderToolbar(host).includes('aria-label="Open SFTP"'), false);
+  });
+}
+
+test('open session log stays in the overflow menu until logging is active', () => {
+  assert.equal(TERMINAL_TOOLBAR_LAYOUT_DEFAULTS.placement.openSessionLog, 'collapse');
+  const hidden = renderToolbar(sshHost, 'disconnected', { onSessionLogAction: () => {} });
+  assert.doesNotMatch(hidden, /aria-label="Open session log"/);
+  assert.doesNotMatch(hidden, /Open session log/);
+
+  for (const status of ['connected', 'disconnected'] as const) {
+    const markup = renderToolbar(sshHost, status, {
+      onSessionLogAction: () => {},
+      canOpenSessionLog: true,
+    });
+    assert.doesNotMatch(markup, /aria-label="Open session log"/);
+    assert.doesNotMatch(markup, /aria-label="Session log actions"/);
+    assert.match(markup, /aria-label="More actions"/);
+  }
+  assert.match(toolbarSource, /case 'openSessionLog':/);
+  assert.match(toolbarSource, /data-session-log-submenu="true"/);
+  assert.match(toolbarSource, /terminal\.toolbar\.sessionLog\.menu/);
+  assert.match(toolbarSource, /terminal\.toolbar\.sessionLog\.\$\{action\}/);
+  assert.equal(toolbarSource.includes('rememberApplication'), false);
+  assert.equal(toolbarSource.includes('Open session log'), false);
 });

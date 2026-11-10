@@ -1,5 +1,8 @@
+import { refreshObservedTerminalDirectory } from '../../application/state/terminalDirectoryRegistry';
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps */
 import { useRef } from 'react';
+import { publishTerminalSelectionTarget } from '../../infrastructure/plugins/terminalSelectionRegistry';
+import type { TerminalSettings } from '../../types';
 import { publishPluginTerminalRuntimeLifecycleEvent } from '../../application/state/pluginTerminalRuntimeLifecycle';
 import { markTerminalCommandCompletionPending } from './runtime/promptLineBreak';
 import { loadInlineImageAddon } from './runtime/inlineImageAddon';
@@ -7,6 +10,7 @@ import { resolveFontWeightBold } from '../../lib/fontWeightAvailability';
 import { bundledFamiliesInStack } from '../../lib/fontAvailability';
 import { isMacPlatform } from '../../lib/utils';
 import { resolveXTermScrollback } from '../../infrastructure/config/xtermPerformance';
+import { terminalFontLigaturesEnabled } from './runtime/terminalFontLigatures';
 import {
   createMacOptionForcedSelectionMouseEvent,
   createRightClickMouseTrackingPressClaim,
@@ -24,7 +28,12 @@ import {
   resolveTerminalHibernateEnabledForProtocol,
 } from '../../domain/terminalHibernate';
 import { setTerminalBootEpoch } from '../../domain/terminalBootEpoch';
-import { applyUserCursorBlinkPreference } from './runtime/cursorPreference';
+import { hostRestrictsExtraSshChannels } from '../../domain/host';
+import {
+  applyUserCursorBlinkPreference,
+  snapshotUserCursorPreference,
+  type CursorPreferenceSnapshot,
+} from './runtime/cursorPreference';
 import { resolveCursorLineHighlightBackground } from '../../domain/cursorLineHighlight';
 import { getFlowControllerForTerm } from './runtime/terminalSessionAttachment';
 import {
@@ -57,12 +66,10 @@ import {
   isTerminalCloseGenerationCurrent,
   resolveConnectionLogCapturePayload,
   scheduleTerminalCloseTeardown,
+  scheduleTerminalCloseForGeneration,
   serializeTerminalCloseFallback,
 } from './runtime/terminalCloseCapture';
-import {
-  CONNECTION_PROGRESS_START,
-  advanceIndeterminateConnectionProgress,
-} from './connectionProgress';
+import { CONNECTION_PROGRESS_START } from './connectionProgress';
 import {
   getConnectionTimeoutMs,
   resolveActiveConnectionTimeoutHost,
@@ -73,6 +80,39 @@ import { resolveEffectiveTerminalProtocol } from '../../domain/terminalProtocol'
 import { isPluginHostProtocol } from '../../domain/pluginConnection';
 
 type TerminalEffectsContext = Record<string, any>;
+
+type CursorPreferenceRuntimeRefs = {
+  termRef: { current: any };
+  previousCursorPreferenceRef: { current: CursorPreferenceSnapshot | null };
+};
+
+export const publishTerminalRuntimeCursorPreference = (
+  { termRef, previousCursorPreferenceRef }: CursorPreferenceRuntimeRefs,
+  term: any,
+  terminalSettings: TerminalSettings | undefined,
+): void => {
+  termRef.current = term;
+  previousCursorPreferenceRef.current = snapshotUserCursorPreference(terminalSettings);
+};
+
+export const applyTerminalCursorPreferenceUpdate = (
+  { termRef, previousCursorPreferenceRef }: CursorPreferenceRuntimeRefs,
+  terminalSettings: TerminalSettings | undefined,
+  applyUserCursorPreference: TerminalEffectsContext["applyUserCursorPreference"],
+  applyUserCursorWidthPreference: TerminalEffectsContext["applyUserCursorWidthPreference"],
+  shouldApplyUserCursorPreference: TerminalEffectsContext["shouldApplyUserCursorPreference"],
+): void => {
+  const term = termRef.current;
+  if (!term || !terminalSettings) return;
+
+  const cursorPreference = snapshotUserCursorPreference(terminalSettings);
+  if (shouldApplyUserCursorPreference(previousCursorPreferenceRef.current, cursorPreference)) {
+    applyUserCursorPreference(term, terminalSettings);
+  } else {
+    applyUserCursorWidthPreference(term, terminalSettings);
+  }
+  previousCursorPreferenceRef.current = cursorPreference;
+};
 
 type SelectionOverlayPosition = {
   left: number;
@@ -174,7 +214,9 @@ export function resolveSelectionOverlayPosition(term: any, container: HTMLElemen
 }
 
 export function useTerminalEffects(ctx: TerminalEffectsContext) {
-  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, autocompleteRepositionRef, captureTerminalLogData, chainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef, onPluginRuntimeCwdChange, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRules, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setTimeLeft, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalOutputHistory, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState, vaultInitialized } = ctx;
+  const { CONNECTION_TIMEOUT, Error, XTERM_PERFORMANCE_CONFIG, applyUserCursorPreference, applyUserCursorWidthPreference, shouldApplyUserCursorPreference, auth, autocompleteCloseRef, autocompleteInputRef, autocompleteKeyEventRef, autocompleteRepositionRef, captureTerminalLogData, chainHosts, chainProgress, clearTerminalCwd, commandBufferRef, connectionLogBufferRef, containerRef, createPromptLineBreakState, createReplaySafeTerminalLogSanitizer, createXTermRuntime, deferTerminalResizeRef, disableTerminalFontZoomRef, effectiveFontSize, effectiveFontWeight, effectiveTheme, error, executeSnippetCommand, finalizeTerminalLogData, fitAddonRef, fontFamilyId, fontSize, fontWeightFixupDoneRef, forceCloseHibernatedSession, forceSyncRenderAfterResize, handleOsc52ReadRequest, handleTerminalDataCaptureOnce, hasConnectedRef, hasRuntimeRef, host, hotkeySchemeRef, hibernatedRef, identities, inWorkspace, isBootActiveRef, bootEpochRef, isBroadcastEnabledRef, broadcastPasswordBypassRef, isComposeBarOpen, isConnectionAwaitingUserInput, isConnectionPastTcpDial, isFocusMode, isFocused, isLocalConnection, isNetworkDevice, isResizing, isRestoringSelectionRef, isSearchOpen, isSerialConnection, isVisible, isVisibleRef, keyBindingsRef, keys, kittyKeyboardProtocolEnabledForSession, knownCwdRef, lastFittedSizeRef, lastToastedErrorRef, logger, mouseTrackingRef, needsHostKeyVerification, onBroadcastInputRef, onBroadcastInterruptPriorityChange, onCommandExecuted, onCommandSubmitted, onHotkeyActionRef, onOpenExternalError, onOutputTriggerUserInputRef, onPluginRuntimeCwdChange, onSnippetExecutorChange, onTerminalCwdChange, onTerminalTitleChange, onTerminalBell, onTerminalFontSizeChange, paneLayoutKey, passwordPromptActiveRef, pendingAuthRef, pendingOutputScrollRef, pluginDecorationRules, pluginTerminalLifecycle, pluginTerminalProviderRevision, isPluginTerminalProviderAvailable, requestPluginTerminalProviders, prepareRestoredReconnect, prepareInitialCwdIntent, prevIsResizingRef, promptLineBreakStateRef, resizeSession, resolveHostAuth, resolvedFontFamily, safeFit, scriptRecorderRef, searchAddonRef, serialConfig, serialLineBufferRef, serializeAddonRef, sessionId, sessionRef, sessionStarters, setError, setHasMouseTracking, setIsCancelling, setIsDisconnectedDialogDismissed, requestSearchFocus, setNeedsHostKeyVerification, setPendingHostKeyInfo, setPendingHostKeyRequestId, setProgressLogs, setProgressValue, setShowLogs, setStatus, setConnectionDeadlineAt, shouldEnableNativeUserInputAutoScroll, shouldProbeSessionCwd, shouldStartTerminalBackend, attachExistingSession, attachAuthorization, attachHomeWebContentsIdRef, onSnippetShortkeyRef, snippetsRef, splitResizeActive, status, statusRef, sudoAutofillRef, t, teardown, telnetLocalEchoRef, termRef, terminalAltKeyOptions, terminalBackend, terminalContextActionsRef, terminalCwdTracker, terminalDataCapturedRef, terminalLogSanitizerRef, terminalOutputHistory, terminalSettings, terminalSettingsRef, terminalTitleRef, toHostKeyInfo, toast, updateStatus, useEffect, useLayoutEffect, xtermRuntimeRef, zmodem, zmodemToastedRef, restoreState, vaultInitialized } = ctx;
+  const archiveHostRef = useRef(host);
+  archiveHostRef.current = host;
   const effectiveTerminalProtocol = resolveEffectiveTerminalProtocol(host);
   const hibernateHiddenTabs = resolveTerminalHibernateEnabledForProtocol(
     terminalSettings,
@@ -182,6 +224,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
   ) && !kittyKeyboardProtocolEnabledForSession;
   ctx.pluginDecorationRulesRef.current = pluginDecorationRules;
   const prevIsSearchOpenRef = useRef(isSearchOpen);
+  const previousCursorPreferenceRef = useRef<ReturnType<typeof snapshotUserCursorPreference> | null>(null);
   const isFocusedRef = useRef(!!isFocused);
   isFocusedRef.current = !!isFocused;
   const pluginAwareOnCommandSubmitted = (...args: Parameters<NonNullable<typeof onCommandSubmitted>>) => {
@@ -189,9 +232,22 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     publishPluginTerminalRuntimeLifecycleEvent(pluginTerminalLifecycle, 'commandSubmitted');
     void xtermRuntimeRef.current?.pluginProviderHost?.commandSubmitted(args[0]);
   };
+  // The xterm runtime captures this callback at boot. Read the latest layer
+  // handler through a ref so a prompt-return refresh sees the current
+  // restore-cwd setting (#1952).
+  const onCommandSettledRef = useRef(ctx.onCommandSettled);
+  onCommandSettledRef.current = ctx.onCommandSettled;
   const pluginAwareOnCommandCompleted = () => {
     publishPluginTerminalRuntimeLifecycleEvent(pluginTerminalLifecycle, 'commandCompleted');
+    refreshObservedTerminalDirectory(sessionId);
     void xtermRuntimeRef.current?.pluginProviderHost?.commandCompleted();
+    // Stock local shells update cwd when the command finishes, which can be
+    // long after the 150ms post-submit probe. Prompt return (and OSC 133)
+    // already call this hook; re-run the probe then. Empty command text keeps
+    // coding-CLI detection from treating the refresh as a new launch.
+    if (isLocalConnection) {
+      onCommandSettledRef.current?.("", host.id, host.label, sessionId);
+    }
   };
   const isRendererActive = isVisible || !hibernateHiddenTabs;
   const isRendererActiveRef = useRef(isRendererActive);
@@ -333,7 +389,11 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
         // SSH banner, which is captured for free at handshake time.
         const info = await terminalBackend.getSessionRemoteInfo?.(id);
         if (cancelled || id !== sessionRef.current) return;
-        if (!shouldProbeSessionCwd({ isNetworkDevice, remoteSshVersion: info?.remoteSshVersion })) {
+        if (!shouldProbeSessionCwd({
+          isNetworkDevice,
+          remoteSshVersion: info?.remoteSshVersion,
+          restrictExtraSshChannels: hostRestrictsExtraSshChannels(host),
+        })) {
           return;
         }
         const result = await terminalBackend.getSessionPwd(id);
@@ -457,6 +517,8 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
         serializeAddonRef.current = null;
         searchAddonRef.current = null;
         hasRuntimeRef.current = false;
+        previousCursorPreferenceRef.current = null;
+        publishTerminalSelectionTarget();
       }
       try {
         runtime.dispose();
@@ -477,6 +539,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
         const runtime = createXTermRuntime({
           container: containerRef.current,
           host,
+          getHost: () => archiveHostRef.current,
           fontFamilyId,
           resolvedFontFamily,
           fontSize,
@@ -493,6 +556,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           onOpenExternalError,
           isBroadcastEnabledRef,
           onBroadcastInputRef,
+          broadcastPasswordBypassRef,
           snippetsRef,
           onSnippetShortkeyRef,
           sessionId,
@@ -518,6 +582,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           promptLineBreakStateRef,
           scriptRecorderRef,
           passwordPromptActiveRef,
+          isPromptSecurityAlternateScreenActive: ctx.isPromptSecurityAlternateScreenActive,
           allowHostStyleGreaterThanPrompt: isNetworkDevice,
           onOutputTriggerUserInputRef,
           sudoAutofillRef,
@@ -525,6 +590,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           // Serial-specific options
           serialLocalEcho: serialConfig?.localEcho,
           serialLineMode: serialConfig?.lineMode,
+          serialByteOrientedBackspace: serialConfig?.byteOrientedBackspace ?? false,
           serialLineBufferRef,
           telnetLocalEchoRef,
           onTerminalLogData: captureTerminalLogData,
@@ -564,6 +630,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           // Defer WebGL context creation for panes that mount hidden (e.g. the
           // background tabs of a batch connect) until they first become visible.
           initiallyVisible: isRendererActive,
+          isPaneVisibleRef: isVisibleRef,
         });
 
         if (disposed) {
@@ -573,11 +640,19 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
         ownedRuntime = runtime;
         xtermRuntimeRef.current = runtime;
-        termRef.current = runtime.term;
+        publishTerminalRuntimeCursorPreference(
+          { termRef, previousCursorPreferenceRef },
+          runtime.term,
+          terminalSettingsRef.current,
+        );
         fitAddonRef.current = runtime.fitAddon;
         serializeAddonRef.current = runtime.serializeAddon;
         searchAddonRef.current = runtime.searchAddon;
         hasRuntimeRef.current = true;
+        publishTerminalSelectionTarget();
+        // Runtime construction already applied the current cursor shape and blink
+        // settings. Publishing records that snapshot so a first width-only update
+        // cannot clear a DEC/vi cursor-style override emitted after boot.
         // xterm boots asynchronously; ResizeObserver may have already run without
         // fitAddon and will not re-attach until isVisible/isResizing changes.
         initialFitTimer = setTimeout(() => {
@@ -651,11 +726,18 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
             if (!snap?.success) {
               throw new Error(snap?.error || "Failed to capture terminal snapshot");
             }
+            // Restore the active connection policy before the attached session
+            // accepts input. Saved host changes still require a reconnect.
+            if (typeof snap.perCharacterInput === "boolean") {
+              runtime.restorePerCharacterInput(snap.perCharacterInput);
+            }
             if (typeof snap.kittyKeyboardProtocolEnabled === "boolean") {
               runtime.setKittyKeyboardProtocolEnabled(snap.kittyKeyboardProtocolEnabled);
             }
             if (typeof snap.passwordPromptActive === "boolean") {
               passwordPromptActiveRef.current = snap.passwordPromptActive;
+              // Same conservative restore as the home apply-snapshot path.
+              if (snap.passwordPromptActive) passwordPromptActiveRef.source = "explicit";
             }
             if (snap.cwd !== undefined) {
               const cwd = terminalCwdTracker.setRendererCwd(snap.cwd, "snapshot");
@@ -851,42 +933,60 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       bootAbort.abort();
       isBootActiveRef.current = false;
       if (hibernatedRef?.current) {
-        forceCloseHibernatedSession?.();
-        disposeOwnedRuntime();
+        const pendingClose = forceCloseHibernatedSession?.() as void | Promise<void>;
+        if (pendingClose && typeof pendingClose.then === "function") {
+          void pendingClose.finally(() => {
+            disposeOwnedRuntime();
+          });
+        } else {
+          disposeOwnedRuntime();
+        }
         return;
       }
 
       // A boot that never reached "connected" has nothing worth capturing, and
       // the teardown below awaits terminal drain plus serialization before it
-      // closes anything. Tell the main process now so it can abort the pending
-      // boot (passphrase prompt, TCP dial) for this epoch instead of letting it
+      // closes anything. Cancel the pending backend boot after giving an immediate
+      // remount a chance to replace this generation, instead of letting it
       // finish against a pane that is already gone. Attached popups never own
       // the backend session (skip closeSession) but still sync-dispose xterm.
       if (!hasConnectedRef.current) {
         if (!attachExistingSession) {
-          try {
-            const closeResult = terminalBackend.closeSession(
-              sessionRef.current ?? sessionId,
-              { bootEpoch: bootEpochRef ? bootEpochRef.current : undefined },
-            );
-            void Promise.resolve(closeResult).catch((err: unknown) => {
+          const closingBootEpoch = bootEpochRef ? bootEpochRef.current : undefined;
+          // StrictMode can remount this pane before a backend boot starts.
+          // Abort/dispose immediately, but do not report that remount as a tab close.
+          scheduleTerminalCloseForGeneration(closeGeneration, () => terminalBootCloseGenerationRef.current, () => {
+            try {
+              const closeResult = terminalBackend.closeSession(
+                sessionRef.current ?? sessionId,
+                { bootEpoch: closingBootEpoch },
+              );
+              void Promise.resolve(closeResult).catch((err: unknown) => {
+                logger.warn("Failed to cancel pending terminal boot on unmount", err);
+              });
+            } catch (err) {
               logger.warn("Failed to cancel pending terminal boot on unmount", err);
-            });
-          } catch (err) {
-            logger.warn("Failed to cancel pending terminal boot on unmount", err);
-          }
+            }
+          });
         }
         disposeOwnedRuntime();
         return;
       }
 
-      const persistCloseCapture = (data: string, source: string, dataLength: number) => {
+      const persistCloseCapture = async (data: string, source: string, dataLength: number) => {
         logger.info("[Terminal] Capturing data on unmount", {
           sessionId,
           source,
           dataLength,
         });
-        handleTerminalDataCaptureOnce(sessionId, data, { finalized: true });
+        const pendingCapture: unknown = handleTerminalDataCaptureOnce(sessionId, data, { finalized: true });
+        if (
+          pendingCapture !== undefined
+          && pendingCapture !== null
+          && typeof (pendingCapture as Promise<void>).then === "function"
+        ) {
+          await (pendingCapture as Promise<void>);
+        }
       };
 
       const term = termRef.current;
@@ -925,7 +1025,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
           ? resolveConnectionLogCapturePayload(finalizeTerminalLogData)
           : null;
         if (connectionLogPayload) {
-          persistCloseCapture(
+          await persistCloseCapture(
             connectionLogPayload.data,
             connectionLogPayload.source,
             connectionLogPayload.data.length,
@@ -952,7 +1052,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
               return;
             }
             if (payload) {
-              persistCloseCapture(payload.data, payload.source, payload.data.length);
+              await persistCloseCapture(payload.data, payload.source, payload.data.length);
             }
             ownedRuntime = null;
             scheduleTerminalCloseTeardown(teardown);
@@ -1021,10 +1121,11 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       tcpConnectTimeoutMs: hostConnectionTimeouts.tcpConnectTimeoutSeconds * 1000,
       authReadyTimeoutMs: hostConnectionTimeouts.authReadyTimeoutSeconds * 1000,
     }) || CONNECTION_TIMEOUT;
-    setTimeLeft(connectionTimeout / 1000);
-    const countdown = setInterval(() => {
-      setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
-    }, 1000);
+    // Publish only the deadline: the connection dialog animates the
+    // indeterminate progress and counts down locally (connectionTicker.ts).
+    // Ticking 200 ms / 1 s intervals here re-rendered Terminal + TerminalView
+    // ~6 times a second per connecting session, hidden tabs included.
+    setConnectionDeadlineAt(Date.now() + connectionTimeout);
 
     const timeout = setTimeout(() => {
       setError("Connection timed out. Please try again.");
@@ -1032,14 +1133,9 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       setProgressLogs((prev) => [...prev, "Connection timed out."]);
     }, connectionTimeout);
 
-    const prog = setInterval(() => {
-      setProgressValue(advanceIndeterminateConnectionProgress);
-    }, 200);
-
     return () => {
-      clearInterval(countdown);
       clearTimeout(timeout);
-      clearInterval(prog);
+      setConnectionDeadlineAt(null);
     };
      
   }, [status, auth.needsAuth, host.protocol, host.hostname, host.moshEnabled, host.etEnabled, host.sshTcpConnectTimeoutSeconds, host.sshAuthReadyTimeoutSeconds, chainHosts, chainProgress?.currentHop, chainProgress?.connectionPhase, isLocalConnection, isSerialConnection, needsHostKeyVerification, isConnectionAwaitingUserInput, isConnectionPastTcpDial]);
@@ -1053,7 +1149,7 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
   }, [status]);
 
 
-  const effectiveThemeKey = `${effectiveTheme.id}:${effectiveTheme.colors.background}:${effectiveTheme.colors.foreground}:${effectiveTheme.colors.cursor}`;
+  const effectiveThemeKey = `${effectiveTheme.id}:${effectiveTheme.colors.background}:${effectiveTheme.colors.foreground}:${effectiveTheme.colors.foregroundIntense ?? ""}:${effectiveTheme.colors.cursor}`;
 
   // Sync xterm theme before browser paint; apply synchronously on visible panes.
   useLayoutEffect(() => {
@@ -1096,7 +1192,14 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     termRef.current.options.fontFamily = resolvedFontFamily;
 
     if (terminalSettings) {
-      applyUserCursorPreference(termRef.current, terminalSettings);
+      // Width changes must not clear a vi/DECSCUSR cursor-style override.
+      applyTerminalCursorPreferenceUpdate(
+        { termRef, previousCursorPreferenceRef },
+        terminalSettings,
+        applyUserCursorPreference,
+        applyUserCursorWidthPreference,
+        shouldApplyUserCursorPreference,
+      );
       termRef.current.options.scrollback = resolveXTermScrollback(terminalSettings.scrollback);
       termRef.current.options.fontWeight = effectiveFontWeight as
         | 100
@@ -1141,6 +1244,9 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       termRef.current.options.altClickMovesCursor = altKeyOpts.altClickMovesCursor;
       termRef.current.options.wordSeparator = terminalSettings.wordSeparators;
       termRef.current.options.ignoreBracketedPasteMode = terminalSettings.disableBracketedPaste ?? false;
+      xtermRuntimeRef.current?.syncFontLigatures(
+        terminalFontLigaturesEnabled(terminalSettings),
+      );
     }
 
     // Changing the font can leave the WebGL renderer drawing stale glyphs from
@@ -1241,7 +1347,12 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
       applyUserCursorBlinkPreference(term, terminalSettingsRef.current);
       if (hasOpenAppDialog()) return;
       term.focus();
-      scheduleLayoutRecoveryRefit([0, 100]);
+      // Tab focus retries do not imply a lost renderer or a changed layout.
+      // Leave explicit app-resume/fullscreen recovery timers untouched when
+      // these bounds are already fitted, or recovery is still settling.
+      if (!currentContainerSizeAlreadyFit() && layoutRecoveryTimersRef.current.length === 0) {
+        scheduleLayoutRecoveryRefit([0, 100]);
+      }
     };
 
     window.addEventListener(TERMINAL_SESSION_RESTORE_FOCUS_EVENT, handleRestoreFocus);
@@ -1311,12 +1422,18 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
   const recoverTerminalAfterBecomeVisible = () => {
     flushTerminalWritesAfterBecomeVisible();
+    // A hidden pane can become visible before its asynchronous boot completes.
+    // Do not claim recovery until there is a runtime for the delayed pass to use.
+    if (!termRef.current || !xtermRuntimeRef.current) return;
 
     if (
       getHiddenDurationMs() < CSS_ONLY_TAB_REVEAL_MAX_HIDDEN_MS
       && currentContainerSizeAlreadyFit()
     ) {
       lastWebglRecoveryLayoutKeyRef.current = paneLayoutKey;
+      // Even a short hide can cost the renderer: Chromium reclaims a hidden
+      // pane's WebGL context when it runs short. No-op while it is still live.
+      xtermRuntimeRef.current?.ensureWebglRenderer();
       flushPendingOutputScroll();
       commitVisibleLayout();
       return;
@@ -1340,6 +1457,12 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     commitVisibleLayout();
     scheduleLayoutRecoveryRefit([100, 350]);
   };
+
+  // Lets the WebGL context budget note when this pane was hidden, so a pane
+  // that stays hidden can give its renderer up while the budget is over.
+  useLayoutEffect(() => {
+    xtermRuntimeRef.current?.syncPaneVisibility();
+  }, [isVisible]);
 
   // Refit synchronously when a split pane becomes visible or its bounds change.
   // Tab switches hide inactive panes without resizing xterm; becoming visible
@@ -1387,20 +1510,17 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
   useEffect(() => {
     if (!isVisible) return;
 
-    const hiddenMs = hiddenAtRef.current
-      ? Date.now() - hiddenAtRef.current
-      : Number.POSITIVE_INFINITY;
     hiddenAtRef.current = null;
 
-    if (
-      lastWebglRecoveryLayoutKeyRef.current === paneLayoutKey
-      && hiddenMs < CSS_ONLY_TAB_REVEAL_MAX_HIDDEN_MS
-    ) {
+    // The layout effect already recovers long hides as well as short ones.
+    // Repeating it here discards the freshly populated, potentially shared atlas.
+    if (lastWebglRecoveryLayoutKeyRef.current === paneLayoutKey) {
       flushPendingOutputScroll();
       return;
     }
 
     const timer = setTimeout(() => {
+      if (!isVisibleRef.current || !termRef.current || !xtermRuntimeRef.current) return;
       lastWebglRecoveryLayoutKeyRef.current = paneLayoutKey;
       // A pane that mounted hidden deferred its WebGL renderer; create it now
       // that it's visible (no-op if already active or WebGL is disabled).
@@ -1611,14 +1731,16 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
     // Fit twice: once after initial layout (100ms) and again after layout settles
     // (350ms) to handle race conditions during split operations where the container
     // dimensions may not be final on the first pass.
-    const timer1 = setTimeout(() => {
+    const refitSettledLayout = () => {
+      // Keep checking for late split/layout changes, but an unchanged tab does
+      // not need another forced fit (which clears its glyph atlas even when
+      // the row/column count is unchanged).
+      if (!isVisibleRef.current || currentContainerSizeAlreadyFit()) return;
       safeFit({ requireVisible: true });
       finishLayoutRecoveryAfterFit();
-    }, 100);
-    const timer2 = setTimeout(() => {
-      safeFit({ force: true, requireVisible: true });
-      finishLayoutRecoveryAfterFit();
-    }, 350);
+    };
+    const timer1 = setTimeout(refitSettledLayout, 100);
+    const timer2 = setTimeout(refitSettledLayout, 350);
     return () => { clearTimeout(timer1); clearTimeout(timer2); };
   }, [inWorkspace, isVisible]);
 

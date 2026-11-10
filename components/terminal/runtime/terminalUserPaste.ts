@@ -1,5 +1,7 @@
 import type { Terminal as XTerm } from "@xterm/xterm";
 
+import { sanitizeTerminalInput } from "./terminalInputSanitize";
+
 type PasteTarget = Pick<XTerm, "paste" | "scrollToBottom"> &
   Partial<Pick<XTerm, "cols" | "rows" | "write">> & {
     modes?: { bracketedPasteMode?: boolean };
@@ -9,7 +11,15 @@ type PasteTarget = Pick<XTerm, "paste" | "scrollToBottom"> &
 type PasteOptions = {
   scrollOnPaste?: boolean;
   requestAnimationFrame?: (callback: () => void) => unknown;
-  onPasteData?: (data: string) => boolean | void;
+  onPasteData?: (data: string, options?: { sensitive?: boolean }) => boolean | void;
+  /**
+   * Pre-computed sensitivity for this paste. When true, the terminal input
+   * handler must treat the pasted bytes as sensitive even if its live
+   * password-prompt ref was cleared while a confirmation dialog was open
+   * (the dialog await can outlive the prompt flag). The override only
+   * applies to the pasted data itself and is consumed as it arrives.
+   */
+  sensitive?: boolean;
 };
 
 type BroadcastUserInputOptions = {
@@ -22,6 +32,8 @@ type PasteDisplayState = {
   clearPending: number;
   pasteEchoFragments: string[];
   inPasteEchoActiveRegion: boolean;
+  // Buffer type observed while preparing this chunk, before xterm applies it.
+  preparedOnAlternateScreen: boolean;
 };
 
 type PasteInputScrollState = {
@@ -38,6 +50,26 @@ type TerminalProtocolReplyState = {
 const pasteDisplayStates = new WeakMap<object, PasteDisplayState>();
 const pasteInputScrollStates = new WeakMap<object, PasteInputScrollState>();
 const pasteBroadcastStates = new WeakMap<object, PasteInputScrollState>();
+const pasteSensitiveStates = new WeakMap<object, PasteInputScrollState>();
+type LinePasteOptions = { lineDelayMs: number; sensitive: boolean; broadcast?: boolean };
+type LinePasteHandler = (data: string, options: LinePasteOptions) => void;
+const linePasteHandlers = new WeakMap<object, LinePasteHandler>();
+
+/** Preserve pending input and local echo before scheduling delayed writes. */
+export function registerTerminalLinePasteHandler(term: object, handler: LinePasteHandler): () => void {
+  linePasteHandlers.set(term, handler);
+  return () => {
+    if (linePasteHandlers.get(term) === handler) linePasteHandlers.delete(term);
+  };
+}
+
+export function dispatchTerminalLinePaste(term: object, data: string, options: LinePasteOptions): boolean {
+  const handler = linePasteHandlers.get(term);
+  if (!handler) return false;
+  handler(data, options);
+  return true;
+}
+
 const terminalProtocolReplyStates = new WeakMap<object, TerminalProtocolReplyState>();
 const LONG_PASTE_MIN_LENGTH = 200;
 const PASTE_DISPLAY_FIX_WINDOW_MS = 4000;
@@ -298,6 +330,7 @@ export function pasteTextIntoTerminal(
       clearPending: 0,
       pasteEchoFragments: getPasteEchoFragments(text),
       inPasteEchoActiveRegion: false,
+      preparedOnAlternateScreen: false,
     });
   }
 
@@ -312,7 +345,13 @@ export function pasteTextIntoTerminal(
 
   if (options.onPasteData) {
     const pasteData = getPasteInputData(term, text);
-    const didBroadcast = options.onPasteData(pasteData) === true;
+    // Forward the pre-dialog sensitivity snapshot (#3491): the broadcast
+    // callback re-reads the live password-prompt ref, which the confirm
+    // dialog await may have cleared, so the saved classification must ride
+    // along to keep the peer fan-out tagged sourceSensitive.
+    const didBroadcast = options.onPasteData(pasteData, {
+      sensitive: options.sensitive === true,
+    }) === true;
     if (didBroadcast) {
       pasteBroadcastStates.set(term, {
         expiresAt: getNow() + PASTE_INPUT_SCROLL_WINDOW_MS,
@@ -323,6 +362,25 @@ export function pasteTextIntoTerminal(
     }
   } else {
     pasteBroadcastStates.delete(term);
+  }
+
+  // Carry the pre-dialog sensitivity snapshot through term.paste so the
+  // input handler writes / records this paste as sensitive even when the
+  // live password-prompt ref has been cleared while the confirm dialog was
+  // open. The state is consumed chunk-by-chunk like the scroll/broadcast
+  // states so it never leaks to later, unrelated input.
+  if (options.sensitive === true) {
+    // The input handler sanitizes chunk data (stripping zero-width /
+    // invisible characters such as U+200B or a BOM) before consulting this
+    // override, so the stored variants must be sanitized equivalently or a
+    // paste containing such characters would never match and could be
+    // broadcast / recorded as nonsensitive.
+    pasteSensitiveStates.set(term, {
+      expiresAt: getNow() + PASTE_INPUT_SCROLL_WINDOW_MS,
+      remainingDataVariants: getPasteInputDataVariants(sanitizeTerminalInput(text)),
+    });
+  } else {
+    pasteSensitiveStates.delete(term);
   }
 
   term.paste(text);
@@ -349,6 +407,18 @@ export function shouldSuppressTerminalInputScrollForUserPaste(term: object, data
 
 export function shouldSuppressTerminalBroadcastForUserPaste(term: object, data: string): boolean {
   return consumePasteInputState(pasteBroadcastStates, term, data);
+}
+
+/**
+ * True when the given input chunk belongs to a programmatic paste that was
+ * flagged sensitive before a confirm-dialog await (see PasteOptions.sensitive).
+ * Consumes the override state so it applies only to the flagged paste data.
+ */
+export function shouldOverrideTerminalUserPasteSensitivity(
+  term: object,
+  data: string,
+): boolean {
+  return consumePasteInputState(pasteSensitiveStates, term, data);
 }
 
 export function markExpectedTerminalCursorPositionReport(term: object): void {
@@ -454,9 +524,16 @@ function consumePasteInputState(
   return true;
 }
 
+const isAlternateScreenBuffer = (term: object): boolean =>
+  (term as { buffer?: { active?: { type?: string } } }).buffer?.active?.type === "alternate";
+
 export function prepareTerminalDataForUserPasteDisplay(term: object, data: string): string {
   const state = pasteDisplayStates.get(term);
   if (!isStateActive(state)) return data;
+
+  // Captured before term.write. The residual check runs in the write callback,
+  // after a same-batch ESC[?1049l has already restored the normal buffer.
+  state.preparedOnAlternateScreen = isAlternateScreenBuffer(term);
 
   const strippedActiveRegion = stripMatchedReadlineActiveRegion(data, state);
   if (strippedActiveRegion.matched) {
@@ -474,6 +551,16 @@ export function prepareTerminalDataForUserPasteDisplay(term: object, data: strin
 export function clearPasteResidualAfterTerminalWrite(term: object): string | null {
   const state = pasteDisplayStates.get(term);
   if (!isStateActive(state)) return null;
+  // Vim and other alternate-screen apps often end a paste chunk with the cursor
+  // mid-line. EL would erase the rest of that row, and the app may not redraw it (#3166).
+  // Drop the pending clear so it cannot fire after returning to the normal screen.
+  // preparedOnAlternateScreen covers a same-batch exit: buffer.active is already
+  // normal when this write callback runs.
+  if (state.preparedOnAlternateScreen || isAlternateScreenBuffer(term)) {
+    state.preparedOnAlternateScreen = false;
+    state.clearPending = 0;
+    return null;
+  }
   if (state.clearPending <= 0) return null;
   if (typeof (term as Partial<Pick<XTerm, "write">>).write !== "function") return null;
 

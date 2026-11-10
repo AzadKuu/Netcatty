@@ -5,13 +5,17 @@
 import { Loader2, Play } from 'lucide-react';
 import React from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
+import { useConnectionCountdownSeconds } from './connectionTicker';
 import { Button } from '../ui/button';
 import { ScrollArea } from '../ui/scroll-area';
 
 export interface TerminalConnectionProgressProps {
     status: 'connecting' | 'connected' | 'disconnected';
     error: string | null;
+    /** Seconds shown before a deadline is known; also used as-is when `deadlineAt` is omitted. */
     timeLeft: number;
+    /** Connection timeout deadline (epoch ms). When provided, counts down locally. */
+    deadlineAt?: number | null;
     isAwaitingUserInput?: boolean;
     showEnterReconnectHint?: boolean;
     isCancelling: boolean;
@@ -21,6 +25,7 @@ export interface TerminalConnectionProgressProps {
     onCloseSession: () => void;
     onRetry?: () => void;
     reconnectLabel?: string;
+    closeLabel?: string;
 }
 
 export interface TerminalConnectionLogListProps {
@@ -55,7 +60,8 @@ export const TerminalConnectionLogList: React.FC<TerminalConnectionLogListProps>
 export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProps> = ({
     status,
     error,
-    timeLeft,
+    timeLeft: timeLeftProp,
+    deadlineAt,
     isAwaitingUserInput = false,
     showEnterReconnectHint = false,
     isCancelling: _isCancelling,
@@ -65,8 +71,11 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
     onCloseSession,
     onRetry,
     reconnectLabel,
+    closeLabel,
 }) => {
     const { t } = useI18n();
+    const countdownSeconds = useConnectionCountdownSeconds(deadlineAt ?? null, timeLeftProp);
+    const timeLeft = deadlineAt === undefined ? timeLeftProp : countdownSeconds;
 
     return (
         <>
@@ -79,6 +88,13 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
                                 {isAwaitingUserInput
                                     ? t('terminal.progress.waitingForUserInput')
                                     : t('terminal.progress.timeoutIn', { seconds: timeLeft })}
+                            </span>
+                        </>
+                    ) : status === 'connected' ? (
+                        <>
+                            <div className="mt-[0.4rem] h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-500" />
+                            <span className="min-w-0 whitespace-pre-wrap break-words leading-5 text-emerald-500">
+                                {t('terminal.progress.connected')}
                             </span>
                         </>
                     ) : (
@@ -105,7 +121,7 @@ export const TerminalConnectionProgress: React.FC<TerminalConnectionProgressProp
                     )}
                     <div className="ml-auto flex shrink-0 justify-end gap-2">
                         <Button variant="ghost" size="sm" className="h-7 px-3 text-[11px]" onClick={onCloseSession}>
-                            {t('terminal.toolbar.closeSession')}
+                            {closeLabel ?? t('terminal.toolbar.closeSession')}
                         </Button>
                         {onRetry && (
                             <Button size="sm" className="h-7 px-3 text-[11px]" onClick={onRetry}>

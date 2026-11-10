@@ -79,6 +79,7 @@ import { localStorageAdapter } from "../../../infrastructure/persistence/localSt
 import { STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY } from "../../../infrastructure/config/storageKeys";
 import { sftpTransferCenterStore } from "../sftpTransferCenterStore";
 import { editorTabStore } from "../editorTabStore";
+import { notifyEditorWindowSessionRemap } from "../editorWindowClient";
 import {
   resolveUploadStreamTargetSftpId,
 } from "../../../domain/sftpDedicatedStreamPolicy";
@@ -200,8 +201,8 @@ export const useSftpExternalOperations = (
     return { sftpId, release: () => {} };
   }, [ensureRemoteSftpId, getActivePane, getPaneByConnectionId, getPaneByTabId, getSideByTabId, sftpSessionsRef]);
 
-  const registerUploadController = useCallback((taskId: string, controller: UploadController) => {
-    registerExternalUploadController(taskId, controller);
+  const registerUploadController = useCallback((taskId: string, controller: UploadController, scope: "file" | "batch" = "batch") => {
+    registerExternalUploadController(taskId, controller, scope);
   }, []);
 
   const unregisterUploadController = useCallback((controller: UploadController) => {
@@ -221,7 +222,7 @@ export const useSftpExternalOperations = (
       callbacks.onScanningProgress?.(taskId, progress);
     },
     onTaskCreated: (task) => {
-      registerUploadController(task.id, controller);
+      registerUploadController(task.id, controller, !task.isDirectory && !task.parentTaskId ? "file" : "batch");
       if (task.parentTaskId) {
         registerUploadController(task.parentTaskId, controller);
       }
@@ -443,6 +444,7 @@ export const useSftpExternalOperations = (
 
       if (liveConnectionId !== connectionId) {
         editorTabStore.remapSessionId(connectionId, liveConnectionId);
+        notifyEditorWindowSessionRemap(connectionId, liveConnectionId);
       }
 
       const bridge = netcattyBridge.get();

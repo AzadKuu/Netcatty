@@ -127,6 +127,12 @@ export interface SerialConfig {
   lineMode?: boolean; // Line mode - buffer input and send on Enter (default: false)
   // Store the default explicitly so an open/restored session keeps its launch-time behavior.
   backspaceBehavior?: 'default' | 'ctrl-h';
+  // Byte-oriented backspace: when explicitly enabled, a Backspace deletes the
+  // whole multi-byte character by sending one DEL per wire byte (correct for
+  // MCUs/routers that remove bytes).  Set to false for character-aware line
+  // editors (e.g. a Linux console with readline) where one DEL already
+  // removes a whole character and repeating it would over-delete.
+  byteOrientedBackspace?: boolean;
 }
 
 // Per-protocol configuration
@@ -151,6 +157,15 @@ export interface SftpBookmark {
 
 export type HostAuthMethod = 'auto' | 'password' | 'key' | 'certificate';
 
+/** Per-host TOTP authenticator. `uri` is an otpauth://totp URI and holds the secret. */
+export interface HostTotpConfig {
+  uri: string;
+  /** Defaults to true. False keeps the dialog fill button and skips auto-submit. */
+  autoSubmit?: boolean;
+  /** Extra RE2 regular expression matched against the KI prompt. */
+  promptPattern?: string;
+}
+
 export type HostOperatingSystem = 'linux' | 'windows' | 'macos' | 'freebsd' | 'unknown';
 export type HostOsSelection = 'auto' | HostOperatingSystem;
 
@@ -174,9 +189,16 @@ export interface Host {
   identityFileId?: string; // Reference to SSHKey
   protocol?: HostProtocol; // Default/primary protocol, including namespaced plugin protocols
   pluginConnection?: PluginConnectionConfig;
+  // SSH interactive IME/short-paste compatibility; applied on reconnect.
+  // Missing on legacy records; sanitizeHost preserves their previous behavior.
+  sshInputCompatibility?: boolean;
   // Runtime marker for in-memory-only hosts (e.g. password deep links).
   // Ephemeral hosts are never persisted to the vault or session restore.
   ephemeral?: boolean;
+  // Runtime marker for an ephemeral host cloned from a saved vault host.
+  // Those connections keep the saved host's own SSH settings. Pure temporary
+  // launches (external command lines, quick connect) leave this unset.
+  backedBySavedHost?: boolean;
   // Runtime hint for deep-link launches that target file transfer (e.g.
   // JumpServer sftp payloads): auto-open the SFTP side panel on connect.
   autoOpenSftpPanel?: boolean;
@@ -188,6 +210,9 @@ export interface Host {
   authPolicyVersion?: 1;
   // Prefer keyboard-interactive before the password method for MFA/PAM hosts.
   requiresMfa?: boolean;
+  // Optional per-host TOTP authenticator. The secret lives in `uri` and is
+  // encrypted and synced with the same path as `password`.
+  totp?: HostTotpConfig;
   // Use the local SSH agent for login. This is separate from agentForwarding,
   // which exposes the local agent to the remote host after login.
   useSshAgent?: boolean;
@@ -211,6 +236,12 @@ export interface Host {
   proxy?: string; // Deprecated: use proxyConfig instead
   proxyProfileId?: string; // Reference to reusable proxy profile
   proxyConfig?: ProxyConfig; // New structured proxy configuration
+  /**
+   * Explicit direct connection for this host. Overrides group and global
+   * proxy defaults. Absent means inherit. This is not the jump-host
+   * "Direct" choice (`hostChain`).
+   */
+  directProxy?: boolean;
   hostChain?: HostChainConfig; // New structured host chain configuration
   envVars?: string; // Deprecated: use environmentVariables instead
   environmentVariables?: EnvVar[]; // Structured environment variables
@@ -307,7 +338,8 @@ export interface Host {
   order?: number;
 }
 
-export type KeyType = 'RSA' | 'ECDSA' | 'ED25519';
+/** Software keys plus OpenSSH FIDO2 security-key types (agent + hardware only). */
+export type KeyType = 'RSA' | 'ECDSA' | 'ED25519' | 'ED25519-SK' | 'ECDSA-SK';
 type KeySource = 'generated' | 'imported' | 'reference';
 export type KeyCategory = 'key' | 'certificate' | 'identity';
 type IdentityAuthMethod = 'password' | 'key' | 'certificate';
@@ -406,6 +438,8 @@ export interface GroupNode {
 /** Default configuration for a group. Hosts in this group inherit these values when not explicitly set. */
 export interface GroupConfig {
   path: string;
+  /** Markdown notes for this group only; not inherited by hosts or subgroups. */
+  notes?: string;
   order?: number;
   username?: string;
   password?: string;
@@ -418,6 +452,7 @@ export interface GroupConfig {
   protocol?: 'ssh' | 'telnet';
   deviceType?: 'general' | 'network';
   agentForwarding?: boolean;
+  x11Forwarding?: boolean;
   proxyProfileId?: string;
   proxyConfig?: ProxyConfig;
   hostChain?: HostChainConfig;

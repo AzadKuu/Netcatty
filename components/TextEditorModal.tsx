@@ -64,6 +64,8 @@ interface TextEditorModalProps {
   onClose: () => void;
   fileName: string;
   initialContent: string;
+  /** Full path for language detection; the title still uses fileName. */
+  filePath?: string;
   onSave: (content: string) => Promise<void>;
   editorWordWrap: boolean;
   onToggleWordWrap: () => void;
@@ -71,12 +73,15 @@ interface TextEditorModalProps {
   keyBindings: KeyBinding[];
   /** If provided, a maximize button is shown in the Pane header. */
   onPromoteToTab?: (snapshot: TextEditorModalSnapshot) => void;
+  /** If provided, a pop-out button sends the file to the dedicated editor window. */
+  onPopOut?: (snapshot: TextEditorModalSnapshot) => void;
 }
 
 const TextEditorModal: React.FC<TextEditorModalProps> = ({
   open,
   onClose,
   fileName,
+  filePath,
   initialContent,
   onSave,
   editorWordWrap,
@@ -84,6 +89,7 @@ const TextEditorModal: React.FC<TextEditorModalProps> = ({
   hotkeyScheme,
   keyBindings,
   onPromoteToTab,
+  onPopOut,
 }) => {
   const { t } = useI18n();
 
@@ -91,7 +97,7 @@ const TextEditorModal: React.FC<TextEditorModalProps> = ({
   const [baselineContent, setBaselineContent] = useState(initialContent);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [languageId, setLanguageId] = useState(() => getLanguageId(fileName));
+  const [languageId, setLanguageId] = useState(() => getLanguageId(filePath ?? fileName));
   const contentRef = useRef(initialContent);
   const baselineContentRef = useRef(initialContent);
   const savingRef = useRef(false);
@@ -146,13 +152,13 @@ const TextEditorModal: React.FC<TextEditorModalProps> = ({
     setBaselineContent(initialContent);
     setSaveError(null);
     setSaving(false);
-    setLanguageId(getLanguageId(fileName));
+    setLanguageId(getLanguageId(filePath ?? fileName));
     contentRef.current = initialContent;
     baselineContentRef.current = initialContent;
     savingRef.current = false;
     closePromptRef.current = null;
     viewStateRef.current = null;
-  }, [initialContent, fileName]);
+  }, [initialContent, fileName, filePath]);
 
   const saveContent = useCallback(async (contentToSave = contentRef.current): Promise<boolean> => {
     return saveCoordinatorRef.current?.save(contentToSave) ?? false;
@@ -229,6 +235,20 @@ const TextEditorModal: React.FC<TextEditorModalProps> = ({
     if (snapshot) onPromoteToTab(snapshot);
   }, [onPromoteToTab, fileName, languageId, editorWordWrap]);
 
+  const handlePopOut = useCallback(() => {
+    if (!onPopOut) return;
+    const snapshot = createTextEditorModalSnapshot({
+      fileName,
+      getBaselineContent: () => baselineContentRef.current,
+      getContent: () => contentRef.current,
+      languageId,
+      wordWrap: editorWordWrap,
+      getViewState: () => viewStateRef.current,
+      isSaving: () => savingRef.current,
+    });
+    if (snapshot) onPopOut(snapshot);
+  }, [onPopOut, fileName, languageId, editorWordWrap]);
+
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && handleClose()}>
       <DialogContent
@@ -255,6 +275,7 @@ const TextEditorModal: React.FC<TextEditorModalProps> = ({
           onSave={handleSave}
           onRequestClose={handleClose}
           onPromoteToTab={onPromoteToTab ? handlePromote : undefined}
+          onPopOut={onPopOut ? handlePopOut : undefined}
         />
       </DialogContent>
     </Dialog>

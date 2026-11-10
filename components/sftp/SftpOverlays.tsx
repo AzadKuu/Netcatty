@@ -102,6 +102,7 @@ interface SftpOverlaysProps {
   handleFileOpenerSelect: (openerType: FileOpenerType, setAsDefault: boolean, systemApp?: SystemAppInfo) => void;
   handleSelectSystemApp: (systemApp: { path: string; name: string }) => void;
   onPromoteToTab?: (snapshot: TextEditorModalSnapshot) => void;
+  onPopOut?: (snapshot: TextEditorModalSnapshot) => void;
   onRequestTerminalFocus?: () => void;
 }
 
@@ -145,6 +146,7 @@ export const SftpOverlays: React.FC<SftpOverlaysProps> = React.memo(({
   handleFileOpenerSelect,
   handleSelectSystemApp,
   onPromoteToTab,
+  onPopOut,
   onRequestTerminalFocus,
 }) => {
   const textEditorFileName = textEditorTarget?.file.name || "";
@@ -262,6 +264,7 @@ export const SftpOverlays: React.FC<SftpOverlaysProps> = React.memo(({
               open={showTextEditor}
               onClose={closeTextEditor}
               fileName={textEditorFileName}
+              filePath={textEditorTarget?.fullPath}
               initialContent={textEditorContent}
               onSave={handleSaveTextFile}
               editorWordWrap={editorWordWrap}
@@ -269,6 +272,7 @@ export const SftpOverlays: React.FC<SftpOverlaysProps> = React.memo(({
               hotkeyScheme={hotkeyScheme}
               keyBindings={keyBindings}
               onPromoteToTab={onPromoteToTab}
+              onPopOut={onPopOut}
             />
           </Suspense>
         </LazyLoadBoundary>

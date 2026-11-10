@@ -35,6 +35,7 @@ import {
 import {
     initializePreparedConvergentMigration,
     prepareConvergentSyncMigration,
+    resolvePreparedConvergentMigrationConflict,
     type PreparedConvergentMigration,
 } from '../application/convergentSyncMigration';
 import type { ShrinkFinding } from '../domain/syncGuards';
@@ -50,7 +51,7 @@ import { CloudSyncDashboardTabs } from './cloud-sync/CloudSyncDashboardTabs';
 interface SyncDashboardProps {
     onBuildPayload: () => SyncPayload | Promise<SyncPayload>;
     onBuildLocalPayload: () => SyncPayload;
-    onApplyMigrationPayload: (payload: SyncPayload) => void | Promise<void>;
+    onPrepareMigrationPayload: (payload: SyncPayload) => Promise<() => Promise<void>>;
     onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
     onApplyConvergentPayload: (
         payload: SyncPayload,
@@ -63,7 +64,7 @@ interface SyncDashboardProps {
 const SyncDashboard: React.FC<SyncDashboardProps> = ({
     onBuildPayload,
     onBuildLocalPayload,
-    onApplyMigrationPayload,
+    onPrepareMigrationPayload,
     onApplyPayload,
     onApplyConvergentPayload,
     onApplyLocalPayload,
@@ -336,7 +337,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
                 prepared: preparedConvergentMigration,
                 buildCurrentPayload: onBuildPayload,
                 buildPreApplyPayload: onBuildLocalPayload,
-                applyPayload: onApplyMigrationPayload,
+                preparePayloadApply: onPrepareMigrationPayload,
                 translateProtectiveBackupFailure: (message) =>
                     t('cloudSync.localBackups.protectiveBackupFailed', { message }),
             });
@@ -349,7 +350,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
         } finally {
             setConvergentBusy(false);
         }
-    }, [onApplyMigrationPayload, onBuildLocalPayload, onBuildPayload, preparedConvergentMigration, sync, t]);
+    }, [onPrepareMigrationPayload, onBuildLocalPayload, onBuildPayload, preparedConvergentMigration, sync, t]);
 
     const handleResolveConvergentConflict = useCallback(async (
         addressKey: string,
@@ -358,6 +359,15 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
         setConvergentBusy(true);
         setConvergentError(null);
         try {
+            if (preparedConvergentMigration && !sync.convergentSyncConfig.initialized) {
+                const prepared = resolvePreparedConvergentMigrationConflict(
+                    preparedConvergentMigration, addressKey, candidateDot,
+                );
+                setPreparedConvergentMigration(prepared);
+                setConvergentPreview(prepared.plan.preview);
+                toast.success(t('cloudSync.convergent.conflict.resolved'));
+                return;
+            }
             const { results } = await sync.resolveConvergentConflict(
                 addressKey,
                 candidateDot,
@@ -371,7 +381,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
         } finally {
             setConvergentBusy(false);
         }
-    }, [onApplyConvergentPayload, sync, t]);
+    }, [onApplyConvergentPayload, preparedConvergentMigration, sync, t]);
 
     const handleDowngradeConvergent = useCallback(async () => {
         if (!window.confirm(t('cloudSync.convergent.downgrade.confirm'))) return;
@@ -1053,7 +1063,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
 interface CloudSyncSettingsProps {
     onBuildPayload: () => SyncPayload | Promise<SyncPayload>;
     onBuildLocalPayload: () => SyncPayload;
-    onApplyMigrationPayload: (payload: SyncPayload) => void | Promise<void>;
+    onPrepareMigrationPayload: (payload: SyncPayload) => Promise<() => Promise<void>>;
     onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
     onApplyConvergentPayload: (
         payload: SyncPayload,

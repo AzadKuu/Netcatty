@@ -4,6 +4,7 @@ import type { Host, PortForwardingRule } from '../../domain/models';
 import type { VaultSection } from '../../components/VaultView';
 import type { KeyboardInteractiveRequest } from '../../components/KeyboardInteractiveModal';
 import type { PassphraseRequest } from '../../components/PassphraseModal';
+import type { FidoPromptRequest } from '../../components/FidoPromptModal';
 
 type Listener = () => void;
 
@@ -23,7 +24,6 @@ export type AppLocalUiSnapshot = {
     | { mode: 'append'; workspaceId: string }
     | { mode: 'create' }
     | null;
-  quickSearch: string;
   protocolSelectHost: Host | null;
   navigateToSection: VaultSection | null;
   deepLinkHostDraft: Host | null;
@@ -31,6 +31,7 @@ export type AppLocalUiSnapshot = {
   portForwardingRules: readonly PortForwardingRule[];
   keyboardInteractiveQueue: readonly KeyboardInteractiveRequest[];
   passphraseQueue: readonly PassphraseRequest[];
+  fidoPromptQueue: readonly FidoPromptRequest[];
   deleteHostConfirm: { hostId: string; name: string } | null;
   vaultFocusRequest: unknown;
   openNoteRequest: unknown;
@@ -41,7 +42,6 @@ export const EMPTY_APP_LOCAL_UI: AppLocalUiSnapshot = Object.freeze({
   isQuickSwitcherOpen: false,
   isCreateWorkspaceOpen: false,
   addToWorkspaceDialog: null,
-  quickSearch: '',
   protocolSelectHost: null,
   navigateToSection: null,
   deepLinkHostDraft: null,
@@ -49,6 +49,7 @@ export const EMPTY_APP_LOCAL_UI: AppLocalUiSnapshot = Object.freeze({
   portForwardingRules: Object.freeze([]) as readonly PortForwardingRule[],
   keyboardInteractiveQueue: Object.freeze([]) as readonly KeyboardInteractiveRequest[],
   passphraseQueue: Object.freeze([]) as readonly PassphraseRequest[],
+  fidoPromptQueue: Object.freeze([]) as readonly FidoPromptRequest[],
   deleteHostConfirm: null,
   vaultFocusRequest: null,
   openNoteRequest: null,
@@ -73,7 +74,6 @@ class AppLocalUiStore {
       prev.isQuickSwitcherOpen === next.isQuickSwitcherOpen
       && prev.isCreateWorkspaceOpen === next.isCreateWorkspaceOpen
       && prev.addToWorkspaceDialog === next.addToWorkspaceDialog
-      && prev.quickSearch === next.quickSearch
       && prev.protocolSelectHost === next.protocolSelectHost
       && prev.navigateToSection === next.navigateToSection
       && prev.deepLinkHostDraft === next.deepLinkHostDraft
@@ -81,6 +81,7 @@ class AppLocalUiStore {
       && prev.portForwardingRules === next.portForwardingRules
       && prev.keyboardInteractiveQueue === next.keyboardInteractiveQueue
       && prev.passphraseQueue === next.passphraseQueue
+      && prev.fidoPromptQueue === next.fidoPromptQueue
       && prev.deleteHostConfirm === next.deleteHostConfirm
       && prev.vaultFocusRequest === next.vaultFocusRequest
       && prev.openNoteRequest === next.openNoteRequest

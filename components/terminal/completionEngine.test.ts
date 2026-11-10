@@ -114,7 +114,7 @@ const {
   clearHistory,
   recordCommand,
   removeCommandHistoryEntry,
-} = await import("./autocomplete/commandHistoryStore.ts");
+} = await import("../../application/state/commandHistoryStore.ts");
 const {
   normalizePathTokenForLookup,
   shouldPreferRemoteShellCwd,
@@ -268,6 +268,24 @@ test("removeCommandHistoryEntry trims command text like recordCommand", async ()
     hostOnlyCompletions.some((entry) => entry.source === "history" && entry.text === "padded-cmd"),
     false,
   );
+});
+
+test("getCompletions skips remote path listings when skipPathCompletion is set", async () => {
+  bridgeState.remoteCalls = [];
+  bridgeState.remoteEntriesByPath = new Map([
+    [".", [{ name: "workdir", type: "directory" }]],
+  ]);
+  const completions = await getCompletions("ll ", {
+    hostId: "host-1",
+    os: "linux",
+    sessionId: "session-1",
+    protocol: "ssh",
+    cwd: "/root",
+    skipPathCompletion: true,
+    pathBudgetMs: Infinity,
+  });
+  assert.equal(bridgeState.remoteCalls.length, 0);
+  assert.equal(completions.some((entry) => entry.source === "path"), false);
 });
 
 test("getCompletions uses the remote shell cwd for relative path arguments instead of stale home", async () => {

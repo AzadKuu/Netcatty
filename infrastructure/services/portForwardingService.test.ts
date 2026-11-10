@@ -1,4 +1,5 @@
 import test from "node:test";
+import { isPortForwardingAutoReconnectEnabled } from "../../domain/portForwardingReconnect.ts";
 import assert from "node:assert/strict";
 
 import type { Host, PortForwardingRule, SSHKey } from "../../domain/models.ts";
@@ -1076,6 +1077,132 @@ for (const rejects of [false, true]) {
   });
 }
 
+for (const rejects of [false, true]) {
+  test(`final failure notification and ${rejects ? "rejection" : "reply"} cannot restart an exhausted cycle`, async (t) => {
+    let statusListener: ((status: PortForwardingRule["status"], error?: string) => void) | undefined;
+    let forceFinalAttempt = true;
+    const reconnectRule = rule({ id: `final-double-failure-${rejects}`, autoStart: true });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { netcatty: {
+        startPortForward: async () => {
+          if (forceFinalAttempt) getActiveConnection(reconnectRule.id)!.reconnectAttempts = 5;
+          statusListener?.("error", "SSH connection failed");
+          if (rejects) throw new Error("SSH connection failed");
+          return { success: false, error: "SSH connection failed" };
+        },
+        stopPortForwardByRuleId: async () => ({ stopped: 1, failed: 0, errors: [] }),
+        onPortForwardStatus: (_id: string, listener: typeof statusListener) => {
+          statusListener = listener;
+          return () => undefined;
+        },
+      } },
+    });
+    let reconnects = 0;
+    setReconnectCallback(async () => { reconnects += 1; return { success: true }; });
+    t.after(async () => {
+      setReconnectCallback(null);
+      await stopAndCleanupRuleAndWait(reconnectRule.id);
+    });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await startPortForward(reconnectRule, host(), [], [], [], () => undefined, true);
+    t.mock.timers.tick(3000);
+    assert.equal(reconnects, 0);
+    assert.equal(resetReconnectAttempts(reconnectRule.id), true);
+
+    // An explicit restart must still get a new retry cycle if it fails.
+    forceFinalAttempt = false;
+    await startPortForward(reconnectRule, host(), [], [], [], () => undefined, true);
+    assert.equal(getActiveConnection(reconnectRule.id)?.reconnectAttempts, 1);
+    t.mock.timers.tick(3000);
+    assert.equal(reconnects, 1);
+  });
+}
+
+for (const adoption of ["sync", "reconcile"] as const) {
+  test(`${adoption} starts a fresh retry cycle when adopting an active backend tunnel`, async (t) => {
+    const reconnectRule = rule({ id: `exhausted-adoption-${adoption}`, autoStart: true });
+    const listeners = new Map<string, (status: PortForwardingRule["status"]) => void>();
+    const backendTunnel = { ruleId: reconnectRule.id, tunnelId: "fresh-backend-tunnel", status: "active" };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { netcatty: {
+        startPortForward: async () => ({ success: true }),
+        listPortForwards: async () => [backendTunnel],
+        stopPortForwardByRuleId: async () => ({ stopped: 1, failed: 0, errors: [] }),
+        onPortForwardStatus: (id: string, listener: (status: PortForwardingRule["status"]) => void) => {
+          listeners.set(id, listener);
+          return () => undefined;
+        },
+      } },
+    });
+    let reconnects = 0;
+    setReconnectCallback(async () => { reconnects += 1; return { success: true }; }, () => true);
+    t.after(async () => {
+      setReconnectCallback(null);
+      await stopAndCleanupRuleAndWait(reconnectRule.id);
+    });
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await startPortForward(reconnectRule, host(), [], [], [], () => undefined, true);
+    const oldConnection = getActiveConnection(reconnectRule.id)!;
+    oldConnection.reconnectAttempts = 5;
+    const oldListener = listeners.get(oldConnection.tunnelId)!;
+    oldListener("error");
+    oldListener("inactive");
+    assert.equal(resetReconnectAttempts(reconnectRule.id), true);
+
+    if (adoption === "sync") await syncWithBackend({ shouldReconnect: () => true });
+    else await reconcileWithBackend();
+    assert.equal(resetReconnectAttempts(reconnectRule.id), false);
+    const replacement = getActiveConnection(reconnectRule.id)!;
+    assert.equal(replacement.tunnelId, backendTunnel.tunnelId);
+    oldListener("error");
+    assert.equal(getActiveConnection(reconnectRule.id), replacement);
+    listeners.get(backendTunnel.tunnelId)!("inactive");
+    assert.equal(getActiveConnection(reconnectRule.id)?.reconnectAttempts, 1);
+    t.mock.timers.tick(3000);
+    assert.equal(reconnects, 1);
+  });
+}
+
+for (const adoption of ["sync", "reconcile"] as const) {
+  for (const rejects of [false, true]) {
+    test(`${adoption} preserves exhaustion if backend adoption ${rejects ? "rejects" : "finds a stopped tunnel"}`, async (t) => {
+      const reconnectRule = rule({ id: `failed-adoption-${adoption}-${rejects}`, autoStart: true });
+      let statusListener: ((status: PortForwardingRule["status"]) => void) | undefined;
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: { netcatty: {
+          startPortForward: async () => ({ success: true }),
+          listPortForwards: async () => [{ ruleId: reconnectRule.id, tunnelId: "stopped-before-subscribe", status: "active" }],
+          subscribePortForward: async () => {
+            if (rejects) throw new Error("backend unavailable during adoption");
+            return { tunnelId: "stopped-before-subscribe", status: "inactive" };
+          },
+          stopPortForwardByRuleId: async () => ({ stopped: 1, failed: 0, errors: [] }),
+          onPortForwardStatus: (_id: string, listener: typeof statusListener) => {
+            statusListener = listener;
+            return () => undefined;
+          },
+        } },
+      });
+      setReconnectCallback(async () => ({ success: true }), () => true);
+      t.after(async () => {
+        setReconnectCallback(null);
+        await stopAndCleanupRuleAndWait(reconnectRule.id);
+      });
+      await startPortForward(reconnectRule, host(), [], [], [], () => undefined, true);
+      getActiveConnection(reconnectRule.id)!.reconnectAttempts = 5;
+      statusListener!("error");
+      statusListener!("inactive");
+      assert.equal(resetReconnectAttempts(reconnectRule.id), true);
+      if (adoption === "sync") await syncWithBackend({ shouldReconnect: () => true });
+      else await reconcileWithBackend();
+      assert.equal(resetReconnectAttempts(reconnectRule.id), true);
+    });
+  }
+}
+
 test("inactive close events preserve an already scheduled reconnect", async (t) => {
   let statusListener: ((status: PortForwardingRule["status"], error?: string | null) => void) | undefined;
   Object.defineProperty(globalThis, "window", {
@@ -1515,6 +1642,32 @@ test("startPortForward forwards target and jump-host timeouts", async () => {
   assert.equal(jumpHosts[0]?.requiresMfa, true);
   assert.equal(jumpHosts[0]?.sshTcpConnectTimeoutMs, 75_000);
   assert.equal(jumpHosts[0]?.sshAuthReadyTimeoutMs, 360_000);
+});
+
+test("startPortForward does not send a saved single-channel host flag", async () => {
+  const bridge = installBridgeStub();
+  const result = await startPortForward(
+    rule({ id: "rule-single-channel" }),
+    { ...host(), singleChannelSsh: true } as Host,
+    [],
+    [],
+    [],
+    () => {},
+  );
+  assert.equal(result.success, true);
+  assert.equal(bridge.getOptions()?.singleChannelSsh, undefined);
+
+  const plain = installBridgeStub();
+  const plainResult = await startPortForward(
+    rule({ id: "rule-plain" }),
+    host(),
+    [],
+    [],
+    [],
+    () => {},
+  );
+  assert.equal(plainResult.success, true);
+  assert.equal(plain.getOptions()?.singleChannelSsh, undefined);
 });
 
 test("startPortForward rejects missing proxy identities before starting", async () => {
@@ -2317,3 +2470,45 @@ test("startAllPortForwards skips tracked error runtimes and stopAll stops them",
   stopAndCleanupRule("bulk-idle-after-error");
   await new Promise<void>((resolve) => setImmediate(resolve));
 });
+
+for (const type of ["local", "remote", "dynamic"] as const) {
+  test(`${type} reconnect follows live rule choices and respects manual stop`, async (t) => {
+    const liveRule = rule({ id: `reconnect-choice-${type}`, type, autoStart: true });
+    let listener: ((status: PortForwardingRule["status"], error?: string) => void) | undefined;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { netcatty: {
+        startPortForward: async () => ({ success: true }),
+        onPortForwardStatus: (_id: string, callback: typeof listener) => {
+          listener = callback;
+          return () => undefined;
+        },
+        stopPortForwardByRuleId: async () => ({ stopped: 1, failed: 0, errors: [] }),
+      } },
+    });
+    setReconnectCallback(async () => ({ success: true }), () => isPortForwardingAutoReconnectEnabled(liveRule));
+    t.after(async () => {
+      setReconnectCallback(null);
+      await stopAndCleanupRuleAndWait(liveRule.id);
+    });
+    const start = async () => {
+      await startPortForward(liveRule, host(), [], [], [], () => undefined,
+        isPortForwardingAutoReconnectEnabled(liveRule));
+      listener?.("active");
+    };
+    // Legacy auto-start still reconnects, until explicitly turned off while active.
+    await start();
+    liveRule.autoReconnect = false;
+    listener?.("error", "network dropped");
+    assert.equal(getActiveConnection(liveRule.id)?.reconnectTimerCallback, undefined);
+    await stopAndCleanupRuleAndWait(liveRule.id);
+    // Enabling reconnect while active takes effect without restarting the tunnel.
+    liveRule.autoStart = false;
+    await start();
+    liveRule.autoReconnect = true;
+    listener?.("error", "network dropped");
+    assert.ok(getActiveConnection(liveRule.id)?.reconnectTimerCallback);
+    await stopPortForward(liveRule.id, () => undefined);
+    assert.equal(getActiveConnection(liveRule.id)?.reconnectTimerCallback, undefined);
+  });
+}

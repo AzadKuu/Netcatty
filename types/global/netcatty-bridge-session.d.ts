@@ -39,6 +39,8 @@ declare global {
   interface NetcattyBridge {
     getWindowsPtyInfo?(): NetcattyWindowsPtyInfo | null;
     startSSHSession(options: NetcattySSHOptions): Promise<string>;
+    testConnection?(options: NetcattySSHOptions): Promise<string>;
+    cancelTestConnection?(sessionId: string): Promise<{ success: boolean; error?: string }>;
     startTelnetSession?(options: {
       sessionId?: string;
       hostname: string;
@@ -78,6 +80,7 @@ declare global {
       // connection (issue #1198) negotiates the same KEX / cipher / host-key
       // set the interactive session would.
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
       // Known hosts, used to verify the host key before the stats companion
@@ -112,6 +115,7 @@ declare global {
       port?: number;
       etPort?: number;
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
       knownHosts?: import("../../domain/models").KnownHost[];
@@ -144,6 +148,9 @@ declare global {
       stopBits?: 1 | 1.5 | 2;
       parity?: 'none' | 'even' | 'odd' | 'mark' | 'space';
       flowControl?: 'none' | 'xon/xoff' | 'rts/cts';
+      // Optional auto-login credentials saved on the host (#3417)
+      username?: string;
+      password?: string;
       charset?: string;
       sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
     }): Promise<string>;
@@ -183,10 +190,18 @@ declare global {
     discoverShells?(): Promise<DiscoveredShell[]>;
     validatePath?(path: string, type?: 'file' | 'directory' | 'any'): Promise<{ exists: boolean; isFile: boolean; isDirectory: boolean; isExecutable: boolean }>;
     generateKeyPair?(options: {
-      type: 'RSA' | 'ECDSA' | 'ED25519';
+      type: 'RSA' | 'ECDSA' | 'ED25519' | 'ED25519-SK' | 'ECDSA-SK';
       bits?: number;
       comment?: string;
-    }): Promise<{ success: boolean; privateKey?: string; publicKey?: string; error?: string }>;
+      resident?: boolean;
+      verifyRequired?: boolean;
+    }): Promise<{
+      success: boolean;
+      privateKey?: string;
+      publicKey?: string;
+      keyType?: 'RSA' | 'ECDSA' | 'ED25519' | 'ED25519-SK' | 'ECDSA-SK';
+      error?: string;
+    }>;
     checkSshAgent?(options?: {
       identityAgent?: string;
       agentForwarding?: boolean;
@@ -203,6 +218,7 @@ declare global {
       authMethod?: import("../../domain/models").HostAuthMethod;
       requiresMfa?: boolean;
       password?: string;
+      totp?: NetcattyTotpConfig;
       privateKey?: string;
       certificate?: string;
       publicKey?: string;
@@ -223,6 +239,7 @@ declare global {
       enableKeyboardInteractive?: boolean;
       sessionId?: string;
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
     }): Promise<{ stdout: string; stderr: string; code: number | null }>;
@@ -244,6 +261,7 @@ declare global {
     getSessionRemoteInfo?(sessionId: string): Promise<{
       success: boolean;
       remoteSshVersion?: string;
+      singleChannelSsh?: boolean;
       error?: string;
     }>;
     /**
@@ -281,6 +299,17 @@ declare global {
         cpu: number | null;           // CPU usage percentage (0-100)
         cpuCores: number | null;      // Number of CPU cores
         cpuPerCore: number[];         // Per-core CPU usage array
+        gpu?: number | null;          // NVIDIA utilization; absent on unsupported transports
+        gpuName?: string | null;      // First GPU name
+        gpuMemUsed?: number | null;   // Summed VRAM used in MB
+        gpuMemTotal?: number | null;  // Summed VRAM total in MB
+        gpus?: Array<{                // Per-GPU utilization and VRAM (MiB)
+          index: number;
+          name: string;
+          utilization: number | null;
+          memoryUsed: number | null;
+          memoryTotal: number | null;
+        }>;
         memTotal: number | null;      // Total memory in MB
         memUsed: number | null;       // Used memory in MB (excluding buffers/cache)
         memFree: number | null;       // Free memory in MB
@@ -293,10 +322,14 @@ declare global {
           memPercent: number;
           command: string;
         }>;
+        diskReadSpeed?: number | null;  // Linux hardware-backed block devices, bytes/sec; null while unavailable/warming up
+        diskWriteSpeed?: number | null; // Aggregate without partitions or stacked virtual devices
         diskPercent: number | null;   // Disk usage percentage for root partition
         diskUsed: number | null;      // Disk used in GB
         diskTotal: number | null;     // Total disk in GB
         disks: Array<{                // All mounted disks
+          diskReadSpeed?: number | null; // Mounted block-device I/O, bytes/sec
+          diskWriteSpeed?: number | null;
           capacityKey?: string;       // Filesystem or shared-pool identity
           mountPoint: string;
           used: number;               // Used in GB
@@ -306,7 +339,8 @@ declare global {
         }>;
         netRxSpeed: number;           // Total network receive speed (bytes/sec)
         netTxSpeed: number;           // Total network transmit speed (bytes/sec)
-        latencyMs: number | null;     // TCP connection establishment latency to the SSH endpoint
+        latencyMs: number | null;     // SSH transport ping on the existing session, not a second TCP dial
+        responseLatencyMs?: number | null; // Existing stats exec response, including remote channel setup
         netInterfaces: Array<{        // Per-interface network stats
           name: string;               // Interface name (e.g., eth0, ens33)
           rxBytes: number;            // Total received bytes
@@ -326,14 +360,32 @@ declare global {
       sessionId: string,
       data: string,
       options?: {
+        /** Byte-valued xterm onBinary string; bypasses text charset encoding. */
+        binary?: boolean;
         automated?: boolean;
+        pasteRequestId?: string;
         /** Host-classified secret/no-echo input; always bypasses plugin observers and interceptors. */
         sensitive?: boolean;
+        /** Whole character to erase on an explicitly byte-oriented serial device. */
+        serialEraseChar?: string;
         lineDelayMs?: number;
         logRewrite?: { sentCommand: string; displayCommand: string };
       },
     ): void;
-    interruptSession?(sessionId: string, trace?: NetcattyTerminalInterruptTrace): void;
+    /** Notify login-assist detectors about locally buffered user input. */
+    notifySessionUserInput?(sessionId: string): void;
+    /** Opt-in transport handoff receipts; cancellation ends with done and no index. */
+    onTerminalPasteWrite?(cb: (event: {
+      sessionId: string;
+      requestId: string;
+      index?: number;
+      done?: boolean;
+    }) => void): () => void;
+    interruptSession?(
+      sessionId: string,
+      trace?: NetcattyTerminalInterruptTrace,
+      options?: { cancelPendingWritesOnly?: boolean },
+    ): void;
     resizeSession(sessionId: string, cols: number, rows: number): void;
     /**
      * Sync Windows ConPTY after the renderer clears the xterm viewport.
@@ -381,6 +433,8 @@ declare global {
     requestTerminalSessionSnapshot?(sessionId: string, authorization: string): Promise<{
       success: boolean;
       snapshot?: string;
+      /** Captured input policy for the existing backend connection. */
+      perCharacterInput?: boolean;
       kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
       kittyKeyboardProtocolEnabled?: boolean;
       passwordPromptActive?: boolean;
@@ -401,6 +455,7 @@ declare global {
       passwordPromptActive?: boolean,
       cwd?: string | null,
       title?: string | null,
+      perCharacterInput?: boolean,
     ): void;
     /** Observe popup: push current state back to the home renderer before restore. */
     applyTerminalSessionSnapshot?(
@@ -411,6 +466,7 @@ declare global {
         contextViewportSnapshot: string;
         contextScrollbackSnapshot: string;
         alternateScreen: boolean;
+        perCharacterInput?: boolean;
         kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
         kittyKeyboardProtocolEnabled?: boolean;
         passwordPromptActive?: boolean;
@@ -433,6 +489,7 @@ declare global {
         contextViewportSnapshot: string;
         contextScrollbackSnapshot: string;
         alternateScreen: boolean;
+        perCharacterInput?: boolean;
         kittyKeyboardModeState?: NetcattyKittyKeyboardModeState;
         kittyKeyboardProtocolEnabled?: boolean;
         passwordPromptActive?: boolean;
@@ -503,7 +560,7 @@ declare global {
     ): () => void;
     onSessionExit(
       sessionId: string,
-      cb: (evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void
+      cb: (evt: { exitCode?: number; signal?: number; exitSignal?: string; error?: string; reason?: "exited" | "error" | "timeout" | "closed" | "signaled"; remoteClosedWithoutExitStatus?: boolean }) => void
     ): () => void;
     onTelnetAutoLoginComplete?(
       sessionId: string,
@@ -547,6 +604,7 @@ declare global {
         savedPassword?: string | null;
         /** When false, UI must not offer saving the response as the host password. */
         allowSavePassword?: boolean;
+        totpUri?: string;
         scope?: "terminal" | "external";
         bootEpoch?: number;
       }) => void
@@ -613,6 +671,31 @@ declare global {
     ): () => void;
     onPassphraseAuthFailed?(
       cb: (event: { keyPaths: string[]; keyIds?: string[] }) => void
+    ): () => void;
+
+    // FIDO2 PIN / touch presence prompts (OpenSSH sk-*)
+    onFidoPromptRequest?(
+      cb: (request: {
+        requestId: string;
+        kind: "pin" | "touch" | "confirm" | "recovery";
+        reason?: "device-unavailable" | "timeout" | "pin-failed" | "failed";
+        allowPasswordFallback?: boolean;
+        notificationOnly?: boolean;
+        message?: string;
+        title?: string;
+        keyName?: string;
+      }) => void
+    ): () => void;
+    respondFidoPrompt?(
+      requestId: string,
+      response: string,
+      cancelled?: boolean
+    ): Promise<{ success: boolean; error?: string }>;
+    onFidoPromptTimeout?(
+      cb: (event: { requestId: string }) => void
+    ): () => void;
+    onFidoPromptCancelled?(
+      cb: (event: { requestId: string; reason?: string }) => void
     ): () => void;
   }
 }

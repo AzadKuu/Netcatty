@@ -156,6 +156,13 @@ test("restoring terminal tasks strips stale conflict payloads (skip-without-clea
   assert.equal(restored.tasks[1]?.conflict?.fileName, "css");
 });
 
+test("a preflight-skipped conflict keeps its stat limit after restart", () => {
+  const pending = { ...task("late-file", "attention", 1), preflightStatSkipped: true };
+  const restored = deserializeSftpTransferCenter(serializeSftpTransferCenter([pending]));
+  assert.equal(restored.tasks[0]?.status, "attention");
+  assert.equal(restored.tasks[0]?.preflightStatSkipped, true);
+});
+
 test("history keeps unfinished tasks and caps terminal tasks by age and count", () => {
   const now = Date.UTC(2026, 6, 23);
   const old = now - 31 * 24 * 60 * 60 * 1000;
@@ -228,6 +235,42 @@ test("resume rejects changed or shortened source files", () => {
   );
 });
 
+test("resume skips size-based validation when the source size is unknown", () => {
+  // Stat-less SCP endpoints report size as a placeholder 0 (sizeKnown false).
+  // Saved progress must not be misread as a shrunk/changed source.
+  const resumable = {
+    ...task("scp", "interrupted", 1),
+    totalBytes: 100,
+    sourceLastModified: 50,
+    checkpointBytes: 60,
+  };
+  assert.equal(
+    validateTransferResumeSource(
+      resumable,
+      { size: 0, lastModified: 50, sizeKnown: false },
+      { allowSourceGrowth: true },
+    ),
+    null,
+  );
+  // mtime drift is still detectable without a size.
+  assert.match(
+    validateTransferResumeSource(
+      resumable,
+      { size: 0, lastModified: 51, sizeKnown: false },
+    ) ?? "",
+    /modified/,
+  );
+  // The mtime guard is skipped while growth is allowed (append-only updates).
+  assert.equal(
+    validateTransferResumeSource(
+      resumable,
+      { size: 0, lastModified: 51, sizeKnown: false },
+      { allowSourceGrowth: true },
+    ),
+    null,
+  );
+});
+
 test("prune upgrades legacy completed children into the parent checkpoint", () => {
   const now = Date.now();
   const parent: TransferTask = {
@@ -249,6 +292,27 @@ test("prune upgrades legacy completed children into the parent checkpoint", () =
   assert.deepEqual(pruned.filter((item) => item.id === "dir").map((item) => item.id), ["dir"]);
   assert.equal(pruned.some((item) => item.parentTaskId === "dir"), false);
   assert.equal(pruned.find((item) => item.id === "dir")?.directoryResumeCheckpoint?.completedEntries, 5);
+});
+
+test("completed cleanup-warning children retain actionable paths across compaction and restart", () => {
+  const now = Date.now();
+  const warning = "Upload completed; remove backup /target/.netcatty-backup-file manually.";
+  const parent: TransferTask = { ...task("warning-folder", "transferring", now), isDirectory: true };
+  const children: TransferTask[] = [0, 1].map((index) => ({
+    ...task(`warning-child-${index}`, "completed", now),
+    parentTaskId: parent.id, endTime: now, directoryEntryIndex: index,
+    directoryEntryIdentity: String(index).padStart(64, "0"),
+    warning: index === 0 ? warning : undefined,
+  }));
+  const pruned = pruneSftpTransferHistory([parent, ...children], now);
+  assert.equal(pruned.some((row) => row.id === "warning-child-1"), false);
+  assert.equal(pruned.find((row) => row.id === parent.id)?.directoryResumeCheckpoint?.completedEntries, 1);
+  const restored = deserializeSftpTransferCenter(serializeSftpTransferCenter(pruned));
+  const retained = restored.tasks.find((row) => row.id === "warning-child-0");
+  assert.equal(retained?.status, "completed");
+  assert.equal(retained?.warning, warning);
+  assert.equal(retained?.error, undefined);
+  assert.equal(pruneSftpTransferHistory(restored.tasks, now).find((row) => row.id === retained?.id)?.warning, warning);
 });
 
 test("prune compacts 50,000 completed directory children into a bounded parent checkpoint", () => {

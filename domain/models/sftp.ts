@@ -80,12 +80,16 @@ export interface TransferTask {
   speed: number; // bytes per second
   error?: string;
   startTime: number;
+  /** Upload completed, but a generated backup needs manual cleanup. */
+  warning?: string;
   endTime?: number;
   isDirectory: boolean;
   progressMode?: 'bytes' | 'files';
   childTasks?: string[]; // For directory transfers
   parentTaskId?: string;
   sourceLastModified?: number; // Cached from file list to avoid redundant stat
+  /** Bounded remote preflight already skipped this file; keep the cap after panel remount. */
+  preflightStatSkipped?: boolean;
   skipConflictCheck?: boolean; // Skip conflict check for replace operations
   replaceExistingTarget?: boolean; // Delete the existing target before transferring
   retryable?: boolean; // False for task types that cannot be safely replayed through generic retry

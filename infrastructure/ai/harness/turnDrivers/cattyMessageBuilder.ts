@@ -27,9 +27,10 @@ import {
   type AssistantContentPart,
   type CattyProviderContinuationContext,
 } from '../../aiChatStreamingSupport';
-import { redactSecretsInValueForModel } from '../modelSecretRedaction';
+import { redactSecretsForModel, redactSecretsInValueForModel } from '../modelSecretRedaction';
 import { fitLargeUserInputForModel } from '../largeUserInput';
 import type { ToolOutputStore } from '../toolOutputStore';
+import { hasAnthropicThinkingSignature } from '../anthropicThinkingBinding';
 
 const OPENAI_CHAT_ASSISTANT_FIELDS = Symbol('netcatty.openAIChatAssistantFields');
 
@@ -198,10 +199,15 @@ export interface BuildCattySdkMessagesInput {
   trimmed: string;
   attachments?: ChatMessageAttachment[];
   continuationContext: CattyProviderContinuationContext;
-  preserveTerminalToolResults?: ReadonlySet<ToolResult>;
   chatSessionId: string;
   toolOutputStore: ToolOutputStore;
   fieldsByMessage: Map<ModelMessage, OpenAIChatAssistantFields | undefined>;
+  /**
+   * When true (default), durable-summary builds skip Anthropic signed thinking
+   * on the retained tail (#4073). DeepSeek Anthropic-compat must pass false —
+   * it requires thinking blocks with replayed tool calls.
+   */
+  allowStripAnthropicSignedThinking?: boolean;
 }
 
 export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelMessage[] {
@@ -212,10 +218,10 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
     trimmed,
     attachments,
     continuationContext,
-    preserveTerminalToolResults = new Set<ToolResult>(),
     chatSessionId,
     toolOutputStore,
     fieldsByMessage,
+    allowStripAnthropicSignedThinking = true,
   } = input;
 
   const { resolvedToolCallsByAssistant, toolCallByToolResult } = buildHistoricalToolReplayMaps(allMessages);
@@ -233,6 +239,14 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
   // The boundary can become zero when storage trims messages that were all
   // covered by the durable summary. Keep injecting that summary even though
   // no remaining persisted message needs to be skipped.
+  // Durable summary replaces the compacted prefix. Replaying Anthropic signed
+  // thinking on the retained tail would 400 on official Anthropic (prefix
+  // binding / #4073) — skip those signatures while leaving unsigned reasoning
+  // intact. DeepSeek Anthropic-compat forbids wholesale removal, so callers
+  // pass allowStripAnthropicSignedThinking=false for that provider.
+  const skipSignedAnthropicReasoning = Boolean(contextCompaction?.summary)
+    && allowStripAnthropicSignedThinking;
+
   if (contextCompaction?.summary) {
     sdkMessages.push({
       role: 'user',
@@ -324,6 +338,7 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
         if (replayedCalls.length > 0) {
           for (const part of collectReplayableReasoningParts(replayContinuation)) {
             if (!part.text && !part.providerOptions) continue;
+            if (skipSignedAnthropicReasoning && hasAnthropicThinkingSignature(part)) continue;
             contentParts.push({
               type: 'reasoning' as const,
               text: part.text,
@@ -344,7 +359,7 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
             type: 'tool-call' as const,
             toolCallId: tc.id,
             toolName: tc.name,
-            input: redactSecretsInValueForModel(tc.arguments ?? {}),
+            input: redactSecretsInValueForModel(tc.arguments ?? {}, chatSessionId),
             ...(providerOptions ? { providerOptions } : {}),
           });
         }
@@ -359,6 +374,7 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
         const contentParts: AssistantContentPart[] = [];
         for (const part of collectReplayableReasoningParts(replayContinuation)) {
           if (!part.text && !part.providerOptions) continue;
+          if (skipSignedAnthropicReasoning && hasAnthropicThinkingSignature(part)) continue;
           contentParts.push({
             type: 'reasoning' as const,
             text: part.text,
@@ -394,9 +410,12 @@ export function buildCattySdkMessages(input: BuildCattySdkMessagesInput): ModelM
               toolName: toolCall?.name ?? 'unknown',
               output: {
                 type: 'text' as const,
-                value: buildHistoricalToolResultReplayText(tr, toolCall, {
-                  preserveTerminalOutput: preserveTerminalToolResults.has(tr),
-                }),
+                // Live results are already bounded. Reformatting them merely
+                // because another user turn arrived breaks the cached prefix.
+                // Context-budget pruning still owns necessary reductions.
+                value: redactSecretsForModel(buildHistoricalToolResultReplayText(tr, toolCall, {
+                  preserveTerminalOutput: true,
+                }), chatSessionId),
               },
             };
           }),

@@ -6,13 +6,14 @@ const {
   hasCodebuddyQueryOnlyOptions,
 } = require("./index.cjs");
 const { codebuddySessionManager } = require("./codebuddySessionManager.cjs");
+const mimoDriver = require("./mimoDriver.cjs");
 
 test("registry exposes SDK backends", () => {
-  assert.deepEqual(listBackends().sort(), ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "opencode"]);
+  assert.deepEqual(listBackends().sort(), ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "mimo", "opencode"]);
 });
 
 test("getDriver returns a driver with runTurn", () => {
-  for (const key of ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "opencode"]) {
+  for (const key of ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "mimo", "opencode"]) {
     const d = getDriver(key);
     assert.equal(typeof d.runTurn, "function", `${key} must expose runTurn`);
   }
@@ -23,10 +24,27 @@ test("getDriver throws on unknown backend", () => {
 });
 
 test("SDK drivers expose listModels; codex returns [] (no catalog)", async () => {
-  for (const key of ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "opencode"]) {
+  for (const key of ["claude", "codebuddy", "codex", "copilot", "cursor", "grok", "mimo", "opencode"]) {
     assert.equal(typeof getDriver(key).listModels, "function", `${key} must expose listModels`);
   }
   assert.deepEqual(await getDriver("codex").listModels({}), []);
+});
+
+test("MiMo driver receives Netcatty permission mode and approval bridge", async () => {
+  const original = mimoDriver.runMimoTurn;
+  let received;
+  const approve = async () => true;
+  const clear = () => {};
+  mimoDriver.runMimoTurn = async (options) => { received = options; return { sessionId: "sess-1" }; };
+  try {
+    await getDriver("mimo").runTurn({ permissionMode: "confirm", chatSessionId: "chat-1", requestApprovalFromRenderer: approve, clearPendingApprovals: clear });
+    assert.equal(received.permissionMode, "confirm");
+    assert.equal(received.chatSessionId, "chat-1");
+    assert.equal(received.requestApprovalFromRenderer, approve);
+    assert.equal(received.clearPendingApprovals, clear);
+  } finally {
+    mimoDriver.runMimoTurn = original;
+  }
 });
 
 test("CodeBuddy keeps V2 for SessionOptions fields and falls back for query-only fields", () => {
@@ -73,4 +91,54 @@ test("CodeBuddy forwards the explicit bypass opt-in to V2 sessions", async () =>
   } finally {
     codebuddySessionManager.runTurn = originalRunTurn;
   }
+});
+
+
+test("Copilot registry catalog uses the configured profile environment", async (t) => {
+  const copilotDriver = require("./copilotDriver.cjs");
+  const original = copilotDriver.listCopilotModels;
+  let receivedEnv;
+  const sdkModule = {
+    CopilotClient: class {
+      constructor(options) { receivedEnv = options.env; }
+      async start() {}
+      async listModels() { return [{ id: receivedEnv?.GH_TOKEN === "fixture-account" ? "profile-model" : "process-model" }]; }
+      async stop() {}
+    },
+    RuntimeConnection: { forStdio: () => ({}) },
+  };
+  t.mock.method(copilotDriver, "listCopilotModels", (options) => original({ ...options, sdkModule }));
+  const env = { GH_TOKEN: "fixture-account", GH_CONFIG_DIR: "/fixture/profile" };
+  const models = await getDriver("copilot").listModels({ binPath: "/fixture/copilot", env });
+  assert.deepEqual(models, [{ id: "profile-model", name: "profile-model" }]);
+  assert.deepEqual(receivedEnv, env);
+});
+
+test("registry forwards the same live session guard to every prompt driver", async (t) => {
+  const assertSessionValid = () => {};
+  const cases = [
+    ["claude", "./claudeDriver.cjs", "runClaudeTurn", {}],
+    ["codex", "./codexDriver.cjs", "runCodexTurn", {}],
+    ["copilot", "./copilotDriver.cjs", "runCopilotTurn", {}],
+    ["cursor", "./cursorDriver.cjs", "runCursorTurn", {}],
+    ["cursor", "./cursorCliDriver.cjs", "runCursorCliTurn", { cursorAuthMode: "cli-login" }],
+    ["codebuddy", "./codebuddyDriver.cjs", "runCodebuddyTurn", { maxBudgetUsd: 1 }],
+    ["opencode", "./opencodeDriver.cjs", "runOpenCodeTurn", {}],
+    ["grok", "./grokAcpDriver.cjs", "runGrokAcpTurn", {}],
+    ["grok", "./grokDriver.cjs", "runGrokTurn", { grokRuntime: "streaming-json" }],
+    ["mimo", "./mimoDriver.cjs", "runMimoTurn", {}],
+  ];
+  for (const [backend, modulePath, method, extra] of cases) {
+    const driver = require(modulePath);
+    let received;
+    t.mock.method(driver, method, async (context) => { received = context; return {}; });
+    await getDriver(backend).runTurn({
+      prompt: "hello", emitter: {}, env: {}, assertSessionValid, ...extra,
+    });
+    assert.equal(received.assertSessionValid, assertSessionValid, method);
+  }
+  let received;
+  t.mock.method(codebuddySessionManager, "runTurn", async (context) => { received = context; return {}; });
+  await getDriver("codebuddy").runTurn({ prompt: "hello", emitter: {}, env: {}, assertSessionValid });
+  assert.equal(received.assertSessionValid, assertSessionValid, "CodeBuddy V2");
 });

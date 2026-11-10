@@ -1,9 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isStepCount, streamText, tool } from 'ai';
+import { generateText, isStepCount, streamText, tool } from 'ai';
 import { z } from 'zod';
 import { createBridgeFetchForSDK, createModelFromConfig } from './sdk/providers';
 import type { OpenAIChatAssistantFields } from './providerContinuation';
+
+test('delegated bridge fetch rejects absent or substituted turn identity before transport', async (t) => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  let requests = 0;
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { netcatty: {
+    aiFetch: async () => { requests++; throw Error('Unexpected fixture transport'); },
+    aiChatStream: async () => { requests++; throw Error('Unexpected fixture transport'); },
+  } } });
+  t.after(() => { if (original) Object.defineProperty(globalThis, 'window', original); else Reflect.deleteProperty(globalThis, 'window'); });
+  const id = '11111111-1111-4111-8111-111111111111';
+  const tag = '22222222-2222-4222-8222-222222222222';
+  for (const requestIdPrefix of [undefined, 'sdk_', `agent-model_${tag}_${tag}_`]) {
+    const fetch = createBridgeFetchForSDK('synthetic-provider', { requireBridge: true, chatSessionId: `plugin-agent:${id}`, requestIdPrefix });
+    await assert.rejects(fetch('http://fixture.invalid/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify({ stream: true, messages: [] }),
+    }), /Delegated model request identity/);
+  }
+  assert.equal(requests, 0);
+});
 
 test('buffers stream events emitted before the Response stream starts', async (t) => {
   const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
@@ -1233,4 +1252,176 @@ test('re-injects the remembered tool name when the SDK missed the naming chunk',
   assert.ok(!errorMessages.some((message) => /Expected 'function\.name'/.test(message)));
   assert.deepEqual(executedCommands, ['pwd']);
   assert.equal(text, 'tool completed');
+});
+
+for (const indexes of [[0], [1], [1, 4], [4, 1]]) {
+  test(`completes terminal_execute with streamed tool indexes ${indexes.join(',')} (#3274)`, async (t) => {
+    const globals = globalThis as unknown as { window?: unknown };
+    const originalWindow = globals.window;
+    t.after(() => { globals.window = originalWindow; });
+    const dataHandlers = new Map<string, (data: string) => void>();
+    const endHandlers = new Map<string, () => void>();
+    const sentBodies: Array<Record<string, unknown>> = [];
+    globals.window = {
+      netcatty: {
+        aiChatCancel: async () => true,
+        onAiStreamData: (id: string, cb: (data: string) => void) => {
+          dataHandlers.set(id, cb);
+          return () => dataHandlers.delete(id);
+        },
+        onAiStreamEnd: (id: string, cb: () => void) => {
+          endHandlers.set(id, cb);
+          return () => endHandlers.delete(id);
+        },
+        onAiStreamError: () => () => undefined,
+        aiChatStream: async (id: string, _url: string, _headers: unknown, body: string) => {
+          sentBodies.push(JSON.parse(body));
+          const emit = (delta: unknown, finishReason: string | null = null) => dataHandlers.get(id)?.(JSON.stringify({
+            id: 'chatcmpl-sparse', object: 'chat.completion.chunk', created: 0, model: 'test',
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          }));
+          if (sentBodies.length === 1) {
+            emit({ content: 'Checking.' });
+            for (const index of indexes) {
+              emit({ tool_calls: [{ index, id: `call_${index}`, type: 'function',
+                function: { name: 'terminal_execute', arguments: '{"command":' } }] });
+            }
+            // Interleave continuations in reverse order to verify stable correlation.
+            for (const index of [...indexes].reverse()) {
+              emit({ tool_calls: [{ index, function: { arguments: `"echo ${index}"}` } }] });
+            }
+            emit({}, 'tool_calls');
+          } else {
+            emit({ content: 'Done.' });
+            emit({}, 'stop');
+          }
+          endHandlers.get(id)?.();
+          return { ok: true, statusCode: 200, statusText: 'OK' };
+        },
+      },
+    };
+    const executed: string[] = [];
+    const result = streamText({
+      model: createModelFromConfig({ id: 'sparse-test', providerId: 'custom', name: 'Test',
+        apiKey: 'test', baseURL: 'https://example.test/v1', defaultModel: 'test', enabled: true }),
+      messages: [{ role: 'user', content: 'Check the terminal' }],
+      tools: { terminal_execute: tool({ inputSchema: z.object({ command: z.string() }),
+        execute: async ({ command }) => { executed.push(command); return { ok: true }; } }) },
+      stopWhen: isStepCount(2),
+    });
+    const errors: unknown[] = [];
+    let text = '';
+    for await (const part of result.stream) {
+      if (part.type === 'error') errors.push(part.error);
+      if (part.type === 'text-delta') text += part.text;
+    }
+    assert.deepEqual(errors, []);
+    assert.deepEqual(executed.sort(), indexes.map(index => `echo ${index}`).sort());
+    assert.equal(text, 'Checking.Done.');
+    assert.equal(sentBodies.length, 2);
+    const messages = sentBodies[1].messages as Array<{ role: string; tool_call_id?: string }>;
+    assert.deepEqual(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id).sort(),
+      indexes.map(index => `call_${index}`).sort());
+  });
+}
+
+test('non-streaming DeepSeek usage reaches the SDK as cached input', async t => {
+  const originalWindow = globalThis.window;
+  t.after(() => { globalThis.window = originalWindow; });
+  globalThis.window = { netcatty: {
+    aiFetch: async () => ({ ok: true, status: 200, data: JSON.stringify({
+      id: 'response', object: 'chat.completion', created: 0, model: 'deepseek-chat',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1000, completion_tokens: 1, total_tokens: 1001,
+        prompt_cache_hit_tokens: 900, prompt_cache_miss_tokens: 100 },
+    }) }),
+  } } as unknown as Window & typeof globalThis;
+  const result = await generateText({
+    model: createModelFromConfig({
+      id: 'fixture', providerId: 'custom', name: 'Fixture', enabled: true,
+      baseURL: 'https://provider.example.test/v1', apiKey: 'fixture', defaultModel: 'deepseek-chat',
+    }),
+    prompt: 'hello',
+  });
+  assert.equal(result.usage.inputTokenDetails.cacheReadTokens, 900);
+  assert.equal(result.usage.inputTokenDetails.noCacheTokens, 100);
+});
+
+test('replaces lone surrogates before the provider request body is serialized', async (t) => {
+  const originalWindow = (globalThis as typeof globalThis & { window?: unknown }).window;
+  t.after(() => {
+    (globalThis as typeof globalThis & { window?: unknown }).window = originalWindow;
+  });
+
+  const dataHandlers = new Map<string, (data: string) => void>();
+  const endHandlers = new Map<string, () => void>();
+  const rawBodies: string[] = [];
+
+  (globalThis as typeof globalThis & { window?: unknown }).window = {
+    netcatty: {
+      aiFetch: async () => ({ ok: true, status: 200, data: '{}' }),
+      aiChatCancel: async () => true,
+      onAiStreamData: (requestId: string, cb: (data: string) => void) => {
+        dataHandlers.set(requestId, cb);
+        return () => dataHandlers.delete(requestId);
+      },
+      onAiStreamEnd: (requestId: string, cb: () => void) => {
+        endHandlers.set(requestId, cb);
+        return () => endHandlers.delete(requestId);
+      },
+      onAiStreamError: () => () => undefined,
+      aiChatStream: async (requestId: string, _url: string, _headers: Record<string, string>, body: string) => {
+        rawBodies.push(body);
+        setTimeout(() => {
+          dataHandlers.get(requestId)?.(JSON.stringify({
+            id: 'chatcmpl-test',
+            object: 'chat.completion.chunk',
+            created: 1777600000,
+            model: 'deepseek-v4-flash',
+            choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
+          }));
+          endHandlers.get(requestId)?.();
+        }, 0);
+        return { ok: true, statusCode: 200, statusText: 'OK' };
+      },
+    },
+  };
+
+  const model = createModelFromConfig({
+    id: 'deepseek-custom',
+    providerId: 'custom',
+    name: 'DeepSeek',
+    apiKey: 'test-key',
+    baseURL: 'https://api.deepseek.com',
+    defaultModel: 'deepseek-v4-flash',
+    enabled: true,
+  });
+
+  const result = streamText({
+    model,
+    messages: [
+      { role: 'user', content: 'read the log' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'call_1', toolName: 'terminal_exec', input: {} }],
+      },
+      {
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call_1',
+          toolName: 'terminal_exec',
+          // A head/tail cut that split 🏆 leaves its low half behind.
+          output: { type: 'text', value: '[... long line shortened ...]\udfc6[SOCKS-5006]' },
+        }],
+      },
+    ],
+  });
+  for await (const _chunk of result.stream) {
+    // Drain the stream so the request is sent.
+  }
+
+  assert.equal(rawBodies.length, 1);
+  assert.doesNotMatch(rawBodies[0], /\\ud[89a-f][0-9a-f]{2}/i);
+  assert.match(JSON.parse(rawBodies[0]).messages.at(-1).content, /\]�\[SOCKS-5006\]/);
 });

@@ -41,6 +41,28 @@ test('buildVaultHostMergeKey treats group as part of session identity', () => {
   );
 });
 
+test('buildVaultHostMergeKey normalizes the local-shell default port', () => {
+  // Vault-editor local hosts omit `port`; CSV export/import round-trips store
+  // the effective default (22). Both forms must dedupe as the same entry.
+  const localBase = {
+    hostname: 'localhost',
+    username: '',
+    protocol: 'local' as const,
+    group: 'lan',
+    os: 'windows' as const,
+    localShellName: 'PowerShell',
+  };
+  assert.equal(
+    buildVaultHostMergeKey({ ...localBase }),
+    buildVaultHostMergeKey({ ...localBase, port: 22 }),
+  );
+  // An explicit non-default port is still a distinct identity.
+  assert.notEqual(
+    buildVaultHostMergeKey({ ...localBase, port: 2222 }),
+    buildVaultHostMergeKey({ ...localBase, port: 22 }),
+  );
+});
+
 test('buildVaultHostFromDraft maps minimal unstructured fields to a vault host', () => {
   const built = buildVaultHostFromDraft({
     hostname: '192.168.1.10',
@@ -665,6 +687,7 @@ test('applyVaultHostUpdate rejects malformed advanced connection settings', () =
     { patch: { serialConfig: { path: '/dev/ttyUSB0', baudRate: 9600, localEcho: 'maybe' } }, error: /localEcho/i },
     { patch: { serialConfig: { path: '/dev/ttyUSB0', baudRate: 9600, lineMode: 'maybe' } }, error: /lineMode/i },
     { patch: { serialConfig: { path: '/dev/ttyUSB0', baudRate: 9600, backspaceBehavior: 'bad' } }, error: /backspaceBehavior/i },
+    { patch: { serialConfig: { path: '/dev/ttyUSB0', baudRate: 9600, byteOrientedBackspace: 'maybe' } }, error: /byteOrientedBackspace/i },
   ];
 
   for (const entry of cases) {
@@ -807,6 +830,35 @@ test('applyVaultHostUpdate preserves serial Backspace override semantics', () =>
     assert.equal(updated.ok, true);
     if (!updated.ok) continue;
     assert.equal(updated.updatedHost.serialConfig?.backspaceBehavior, backspaceBehavior);
+  }
+});
+
+test('applyVaultHostUpdate preserves serial byteOrientedBackspace semantics', () => {
+  for (const byteOrientedBackspace of [true, false, undefined] as const) {
+    const host: Host = {
+      id: `serial-${byteOrientedBackspace ?? 'inherited'}`,
+      label: 'serial',
+      hostname: 'serial',
+      username: '',
+      protocol: 'serial',
+      tags: [],
+      os: 'linux',
+      serialConfig: {
+        path: '/dev/ttyUSB0',
+        baudRate: 9600,
+        ...(byteOrientedBackspace !== undefined ? { byteOrientedBackspace } : {}),
+      },
+    };
+
+    const updated = applyVaultHostUpdate([host], [], host.id, {
+      serialConfig: { path: '/dev/ttyUSB0', baudRate: 115200 },
+    });
+    assert.equal(updated.ok, true);
+    if (!updated.ok) continue;
+    assert.equal(
+      updated.updatedHost.serialConfig?.byteOrientedBackspace,
+      byteOrientedBackspace,
+    );
   }
 });
 
@@ -1903,4 +1955,11 @@ test('applyVaultHostDelete keeps jump hosts referenced by empty group defaults',
 
   assert.equal(result.ok, false);
   if (!result.ok) assert.match(result.error, /still used as a group jump host/i);
+});
+
+
+test('new SSH hosts explicitly use standard interactive input', () => {
+  const created = buildVaultHostFromDraft({ hostname: 'localhost', username: 'user' });
+  assert.equal(created.ok, true);
+  if (created.ok) assert.equal(created.host.sshInputCompatibility, false);
 });

@@ -6,14 +6,18 @@ import type {
 } from '../domain/sync';
 import {
   cloudSyncPayloadsEqual,
+  convergentConflictAddressKey,
   materializeSyncPayloadFromConvergentState,
   planConvergentSyncMigration,
+  refreshConvergentSyncMigrationPlan,
+  resolveConvergentFieldConflict,
   stripConvergentSyncEnvelope,
   validateConvergentSyncPayload,
   type ConvergentMigrationPlan,
   type ConvergentMigrationProviderInput,
 } from '../domain/convergentSync';
 import { isProviderReadyForSync } from '../domain/sync';
+import { isPreserveDeletionsStrategy } from '../domain/syncStrategy';
 import { getCloudSyncManager, type CloudSyncManager } from '../infrastructure/services/CloudSyncManager';
 import { markConvergentSyncInitialized } from '../infrastructure/services/convergentSyncConfig';
 import { applyProtectedSyncPayload } from './localVaultBackups';
@@ -22,6 +26,25 @@ export interface PreparedConvergentMigration {
   plan: ConvergentMigrationPlan;
   providerBaselines: ConvergentProviderBaselineV2[];
   localSnapshot: SyncPayload;
+}
+
+export function resolvePreparedConvergentMigrationConflict(
+  prepared: PreparedConvergentMigration,
+  addressKey: string,
+  candidateDot: string,
+  manager: CloudSyncManager = getCloudSyncManager(),
+  now = Date.now(),
+): PreparedConvergentMigration {
+  const conflict = prepared.plan.preview.conflicts.find(
+    (entry) => convergentConflictAddressKey(entry.address) === addressKey,
+  );
+  if (!prepared.plan.state || !conflict) {
+    throw new Error('The convergent migration conflict no longer exists');
+  }
+  const state = resolveConvergentFieldConflict(
+    prepared.plan.state, conflict, candidateDot, manager.getState().deviceId, now,
+  );
+  return { ...prepared, plan: refreshConvergentSyncMigrationPlan(prepared.plan, state) };
 }
 
 interface LegacyProviderBaselineSeed {
@@ -113,6 +136,7 @@ export async function prepareConvergentSyncMigration(
     providers: inputs,
     deviceId: manager.getState().deviceId,
     now,
+    preserveDeletions: isPreserveDeletionsStrategy(manager.getState().syncStrategy),
   });
   if (plan.state) {
     for (const seed of legacyBaselineSeeds) {
@@ -137,7 +161,7 @@ export async function initializePreparedConvergentMigration(options: {
   prepared: PreparedConvergentMigration;
   buildCurrentPayload: () => SyncPayload | Promise<SyncPayload>;
   buildPreApplyPayload: () => SyncPayload;
-  applyPayload: (payload: SyncPayload) => void | Promise<void>;
+  preparePayloadApply: (payload: SyncPayload) => Promise<() => Promise<void>>;
   translateProtectiveBackupFailure: (message: string) => string;
   manager?: CloudSyncManager;
   now?: number;
@@ -164,8 +188,9 @@ export async function initializePreparedConvergentMigration(options: {
             'Local sync data changed after the migration preview. Review the updated migration before enabling convergent sync.',
           );
         }
+        const applyPreparedPayload = await options.preparePayloadApply(prepared.plan.payload as SyncPayload);
         return async () => {
-          await options.applyPayload(prepared.plan.payload as SyncPayload);
+          await applyPreparedPayload();
           for (const baseline of prepared.providerBaselines) {
             await manager.saveConvergentProviderBaseline(baseline);
           }
@@ -195,8 +220,9 @@ export async function initializePreparedConvergentMigration(options: {
               'Local sync data changed while publishing the convergent migration. Retry sync to preserve the newer local edits.',
             );
           }
+          const applyPreparedPayload = await options.preparePayloadApply(mergedPayload);
           return async () => {
-            await options.applyPayload(mergedPayload);
+            await applyPreparedPayload();
             await commitReplica();
           };
         },

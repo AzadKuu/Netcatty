@@ -125,6 +125,7 @@ export function stripBuiltInConnectionFieldsForPluginHost(host: Host): Host {
     identityFileId: _identityFileId,
     identityFilePaths: _identityFilePaths,
     password: _password,
+    totp: _totp,
     savePassword: _savePassword,
     authMethod: _authMethod,
     authPolicyVersion: _authPolicyVersion,
@@ -162,5 +163,6 @@ export function stripBuiltInConnectionFieldsForPluginHost(host: Host): Host {
     sshAuthReadyTimeoutSeconds: _sshAuthReadyTimeoutSeconds,
     ...pluginHost
   } = host;
+  delete (pluginHost as { singleChannelSsh?: unknown }).singleChannelSsh;
   return pluginHost;
 }

@@ -25,6 +25,17 @@ import {
   registerCodebuddyElicitation,
 } from '../../shared/codebuddyElicitations';
 
+const OPENCODE_V2_MESSAGE_KEY = /^ai\.opencode\.v2\.[A-Za-z0-9]+$/;
+
+export function localizeSdkAgentMessage(
+  message: string,
+  translate?: (key: string) => string,
+): string {
+  if (!translate || !OPENCODE_V2_MESSAGE_KEY.test(message)) return message;
+  const localized = translate(message);
+  return localized || message;
+}
+
 interface LiveExternalTurn {
   requestId: string;
   sessionId: string;
@@ -98,13 +109,13 @@ async function runExternalTurn(
     return;
   }
 
-  const userSkillsContext = await resolveUserSkillsContext(
+  const userSkillsContext = context.delegationTag ? '' : await resolveUserSkillsContext(
     netcattyBridge,
     trimmed,
     context.selectedUserSkillSlugs,
   );
 
-  const requestId = ctx.turnId;
+  const requestId = context.delegationTag ? `plugin-agent_${context.delegationTag}_${ctx.turnId}` : ctx.turnId;
   ui.setStreamingForScope(sessionId, true);
 
   if (netcattyBridge.aiMcpUpdateSessions) {
@@ -333,7 +344,8 @@ async function runExternalTurn(
     },
     onWarning: (activity) => {
       flushTextBeforeNonTextEvent();
-      runOrBufferUiOperation(() => updateActivity(activity));
+      const message = localizeSdkAgentMessage(activity.message, ui.translate);
+      runOrBufferUiOperation(() => updateActivity({ ...activity, message }));
     },
     onUsage: (usage: AgentUsage) => {
       flushTextBeforeNonTextEvent();
@@ -364,6 +376,16 @@ async function runExternalTurn(
             updateActiveAssistant(msg => ({ ...msg, statusText: message }));
           });
         }
+      } else if (hookEvent === 'PostCompact') {
+        // SDK 0.3.258 — history was summarised; tell the user why earlier
+        // detail is no longer present in this turn's context.
+        flushTextBeforeNonTextEvent();
+        runOrBufferUiOperation(() => {
+          updateActiveAssistant(msg => ({
+            ...msg,
+            statusText: ui.translate?.('ai.chat.contextCompacted') ?? 'Context compacted',
+          }));
+        });
       }
     },
     onElicitationCreate: (elicitationId: string, request: Record<string, unknown>) => {
@@ -381,7 +403,7 @@ async function runExternalTurn(
     },
     onError: (error: string) => {
       flushTextBeforeNonTextEvent();
-      ui.reportStreamError(sessionId, signal, error);
+      ui.reportStreamError(sessionId, signal, localizeSdkAgentMessage(error, ui.translate));
       ui.setStreamingForScope(sessionId, false);
     },
     onDone: () => {

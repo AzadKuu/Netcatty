@@ -5,6 +5,31 @@ import { mergeSyncPayloads } from "./syncMerge.ts";
 import { withSyncReliabilityMeta } from "./syncReliability.ts";
 import type { SyncPayload } from "./sync.ts";
 
+const bookmark = (id: string, title = id) => ({
+  id, title, url: `https://${id}.example.com/`, scope: 'host' as const,
+  hostId: 'host-1', icon: 'A', color: '#247969', order: 0,
+  createdAt: 1, updatedAt: 1,
+});
+
+test('browser bookmark additions from two devices merge by ID', () => {
+  const result = mergeSyncPayloads(
+    payload({ browserBookmarks: [] }),
+    payload({ browserBookmarks: [bookmark('local')] }),
+    payload({ browserBookmarks: [bookmark('remote')] }),
+  );
+  assert.deepEqual(result.payload.browserBookmarks?.map((item) => item.id).sort(), ['local', 'remote']);
+});
+
+test('browser bookmark deletion survives an unchanged remote and legacy omission', () => {
+  const base = payload({ browserBookmarks: [bookmark('app')] });
+  const local = payload({ browserBookmarks: [] });
+  const unchanged = payload({ browserBookmarks: [bookmark('app')] });
+  assert.deepEqual(mergeSyncPayloads(base, local, unchanged).payload.browserBookmarks, []);
+  const legacy = payload();
+  delete legacy.browserBookmarks;
+  assert.deepEqual(mergeSyncPayloads(base, unchanged, legacy).payload.browserBookmarks, [bookmark('app')]);
+});
+
 function payload(overrides: Partial<SyncPayload> = {}): SyncPayload {
   return {
     hosts: [],
@@ -619,4 +644,56 @@ test("mergeSyncPayloads keeps host telemetry off merged payloads", () => {
   );
   assert.equal(unchanged.payload.hosts[0]?.lastConnectedAt, undefined);
   assert.equal(unchanged.summary.modified.local, 0);
+});
+
+test("group notes sync edits and clearing without dropping connection settings", () => {
+  const config = { path: "Project", notes: "# VPN\nOld instructions", username: "admin" };
+  const base = payload({ customGroups: ["Project"], groupConfigs: [config] });
+  const edited = payload({ customGroups: ["Project"], groupConfigs: [{ ...config, notes: "# VPN\nNew instructions" }] });
+  const merged = mergeSyncPayloads(base, base, edited).payload;
+  assert.equal(merged.groupConfigs?.[0].notes, "# VPN\nNew instructions");
+  assert.equal(merged.groupConfigs?.[0].username, "admin");
+  const cleared = payload({ customGroups: ["Project"], groupConfigs: [{ path: "Project", username: "admin" }] });
+  assert.equal(mergeSyncPayloads(merged, merged, cleared).payload.groupConfigs?.[0].notes, undefined);
+});
+
+test("mergeSyncPayloads does not glue a local migration marker onto a legacy auto-close true", () => {
+  const merged = mergeSyncPayloads(
+    null,
+    payload({
+      settings: {
+        autoCloseOnExitDefaultMigrated: true,
+        terminalSettings: { autoCloseOnExit: false, scrollback: 3000 },
+      },
+    }),
+    payload({
+      settings: {
+        terminalSettings: { autoCloseOnExit: true, scrollback: 3000 },
+      },
+    }),
+  ).payload.settings;
+
+  assert.equal(merged?.terminalSettings?.autoCloseOnExit, false);
+  assert.equal(merged?.terminalSettings?.scrollback, 3000);
+});
+
+test("mergeSyncPayloads keeps an explicit auto-close opt-in from a migrated peer", () => {
+  const merged = mergeSyncPayloads(
+    null,
+    payload({
+      settings: {
+        autoCloseOnExitDefaultMigrated: true,
+        terminalSettings: { autoCloseOnExit: false },
+      },
+    }),
+    payload({
+      settings: {
+        autoCloseOnExitDefaultMigrated: true,
+        terminalSettings: { autoCloseOnExit: true },
+      },
+    }),
+  ).payload.settings;
+
+  assert.equal(merged?.autoCloseOnExitDefaultMigrated, true);
+  assert.equal(merged?.terminalSettings?.autoCloseOnExit, true);
 });

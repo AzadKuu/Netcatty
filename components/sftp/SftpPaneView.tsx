@@ -5,6 +5,8 @@ import { useRenderTracker } from "../../lib/useRenderTracker";
 import { cn } from "../../lib/utils";
 import { SftpPaneDialogs } from "./SftpPaneDialogs";
 import { SftpClipboardUploadDialog } from "./SftpClipboardUploadDialog";
+import { SftpCreateArchiveDialog } from "./SftpCreateArchiveDialog";
+import { useSftpArchiveDialog } from "../../application/state/sftp/useSftpArchiveDialog";
 import { SftpPaneEmptyState } from "./SftpPaneEmptyState";
 import { SftpPaneFileList } from "./SftpPaneFileList";
 import { SftpPaneToolbar } from "./SftpPaneToolbar";
@@ -153,6 +155,16 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
     }
   }, [requestTreeReload]);
 
+  const archiveDialog = useSftpArchiveDialog({
+    paneId: pane.id,
+    connectionId: pane.connection?.id,
+    isLocal: !!pane.connection?.isLocal,
+    isActive: !!isActive,
+    t,
+    onCreateArchive: callbacks.onCreateArchive,
+    onCreated: (directory) => requestNestedTreeReload([directory]),
+  });
+
   useRenderTracker(`SftpPaneView[${side}]`, {
     side,
     paneId: pane.id,
@@ -292,6 +304,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
     renameName,
     showDeleteConfirm,
     deleteTargets,
+    deleteError,
     isCreating,
     isCreatingFile,
     isRenaming,
@@ -635,12 +648,14 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
             openRenameDialog={openRenameDialog}
             openDeleteConfirm={openDeleteConfirm}
             onCopyToOtherPane={callbacks.onCopyToOtherPane}
+            onDuplicateEntries={callbacks.onDuplicateEntries}
             onReceiveFromOtherPane={callbacks.onReceiveFromOtherPane}
             onOpenFileWithSystemDefault={callbacks.onOpenFileWithSystemDefault}
             onOpenFileWith={callbacks.onOpenFileWith}
             onEditFile={callbacks.onEditFile}
             onDownloadFile={callbacks.onDownloadFile}
             onExtractArchive={callbacks.onExtractArchive ? handleExtractArchive : undefined}
+            onCreateArchive={callbacks.onCreateArchive && !pane.connection?.isLocal ? archiveDialog.open : undefined}
             onEditPermissions={callbacks.onEditPermissions}
             draggedFiles={draggedFiles}
             openNewFolderDialog={openNewFolderDialogAtPath}
@@ -686,6 +701,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
           handleRowDragLeave={handleRowDragLeave}
           handleEntryDrop={handleEntryDrop}
           onCopyToOtherPane={callbacks.onCopyToOtherPane}
+          onDuplicateEntries={callbacks.onDuplicateEntries}
           onMoveEntriesToPath={handleMoveEntriesToPath}
           onOpenFileWithSystemDefault={callbacks.onOpenFileWithSystemDefault}
           onOpenFileWith={callbacks.onOpenFileWith}
@@ -693,6 +709,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
           onDownloadFile={callbacks.onDownloadFile}
           onDownloadFiles={callbacks.onDownloadFiles}
           onExtractArchive={callbacks.onExtractArchive ? handleExtractArchive : undefined}
+          onCreateArchive={callbacks.onCreateArchive && !pane.connection?.isLocal ? archiveDialog.open : undefined}
           onEditPermissions={callbacks.onEditPermissions}
           onUploadExternalFileList={handleUploadExternalFileList}
           onUploadExternalFolder={handleUploadExternalFolder}
@@ -704,6 +721,15 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
           listDensity={listDensity}
         />
       </div>
+
+      <SftpCreateArchiveDialog
+        state={archiveDialog.state}
+        t={t}
+        onClose={archiveDialog.close}
+        onNameChange={archiveDialog.setArchiveName}
+        onFormatChange={archiveDialog.setFormat}
+        onSubmit={archiveDialog.submit}
+      />
 
       <SftpPaneDialogs
         t={t}
@@ -736,6 +762,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
         showDeleteConfirm={showDeleteConfirm}
         setShowDeleteConfirm={setShowDeleteConfirm}
         deleteTargets={deleteTargets}
+        deleteError={deleteError}
         handleDelete={handleDelete}
         isDeleting={isDeleting}
         showHostPicker={showHostPicker}

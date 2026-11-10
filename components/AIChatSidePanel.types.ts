@@ -37,8 +37,19 @@ export interface AIChatSidePanelProps {
   addDraftFiles: (scopeKey: string, fallbackAgentId: string, inputFiles: File[]) => Promise<void>;
   removeDraftFile: (scopeKey: string, fallbackAgentId: string, fileId: string) => void;
   createSession: (scope: AISessionScope, agentId?: string) => AISession;
+  /** Non-destructively branch before the last user turn; returns the branch id + restored composer content. */
+  undoLastTurnInSession?: (
+    sessionId: string,
+    viewingScope?: Pick<AISessionScope, 'type' | 'targetId'>,
+  ) => Promise<{ sessionId: string; restored: { text: string; attachments: import('../infrastructure/ai/types').UploadedFile[]; selectedUserSkillSlugs: string[] } } | null>;
   deleteSession: (sessionId: string, scopeKey?: string) => void;
   updateSessionTitle: (sessionId: string, title: string) => void;
+  /** Issue #4015 R2: rebind a dangling chat to this panel's scope (panel action, never agent content). */
+  rebindSessionScope?: (sessionId: string, scope: { type: 'terminal' | 'workspace'; targetId: string; hostIds?: string[] }) => void;
+  /** Manual durability escape hatch: export the store to a JSON file (returns the path, '' when fixed-path). */
+  exportSessionsBackup?: () => Promise<string | null>;
+  /** Import sessions from a JSON export; merges by id. Returns the imported count. */
+  importSessionsBackup?: () => Promise<number>;
   updateSessionExternalSessionId: (sessionId: string, externalSessionId: string | undefined) => void;
   addMessageToSession: (sessionId: string, message: ChatMessage) => void;
   updateLastMessage: (
@@ -54,6 +65,11 @@ export interface AIChatSidePanelProps {
     sessionId: string,
     compaction: import('../infrastructure/ai/types').AISessionContextCompaction,
   ) => void;
+  forkSessionFromMessage?: (
+    sessionId: string,
+    messageId: string,
+    viewingScope?: Pick<AISessionScope, 'type' | 'targetId'>,
+  ) => Promise<AISession | null>;
   // Provider config
   providers: ProviderConfig[];
   activeProviderId: string;
@@ -93,6 +109,12 @@ export interface AIChatSidePanelProps {
   scopeLabel?: string;
   /** Workspace focused pane; preferred when inheriting AI chat after merge. */
   focusedSessionId?: string;
+  /** Issue #4098 phase 2: pin the AI chat a workspace scope is anchored to. */
+  onSetWorkspaceAnchorChat?: (workspaceId: string, chatId: string | null) => void;
+  /** Live workspaces (with their anchor chat), used for scope titles and anchor resolution. */
+  workspaces?: Array<{ id: string; title: string; anchorChatId?: string }>;
+  /** All currently live terminal (and workspace) scope target ids. */
+  liveScopeTargetIds?: Set<string>;
 
   // Terminal session context (from parent)
   terminalSessions?: Array<{

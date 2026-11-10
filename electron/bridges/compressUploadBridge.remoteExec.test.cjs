@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { execFileSync, spawnSync } = require("node:child_process");
+const { execFileSync, spawn, spawnSync } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const Module = require("node:module");
@@ -353,4 +353,105 @@ test("compressed promotion can clean a read-only old directory instead of leakin
     fs.readdirSync(target).some((name) => name.includes(".netcatty-compress-")),
     false,
   );
+});
+
+test("failed compressed extraction leaves the existing folder untouched", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-compress-interactive-fail-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "target");
+  const finalDir = path.join(target, "folder");
+  fs.mkdirSync(finalDir, { recursive: true });
+  fs.writeFileSync(path.join(finalDir, "old.txt"), "old");
+  const archive = path.join(target, "truncated.tar.gz");
+  fs.writeFileSync(archive, Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00]));
+
+  const command = buildAtomicRemoteExtractionCommand({
+    compressionId: "truncated-archive",
+    archivePath: archive,
+    targetDir: target,
+    folderName: "folder",
+  });
+  assert.throws(() => execFileSync("/bin/sh", ["-c", command], { stdio: "pipe" }));
+  assert.equal(fs.readFileSync(path.join(finalDir, "old.txt"), "utf8"), "old");
+  assert.equal(fs.readdirSync(target).some((name) => name.includes(".netcatty-compress-")), false);
+});
+
+test("compressed rollback survives repeated TERM and cleanup command failures", (t) => {
+  if (process.platform === "win32") return t.skip("POSIX signal test");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-compress-rollback-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const finalDir = path.join(root, "folder");
+  fs.mkdirSync(finalDir);
+  fs.writeFileSync(path.join(finalDir, "old.txt"), "old");
+  const archive = path.join(root, "archive.tar.gz");
+  fs.writeFileSync(archive, "unused");
+  const command = buildAtomicRemoteExtractionCommand({
+    compressionId: "interrupted-cleanup",
+    archivePath: archive,
+    targetDir: root,
+    folderName: "folder",
+  });
+  // Cancel at extraction, then interrupt each cleanup rm and report a failure
+  // after it has removed its target. Rollback must still finish and retain 143.
+  const result = spawnSync("/bin/sh", ["-c", [
+    'tar() { cleaning=1; kill -s TERM "$$"; }',
+    'rm() { command rm "$@"; if [ "$cleaning" = 1 ]; then kill -s TERM "$$"; return 1; fi; }',
+    command,
+  ].join("\n")], { encoding: "utf8", timeout: 15_000 });
+
+  assert.equal(result.status, 143, JSON.stringify(result));
+  assert.deepEqual(fs.readdirSync(root), ["folder"]);
+  assert.equal(fs.readFileSync(path.join(finalDir, "old.txt"), "utf8"), "old");
+});
+
+test("cancelled compressed extraction leaves the existing folder untouched", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX fifo test");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "netcatty-compress-interactive-cancel-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "target");
+  const finalDir = path.join(target, "folder");
+  fs.mkdirSync(finalDir, { recursive: true });
+  fs.writeFileSync(path.join(finalDir, "old.txt"), "old");
+  const archive = path.join(target, "blocked.tar.gz");
+  assert.equal(spawnSync("mkfifo", [archive]).status, 0);
+
+  const command = buildAtomicRemoteExtractionCommand({
+    compressionId: "blocked-archive",
+    archivePath: archive,
+    targetDir: target,
+    folderName: "folder",
+  });
+  const child = spawn("/bin/sh", ["-c", command], { detached: true, stdio: "ignore" });
+  const exited = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  t.after(() => {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+  });
+  // Match the production remote cleanup deadline; polling returns immediately
+  // when ready instead of adding a fixed delay to each run.
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return predicate();
+  };
+  const diagnostic = () => `target=${JSON.stringify(fs.readdirSync(target))}, pid=${child.pid}, exitCode=${child.exitCode}, signalCode=${child.signalCode}`;
+  // Do not interrupt mkdir/cp: wait for the preserved file so cancellation
+  // exercises extraction blocked on the FIFO.
+  assert.equal(await waitFor(() => fs.readdirSync(target).some((name) => (
+    name.endsWith(".stage") && fs.existsSync(path.join(target, name, "folder", "old.txt"))
+  ))), true, diagnostic());
+  process.kill(-child.pid, "SIGTERM");
+  assert.equal(
+    await waitFor(() => child.exitCode !== null && !fs.readdirSync(target).some((name) => name.includes(".netcatty-compress-"))),
+    true,
+    diagnostic(),
+  );
+  assert.deepEqual(await exited, { code: 143, signal: null });
+  assert.equal(fs.existsSync(archive), false);
+  assert.equal(fs.readFileSync(path.join(finalDir, "old.txt"), "utf8"), "old");
 });

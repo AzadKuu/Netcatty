@@ -1,5 +1,17 @@
-import type { HotkeyScheme, SessionLogFormat, TerminalSettings } from '../../domain/models';
-import { STORAGE_KEY_TERM_FONT_FAMILY } from '../../infrastructure/config/storageKeys';
+import { pluginThemeRegistry } from '../../infrastructure/config/pluginThemeRegistry';
+import {
+  DEFAULT_SHIFT_ENTER_NEWLINE_TEXT,
+  isLegacyDefaultShiftEnterNewlineText,
+  type HotkeyScheme,
+  type SessionLogFormat,
+  type TerminalSettings,
+} from '../../domain/models';
+import {
+  STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED,
+  STORAGE_KEY_TERM_FONT_FAMILY,
+  STORAGE_KEY_TERM_SETTINGS,
+  STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED,
+} from '../../infrastructure/config/storageKeys';
 import {
   isDeprecatedPrimaryFontId,
   TERMINAL_FONT_AUTO,
@@ -63,6 +75,50 @@ export function migrateIncomingTerminalFontId(raw: string | null | undefined): s
   }
   return raw;
 }
+/**
+ * One-time migration for the autoCloseOnExit default flip (tabs now survive
+ * session exits by default; the old default-on silently deleted tabs whenever
+ * a bastion or idle-harvesting server reported a clean exit). Builds before
+ * the flip shipped autoCloseOnExit: true as the default and materialized it
+ * into STORAGE_KEY_TERM_SETTINGS on any settings write, so most upgraders
+ * carry a value they never chose. Leaving it in place would make the new
+ * default unreachable for them. Reset that materialized `true` exactly once
+ * and persist the marker; afterwards every stored value is treated as the
+ * user's own choice and is respected. An inbound cloud or backup payload that
+ * still carries the pre-migration materialized true (no
+ * autoCloseOnExitDefaultMigrated flag) is rewritten to false so sync cannot
+ * resurrect auto-close. The cost: a user who deliberately enabled auto-close
+ * before this release must re-enable it once.
+ */
+export function migrateMaterializedAutoCloseOnExitDefault(): void {
+  if (localStorageAdapter.readBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED)) return;
+  const stored = localStorageAdapter.read<Partial<TerminalSettings>>(STORAGE_KEY_TERM_SETTINGS);
+  if (stored?.autoCloseOnExit === true) {
+    localStorageAdapter.write(STORAGE_KEY_TERM_SETTINGS, { ...stored, autoCloseOnExit: false });
+  }
+  localStorageAdapter.writeBoolean(STORAGE_KEY_TERM_AUTO_CLOSE_EXIT_MIGRATED, true);
+}
+
+/**
+ * One-time migration for the Shift+Enter default flip (#3770). Builds before
+ * that change materialized `\\n` into saved settings, so upgraders kept a
+ * bare newline and TUI CLIs still submitted. Rewrite only that old default
+ * (escaped or raw) to ESC+CR, then persist the marker. A later explicit `\\n`
+ * is left alone. Custom text is never rewritten. Sync and import do not
+ * read this marker; an old `\\n` from another device stays as stored.
+ */
+export function migrateMaterializedShiftEnterNewlineDefault(): void {
+  if (localStorageAdapter.readBoolean(STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED)) return;
+  const stored = localStorageAdapter.read<Partial<TerminalSettings>>(STORAGE_KEY_TERM_SETTINGS);
+  if (stored && isLegacyDefaultShiftEnterNewlineText(stored.shiftEnterNewlineText)) {
+    localStorageAdapter.write(STORAGE_KEY_TERM_SETTINGS, {
+      ...stored,
+      shiftEnterNewlineText: DEFAULT_SHIFT_ENTER_NEWLINE_TEXT,
+    });
+  }
+  localStorageAdapter.writeBoolean(STORAGE_KEY_TERM_SHIFT_ENTER_NEWLINE_MIGRATED, true);
+}
+
 // Auto-detect default hotkey scheme based on platform
 export const DEFAULT_HOTKEY_SCHEME: HotkeyScheme =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/i.test(navigator.platform)
@@ -197,6 +253,9 @@ export const applyThemeTokens = (
   accentOverride: string,
 ) => {
   const root = window.document.documentElement;
+  root.toggleAttribute('data-plugin-theme-active', pluginThemeRegistry.isActive(resolvedTheme));
+  const securityVars = buildAppThemeCssVars(pluginThemeRegistry.securityTokens(resolvedTheme), 'theme', '');
+  for (const [key, value] of Object.entries(securityVars)) root.style.setProperty('--host-security' + key.slice(1), value);
   root.classList.remove('light', 'dark');
   root.classList.add(resolvedTheme);
   const cssVars = buildAppThemeCssVars(tokens, accentMode, accentOverride);

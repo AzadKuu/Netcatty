@@ -4,8 +4,12 @@ function registerAgentProcessHandlers(ctx) {
   const maxCommandTimeoutSeconds = 24 * 60 * 60;
   // ── MCP Server session metadata ──
 
-  ipcMain.handle("netcatty:ai:mcp:update-sessions", async (event, { sessions: sessionList, chatSessionId }) => {
+  ipcMain.handle("netcatty:ai:mcp:update-sessions", async (event, { sessions: sessionList, chatSessionId, delegationTag }) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    if (mcpServerBridge.isPluginAgentConversation?.(chatSessionId)) {
+      try { mcpServerBridge.assertPluginAgentCaller(chatSessionId, event.sender.id, delegationTag); }
+      catch { return { ok: false, error: "Agent scope update unavailable" }; }
+    }
     const list = Array.isArray(sessionList) ? sessionList : [];
     const externalId = mcpServerBridge.EXTERNAL_MCP_CHAT_SESSION_ID;
     if (chatSessionId === externalId) {
@@ -135,11 +139,11 @@ function registerAgentProcessHandlers(ctx) {
   });
 
   // ── MCP Approval response (renderer → main) ──
-  ipcMain.handle("netcatty:ai:mcp:approval-response", async (event, { approvalId, approved }) => {
+  ipcMain.handle("netcatty:ai:mcp:approval-response", async (event, { approvalId, approved, scope }) => {
     // Settings window also hosts External MCP approval cards.
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
-    mcpServerBridge.resolveApprovalFromRenderer(approvalId, approved);
-    return { ok: true };
+    const accepted = mcpServerBridge.resolveApprovalFromRenderer(approvalId, approved, scope);
+    return { ok: true, accepted };
   });
 
   // Cancel MCP approval auto-deny after the user starts reviewing the card.

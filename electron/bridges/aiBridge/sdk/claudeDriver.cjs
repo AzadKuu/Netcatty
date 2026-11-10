@@ -5,7 +5,7 @@
  *
  * - Spawns the user's system `claude` binary via an ABSOLUTE pathToClaudeCodeExecutable
  *   (SDK existsSync-checks it; PATH is not resolved — issue #205).
- * - Repairs ~/.claude.json before spawn (ensureClaudeConfig).
+ * - Repairs ~/.claude.json before builtin turns only (ensureClaudeConfig).
  * - Bypasses the SDK's built-in permission system and BLOCKS built-in
  *   side-effect tools so the agent can only act through the injected netcatty
  *   MCP server (approval/scope/blocklist enforced there).
@@ -78,7 +78,7 @@ function parseClaudeSettings(settings) {
   return str;
 }
 
-const CLAUDE_REASONING_LEVELS = new Set(["low", "medium", "high", "max"]);
+const CLAUDE_REASONING_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 function splitClaudeModelSelection(model) {
   if (typeof model !== "string" || !model) {
@@ -101,7 +101,9 @@ function mergeClaudeEffortSettings(settings, effort) {
 function buildClaudeQueryOptions({
   cwd, model, env, pathToClaudeCodeExecutable, abortController, injectedMcpServers, settings, resume,
   toolIntegrationMode,
+  delegatedAgent = false,
 }) {
+  if (delegatedAgent && toolIntegrationMode !== "mcp") throw Error("Delegated Claude requires MCP mode");
   const { model: resolvedModel, effort } = splitClaudeModelSelection(model);
   const options = {
     cwd,
@@ -130,8 +132,17 @@ function buildClaudeQueryOptions({
     options.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
   }
   // Optional settings.json path / inline object — additive to CLAUDE_CONFIG_DIR.
-  const parsedSettings = mergeClaudeEffortSettings(parseClaudeSettings(settings), effort);
+  const parsedSettings = mergeClaudeEffortSettings(delegatedAgent ? undefined : parseClaudeSettings(settings), effort);
   if (parsedSettings !== undefined) options.settings = parsedSettings;
+  if (delegatedAgent) {
+    options.strictMcpConfig = true;
+    options.settingSources = [];
+    options.maxTurns = 12;
+    // Global plugin history belongs to core's source namespace. Rehydrate from
+    // that history each turn instead of creating a second native history store.
+    options.persistSession = false;
+    delete options.resume;
+  }
   return options;
 }
 
@@ -233,8 +244,10 @@ function buildClaudePromptInput(prompt, attachments) {
  * @param {object} args.emitter  createStreamEmitter(...)
  * @param {Function} [args.queryFn] inject @anthropic-ai/claude-agent-sdk query (for tests)
  */
-async function runClaudeTurn({ prompt, attachments, options, emitter, queryFn }) {
-  ensureClaudeConfig();
+async function runClaudeTurn({ prompt, attachments, options, emitter, queryFn, assertSessionValid, delegatedAgent = false }) {
+  // A delegated turn may use the selected host profile for authentication, but
+  // must not repair or delete unrelated files in the main process's home.
+  if (!delegatedAgent) ensureClaudeConfig();
   let query = queryFn;
   if (!query) {
     let sdk;
@@ -246,6 +259,7 @@ async function runClaudeTurn({ prompt, attachments, options, emitter, queryFn })
   let sessionId = null;
   let hasContent = false;
   try {
+    assertSessionValid?.();
     const stream = query({ prompt: promptInput, options });
     for await (const message of stream) {
       if (options.abortController?.signal?.aborted) break;
@@ -286,15 +300,47 @@ async function runClaudeTurn({ prompt, attachments, options, emitter, queryFn })
 /** Map claude-agent-sdk ModelInfo[] -> renderer preset shape {id,name,description}. */
 function mapClaudeModels(models) {
   if (!Array.isArray(models)) return [];
-  return models
-    .filter((m) => m && m.value)
-    .map((m) => ({
-      id: m.value,
-      name: m.displayName || m.value,
-      description: m.description,
-      thinkingLevels: ["low", "medium", "high", "max"],
-      defaultThinkingLevel: "medium",
-    }));
+  // SDK types declare {value, displayName, description}, but Claude Code's
+  // supportedModels() control response actually returns {id, name} at runtime
+  // (same CLI lineage as CodeBuddy — see mapCodebuddyModels). Accept both
+  // shapes so a live catalog is never filtered into an empty list, which
+  // would silently degrade the picker to build-time curated presets (#3496).
+  const presets = models
+    .map((m) => {
+      if (!m) return null;
+      const id = m.value || m.id || m.modelId;
+      if (!id) return null;
+      const advertisedLevels = m.supportedEffortLevels || m.thinking?.effort_options;
+      const thinkingLevels = m.supportsEffort === false
+        ? []
+        : Array.isArray(advertisedLevels)
+          ? advertisedLevels.filter((level) => CLAUDE_REASONING_LEVELS.has(level))
+          : ["low", "medium", "high", "max"];
+      return {
+        id,
+        name: m.displayName || m.name || id,
+        description: m.description,
+        thinkingLevels,
+        ...(thinkingLevels.length > 0 ? { defaultThinkingLevel: thinkingLevels.includes("medium") ? "medium" : thinkingLevels[0] } : {}),
+      };
+    })
+    .filter(Boolean);
+  const nameCounts = new Map();
+  for (const preset of presets) {
+    nameCounts.set(preset.name, (nameCounts.get(preset.name) || 0) + 1);
+  }
+  const usedNames = new Set(presets.map((preset) => preset.name));
+  return presets.map((preset) => {
+    if (nameCounts.get(preset.name) === 1) return preset;
+    let suffix = 1;
+    let name = `[${preset.id}] ${preset.name}`;
+    while (usedNames.has(name)) {
+      suffix += 1;
+      name = `[${preset.id} #${suffix}] ${preset.name}`;
+    }
+    usedNames.add(name);
+    return { ...preset, name };
+  });
 }
 
 /**

@@ -10,7 +10,7 @@ import {
   filterVaultImportKeyPassphrasesAgainstExisting,
   resolveVaultImportKeyPassphraseConflicts,
 } from "./vaultImport.ts";
-import { encodeCsvPassphrase } from "./vaultImport/csvCredentialFields.ts";
+import { encodeCsvPassphrase, encodeCsvLocalShell } from "./vaultImport/csvCredentialFields.ts";
 import type { Host } from "./models.ts";
 
 const mobaXtermSshSession = (
@@ -18,6 +18,79 @@ const mobaXtermSshSession = (
   port = 22,
   username = "root",
 ) => `#109#0%${hostname}%${port}%${username}%%-1%-1%%%%%0%0%0%%%-1%0%0%0%%1080%%0%0%1%#MobaFont%10%0%0%-1#0# #-1`;
+
+const JAVA_RANDOM_MULTIPLIER = 0x5deece66dn;
+const JAVA_RANDOM_ADDEND = 0xbn;
+const JAVA_RANDOM_MASK = (1n << 48n) - 1n;
+
+class TestJavaRandom {
+  private seed: bigint;
+
+  constructor(seed: bigint) {
+    this.seed = (BigInt.asIntN(64, seed) ^ JAVA_RANDOM_MULTIPLIER) & JAVA_RANDOM_MASK;
+  }
+
+  private next(bits: number): number {
+    this.seed = (this.seed * JAVA_RANDOM_MULTIPLIER + JAVA_RANDOM_ADDEND) & JAVA_RANDOM_MASK;
+    return Number(this.seed >> BigInt(48 - bits));
+  }
+
+  nextInt(bound: number): number {
+    if ((bound & -bound) === bound) {
+      return Math.floor((bound * this.next(31)) / 0x80000000);
+    }
+    let bits: number;
+    let value: number;
+    do {
+      bits = this.next(31);
+      value = bits % bound;
+    } while (((bits - value + (bound - 1)) | 0) < 0);
+    return value;
+  }
+
+  nextLong(): bigint {
+    const high = BigInt.asIntN(32, BigInt(this.next(32)));
+    const low = BigInt.asIntN(32, BigInt(this.next(32)));
+    return BigInt.asIntN(64, (high << 32n) + low);
+  }
+}
+
+const signedByte = (value: number): bigint => BigInt(value > 127 ? value - 256 : value);
+
+const encodeFinalShellPassword = (password: string, head: Uint8Array): string => {
+  assert.equal(head.length, 8);
+  const divisor = new TestJavaRandom(signedByte(head[5])).nextInt(127);
+  assert.notEqual(divisor, 0);
+  const random = new TestJavaRandom(BigInt.asIntN(64, 3680984568597093857n / BigInt(divisor)));
+  const iterations = Number(signedByte(head[0]));
+  for (let index = 0; index < iterations; index++) random.nextLong();
+  const secondRandom = new TestJavaRandom(random.nextLong());
+  const longs = [
+    signedByte(head[4]),
+    secondRandom.nextLong(),
+    signedByte(head[7]),
+    signedByte(head[3]),
+    secondRandom.nextLong(),
+    signedByte(head[1]),
+    random.nextLong(),
+    signedByte(head[2]),
+  ];
+  const keySource = Buffer.alloc(64);
+  longs.forEach((value, index) => keySource.writeBigInt64BE(BigInt.asIntN(64, value), index * 8));
+  const key = createHash("md5").update(keySource).digest().subarray(0, 8);
+  const cipher = createCipheriv("des-ede3", Buffer.concat([key, key, key]), null);
+  const encrypted = Buffer.concat([cipher.update(password, "utf8"), cipher.final()]);
+  return Buffer.concat([head, encrypted]).toString("base64");
+};
+
+const finalShellConnection = (password: string) => JSON.stringify({
+  name: "Synthetic FinalShell",
+  host: "synthetic.example.test",
+  port: 2222,
+  user_name: "tester",
+  conection_type: 100,
+  password,
+});
 
 test("ssh_config import maps ForwardX11 yes to host X11 forwarding", () => {
   const result = importVaultHostsFromText("ssh_config", [
@@ -133,6 +206,95 @@ test("detectVaultImportFormat recognizes csv and ssh_config exports", () => {
     detectVaultImportFormat(["Host prod", "  HostName prod.example.com", "  User deploy"].join("\n")),
     "ssh_config",
   );
+});
+
+test("FinalShell import decrypts a synthetic ASCII password", () => {
+  const password = "synthetic-secret";
+  const encrypted = encodeFinalShellPassword(password, Uint8Array.from([3, 18, 52, 86, 120, 11, 34, 56]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, password);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import decrypts a synthetic letter-number-dot password", () => {
+  const password = "Alpha9.beta2026";
+  const encrypted = encodeFinalShellPassword(password, Uint8Array.from([5, 201, 17, 88, 144, 23, 77, 199]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, password);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import skips damaged ciphertext and warns", () => {
+  const encrypted = encodeFinalShellPassword("synthetic-secret", Uint8Array.from([2, 41, 63, 85, 107, 29, 51, 73]));
+  const damaged = `${encrypted.slice(0, -2)}AA`;
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(damaged));
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /password.*decrypt/i);
+});
+
+test("FinalShell import accepts an empty password without warning", () => {
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(""));
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import rejects decrypted passwords containing control characters", () => {
+  const encrypted = encodeFinalShellPassword("invalid\u0085password", Uint8Array.from([4, 26, 48, 70, 92, 31, 53, 75]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /password.*decrypt/i);
+});
+
+test("FinalShell import skips non-SSH connection types", () => {
+  const result = importVaultHostsFromText("finalshell", JSON.stringify({
+    name: "RDP",
+    host: "windows.example.com",
+    port: 3389,
+    user_name: "Administrator",
+    conection_type: 1,
+  }));
+
+  assert.equal(result.hosts.length, 0);
+  assert.equal(result.stats.parsed, 1);
+  assert.equal(result.stats.skipped, 1);
+  assert.match(result.issues[0]?.message ?? "", /unsupported.*type/i);
+});
+
+test("FinalShell detection and parsing accept a UTF-8 BOM", () => {
+  const text = "\uFEFF" + JSON.stringify({ host: "bom.example.com", conection_type: 100 });
+  assert.equal(detectVaultImportFormat(text), "finalshell");
+  assert.equal(importVaultHostsFromText("finalshell", text).hosts[0]?.hostname, "bom.example.com");
+});
+
+test("FinalShell auto-detection accepts missing and null usernames", () => {
+  for (const user_name of [undefined, null]) {
+    const text = JSON.stringify({ host: "optional-user.example.com", conection_type: 100, user_name });
+    assert.equal(detectVaultImportFormat(text), "finalshell");
+    assert.equal(importVaultHostsFromText("finalshell", text).hosts.length, 1);
+  }
+});
+
+test("FinalShell detection requires characteristic fields and avoids generic JSON", () => {
+  assert.equal(detectVaultImportFormat(JSON.stringify({
+    name: "Production",
+    host: "prod.example.com",
+    port: 22,
+    user_name: "root",
+    conection_type: 100,
+  })), "finalshell");
+  assert.equal(detectVaultImportFormat(JSON.stringify({
+    name: "Generic host",
+    host: "generic.example.com",
+    port: 22,
+    username: "root",
+  })), null);
 });
 
 test("SecureCRT import reads the protocol-specific hexadecimal port", () => {
@@ -363,6 +525,73 @@ test("applyVaultImportDestination does not override retained key auth with ident
   assert.equal(targeted.hosts.length, 1);
   assert.deepEqual(targeted.hosts[0]?.identityFilePaths, ["~/.ssh/id_ed25519"]);
   assert.equal(targeted.hosts[0]?.identityId, undefined);
+});
+
+test("CSV import keeps default-shell local hosts distinct across OS values", () => {
+  // The merge key for local hosts must include the host OS: two default-shell
+  // entries (no shell/args/name/startDir) in the same group differ only by os,
+  // and dropping the second would silently lose that OS's default shell.
+  const csvQuote = (value: string): string => `"${value.replaceAll('"', '""')}"`;
+  const result = importVaultHostsFromText("csv", [
+    "Label,Hostname,Protocol,Group,LocalShell",
+    `Win,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "windows" }))}`,
+    `Nix,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "linux" }))}`,
+  ].join("\n"));
+
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.stats.duplicates, 0);
+  assert.equal(result.hosts.length, 2);
+  assert.deepEqual(
+    result.hosts.map((host) => host.os),
+    ["windows", "linux"],
+  );
+});
+
+test("import destination keeps local shells distinct through the full pipeline", () => {
+  // applyVaultImportDestination re-dedupe and applyVaultHostImport must not
+  // collapse CMD/PowerShell entries back onto the endpoint-only merge key.
+  const csvQuote = (value: string): string => `"${value.replaceAll('"', '""')}"`;
+  const result = importVaultHostsFromText("csv", [
+    "Label,Hostname,Protocol,Group,LocalShell",
+    `CMD,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "windows", shellName: "CMD" }))}`,
+    `PS,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "windows", shellName: "PowerShell" }))}`,
+  ].join("\n"));
+  assert.equal(result.hosts.length, 2);
+
+  const targeted = applyVaultImportDestination(result, {
+    mode: "group",
+    group: "Imported",
+  });
+  assert.equal(targeted.hosts.length, 2);
+  assert.deepEqual(
+    targeted.hosts.map((host) => host.localShellName),
+    ["CMD", "PowerShell"],
+  );
+
+  const applied = applyVaultHostImport([], [], targeted);
+  assert.equal(applied.hosts.length, 2);
+  assert.equal(applied.skippedExistingCount, 0);
+
+  // Re-importing the same backup into the same destination must skip both
+  // existing shell entries instead of importing them again.
+  const reapplied = applyVaultHostImport(applied.hosts, [], targeted);
+  assert.equal(reapplied.hosts.length, 2);
+  assert.equal(reapplied.skippedExistingCount, 2);
+});
+
+test("applyVaultHostImport still dedupes identical local shells but keeps different shells", () => {
+  const csvQuote = (value: string): string => `"${value.replaceAll('"', '""')}"`;
+  const result = importVaultHostsFromText("csv", [
+    "Label,Hostname,Protocol,Group,LocalShell",
+    `CMD,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "windows", shellName: "CMD" }))}`,
+    `PS,localhost,local,Tools,${csvQuote(encodeCsvLocalShell({ os: "windows", shellName: "PowerShell" }))}`,
+  ].join("\n"));
+
+  const existingCmd = result.hosts[0]!;
+  const applied = applyVaultHostImport([existingCmd], [], result);
+  assert.equal(applied.hosts.length, 2);
+  assert.equal(applied.skippedExistingCount, 1);
+  assert.equal(applied.addedHosts[0]?.localShellName, "PowerShell");
 });
 
 test("CSV import keeps working when KeyPath and Passphrase columns are absent", () => {
