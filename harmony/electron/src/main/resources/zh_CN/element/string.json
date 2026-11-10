@@ -10,7 +10,7 @@
     },
     {
       "name": "EntryAbility_label",
-      "value": "Electron"
+      "value": "Netcatty"
     },
     {
       "name": "button_ok",
@@ -22,11 +22,11 @@
     },
     {
       "name": "StatusBarEntryAbility_desc",
-      "value": "应用状态栏"
+      "value": "Netcatty 状态栏"
     },
     {
       "name": "StatusBarEntryAbility_label",
-      "value": "应用状态栏"
+      "value": "Netcatty 状态栏"
     },
     {
       "name": "OpenNewWindow_label",
