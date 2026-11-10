@@ -113,12 +113,50 @@ function writeAppScopeVersion(version) {
   }
 }
 
+function collectNodeModuleNames(seedNames) {
+  const sourceRoot = path.join(repoRoot, "node_modules");
+  const names = new Set(seedNames);
+  const queue = [...seedNames];
+  while (queue.length) {
+    const name = queue.pop();
+    const manifestPath = path.join(sourceRoot, name, "package.json");
+    if (!fs.existsSync(manifestPath)) continue;
+    let manifest;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    } catch {
+      continue;
+    }
+    for (const field of ["dependencies", "optionalDependencies"]) {
+      for (const dependency of Object.keys(manifest[field] || {})) {
+        if (names.has(dependency)) continue;
+        if (!fs.existsSync(path.join(sourceRoot, dependency))) continue;
+        names.add(dependency);
+        queue.push(dependency);
+      }
+    }
+  }
+  return [...names].sort();
+}
+
 function syncNodeModules() {
-  const names = fs
+  const seedNames = fs
     .readFileSync(nodeModulesListPath, "utf8")
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => line && !line.startsWith("#"));
+  // The repo manifest is authoritative for direct dependencies; the text list
+  // is a curated extra (packages the app requires indirectly at runtime).
+  let repoManifest = { dependencies: {} };
+  try {
+    repoManifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  } catch {
+    // fall back to the curated list alone
+  }
+  const seeds = new Set([...seedNames, ...Object.keys(repoManifest.dependencies || {})]);
+  // A direct dependency pulled in by an upstream merge may itself need packages
+  // that are not listed, so walk the production dependency graph as well.
+  const names = collectNodeModuleNames([...seeds]);
   const sourceRoot = path.join(repoRoot, "node_modules");
   const targetRoot = path.join(appDir, "node_modules");
   fs.mkdirSync(targetRoot, { recursive: true });
@@ -132,7 +170,7 @@ function syncNodeModules() {
     fs.cpSync(source, path.join(targetRoot, name), { recursive: true, force: true });
     copied += 1;
   }
-  log(`refreshed ${copied}/${names.length} node_modules entries`);
+  log(`refreshed ${copied}/${names.length} node_modules entries (including the dependency closure)`);
 }
 
 function main() {
