@@ -8,6 +8,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Readable } = require("node:stream");
 const tempDirBridge = require("./tempDirBridge.cjs");
+const harmonyCompat = require("../harmonyCompat.cjs");
 const {
   encodePathForSession,
   ensureRemoteDirForSession,
@@ -7692,10 +7693,15 @@ function runAdmittedTransfer(event, payload, onProgress, runner) {
 }
 
 function startTransfer(event, payload, onProgress) {
-  if (payload?.skipAdmission === true) {
-    return startTransferNow(event, payload, onProgress);
+  // On HarmonyOS the real Downloads folder is outside the app sandbox, so a
+  // target inherited from another profile would fail with EPERM. Redirect it
+  // before admission so every lifecycle/progress event carries the path that
+  // actually receives the bytes.
+  const admittedPayload = harmonyCompat.remapLocalTransferTarget(payload);
+  if (admittedPayload?.skipAdmission === true) {
+    return startTransferNow(event, admittedPayload, onProgress);
   }
-  return runAdmittedTransfer(event, payload, onProgress);
+  return runAdmittedTransfer(event, admittedPayload, onProgress);
 }
 
 async function startInternalTransfer(event, payload, onProgress) {

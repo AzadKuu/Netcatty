@@ -163,6 +163,84 @@ function shouldQuitOnWindowAllClosed(platform = process.platform) {
   return true;
 }
 
+/**
+ * HarmonyOS sandboxes apps out of /storage/Users/<user>, so writing a download
+ * straight into the user's Download folder fails with EPERM. Third-party apps
+ * only get that tree through a picker grant or an ACL permission, so downloads
+ * land in the app's own Downloads folder unless the platform lets us in.
+ */
+const DOWNLOAD_DIR_CANDIDATES = ["/storage/Users/currentUser/Download/Netcatty"];
+
+let cachedDownloadDir = null;
+
+function isDirectoryWritable(dir) {
+  if (!dir) return false;
+  const probeFile = path.join(dir, `.netcatty_dl_probe_${process.pid}`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(probeFile, "1");
+    fs.unlinkSync(probeFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function downloadDirCandidates(sandboxDownloads, platform) {
+  return isHarmony(platform)
+    ? [...DOWNLOAD_DIR_CANDIDATES, sandboxDownloads]
+    : [sandboxDownloads];
+}
+
+function getDownloadDir(app, platform = process.platform) {
+  if (!isHarmony(platform)) {
+    return path.join(getSafeHomeDir(app, platform), "Downloads", "Netcatty");
+  }
+  if (cachedDownloadDir) return cachedDownloadDir;
+  const sandboxDownloads = path.join(getSafeHomeDir(app, platform), "Downloads", "Netcatty");
+  for (const dir of downloadDirCandidates(sandboxDownloads, platform)) {
+    if (isDirectoryWritable(dir)) {
+      cachedDownloadDir = dir;
+      hcLog("getDownloadDir", { dir });
+      return dir;
+    }
+  }
+  // Nothing was writable: fall back to the sandbox anyway, creating it so the
+  // caller fails on the real reason rather than a missing directory.
+  try {
+    fs.mkdirSync(sandboxDownloads, { recursive: true });
+  } catch {
+    // Ignore: the transfer will surface the filesystem error.
+  }
+  hcLog("getDownloadDir fallback", { dir: sandboxDownloads });
+  return sandboxDownloads;
+}
+
+/**
+ * Keep a local download from failing when the requested folder is outside the
+ * app sandbox (stale UI state from a desktop profile, or the real Downloads
+ * folder on a locked-down device): the file is written to the app Downloads
+ * folder instead and the redirect is logged for support.
+ */
+function remapLocalTransferTarget(payload, options = {}) {
+  const platform = options.platform || process.platform;
+  if (!isHarmony(platform) || !payload || payload.targetType !== "local") return payload;
+  const targetPath = typeof payload.targetPath === "string" ? payload.targetPath : "";
+  if (!targetPath) return payload;
+  // Both hooks exist so tests can exercise the redirect without depending on
+  // the host filesystem's permission model.
+  const probeWritable = options.isDirectoryWritable || isDirectoryWritable;
+  if (probeWritable(path.dirname(targetPath))) return payload;
+  const downloadDir = options.downloadDir || getDownloadDir(options.app, platform);
+  const redirected = path.join(downloadDir, path.basename(targetPath));
+  hcLog("download target redirected", { from: targetPath, to: redirected });
+  return { ...payload, targetPath: redirected };
+}
+
+function resetDownloadDirCache() {
+  cachedDownloadDir = null;
+}
+
 function isLocalTerminalAvailable(platform = process.platform) {
   if (isHarmony(platform)) return false;
   return true;
@@ -207,6 +285,9 @@ module.exports = {
   shouldUseDevServer,
   shouldQuitOnWindowAllClosed,
   isLocalTerminalAvailable,
+  getDownloadDir,
+  remapLocalTransferTarget,
+  resetDownloadDirCache,
   isAutoLaunchSupported,
   isDeepLinkSupported,
   isExplorerContextMenuSupported,
