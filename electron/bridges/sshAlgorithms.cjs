@@ -26,6 +26,7 @@ const CIPHER_SSL_NAME_BY_ALGORITHM = Object.freeze({
 
 let _md5Supported = null;
 let _supportedCiphers = null;
+let _chaCha20Poly1305Supported = null;
 const dhGroupSupport = new Map();
 
 // MODP groups that every SSH runtime we target supports, so we skip the
@@ -77,9 +78,33 @@ function supportedCiphers() {
   return _supportedCiphers;
 }
 
+// ssh2's patch adds a JS ChaCha20 fallback for runtimes whose BoringSSL lacks
+// the standalone cipher. Some runtimes (HarmonyOS) also cannot require() the
+// ESM-only @noble/ciphers package, so neither path is available there; offering
+// the cipher anyway would fail the handshake with "Unsupported algorithm".
+function chaCha20Poly1305Supported() {
+  if (_chaCha20Poly1305Supported === null) {
+    let supported = false;
+    // chacha20-poly1305 also needs ssh2's Poly1305 WASM module.
+    if (typeof WebAssembly !== "undefined") {
+      try {
+        const chacha = require("ssh2/lib/protocol/crypto/chacha20.js");
+        supported = Boolean(chacha.nativeChacha20 || chacha.jsChacha20Available);
+      } catch {
+        supported = supportedCiphers().has("chacha20");
+      }
+    }
+    _chaCha20Poly1305Supported = supported;
+  }
+  return _chaCha20Poly1305Supported;
+}
+
 function filterRuntimeUnsupportedCiphers(cipherAlgorithms) {
   const ciphers = supportedCiphers();
   return cipherAlgorithms.filter((algo) => {
+    if (algo === "chacha20-poly1305@openssh.com") {
+      return chaCha20Poly1305Supported();
+    }
     const sslName = CIPHER_SSL_NAME_BY_ALGORITHM[algo];
     return !sslName || ciphers.has(sslName);
   });

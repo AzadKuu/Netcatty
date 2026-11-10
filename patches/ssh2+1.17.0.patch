@@ -919,7 +919,7 @@ index ad77592..03ab33b 100644
      [ /^OpenSSH_5[.][0-9]+/, COMPAT.DYN_RPORT_BUG ],
      [ /^OpenSSH_7[.]4/, COMPAT.IMPLY_RSA_SHA2_SIGALGS ],
 diff --git a/node_modules/ssh2/lib/protocol/crypto.js b/node_modules/ssh2/lib/protocol/crypto.js
-index 851cc73..088de2a 100644
+index 851cc73..fe61dc2 100644
 --- a/node_modules/ssh2/lib/protocol/crypto.js
 +++ b/node_modules/ssh2/lib/protocol/crypto.js
 @@ -11,6 +11,7 @@ const {
@@ -1002,29 +1002,55 @@ index 851cc73..088de2a 100644
                ? new ChaChaPolyDecipherBinding(config)
                : new ChaChaPolyDecipherNative(config));
      default: {
+@@ -1581,6 +1576,11 @@ module.exports = {
+     // eslint-disable-next-line no-async-promise-executor
+     return new Promise(async (resolve, reject) => {
+       try {
++        // Runtimes without WebAssembly (for example HarmonyOS ArkWeb) can still
++        // use the AES ciphers; only chacha20-poly1305 needs this module, so skip
++        // it instead of rejecting every SSH connection.
++        if (typeof WebAssembly === 'undefined')
++          return resolve();
+         POLY1305_WASM_MODULE = await require('./crypto/poly1305.js')();
+         POLY1305_RESULT_MALLOC = POLY1305_WASM_MODULE._malloc(16);
+         poly1305_auth = POLY1305_WASM_MODULE.cwrap(
 diff --git a/node_modules/ssh2/lib/protocol/crypto/chacha20.js b/node_modules/ssh2/lib/protocol/crypto/chacha20.js
 new file mode 100644
-index 0000000..86dd731
+index 0000000..96842ea
 --- /dev/null
 +++ b/node_modules/ssh2/lib/protocol/crypto/chacha20.js
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,31 @@
 +// OpenSSH uses original ChaCha20 (64-bit nonce), not the IETF/TLS AEAD.
 +// Electron's BoringSSL lacks the standalone cipher, including in sshcrypto.
 +'use strict';
 +const { createCipheriv, getCiphers } = require('crypto');
 +const nativeChacha20 = getCiphers().includes('chacha20');
-+const { chacha20orig } = nativeChacha20 ? {} : require('@noble/ciphers/chacha.js');
++// Some runtimes (for example HarmonyOS) cannot require() ESM packages, so a
++// missing JS fallback must not break module evaluation; it only disables the
++// cipher, and sshAlgorithms.cjs stops offering it.
++let chacha20orig = null;
++if (!nativeChacha20) {
++  for (const id of ['@noble/ciphers/chacha.cjs', '@noble/ciphers/chacha.js']) {
++    try {
++      chacha20orig = require(id).chacha20orig;
++      break;
++    } catch {}
++  }
++}
++const jsChacha20Available = typeof chacha20orig === 'function';
 +
 +function chacha20(key, iv, data) {
 +  if (nativeChacha20)
 +    return createCipheriv('chacha20', key, iv).update(data);
++  if (!jsChacha20Available)
++    throw new Error('ChaCha20 is not available on this runtime');
 +  // ssh2 only uses block counters 0 (length/Poly1305 key) and 1 (payload).
 +  // The last eight IV bytes are its big-endian SSH packet sequence nonce.
 +  return Buffer.from(chacha20orig(key, iv.subarray(8), data, undefined,
 +                                  iv.readUInt32LE(0)));
 +}
 +
-+module.exports = { chacha20, nativeChacha20 };
++module.exports = { chacha20, nativeChacha20, jsChacha20Available };
 diff --git a/node_modules/ssh2/lib/protocol/kex.js b/node_modules/ssh2/lib/protocol/kex.js
 index 811e631..422a198 100644
 --- a/node_modules/ssh2/lib/protocol/kex.js
