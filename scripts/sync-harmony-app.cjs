@@ -9,8 +9,9 @@
 // Usage:
 //   node scripts/sync-harmony-app.cjs [--node-modules] [--version <x.y.z>]
 //
-// --node-modules  also refresh app/node_modules from the repo install, limited to
-//                 the packages listed in scripts/harmony/node-modules.txt
+// --node-modules  also refresh app/node_modules with exactly the packages the main
+//                 process requires (discovered by scanning electron/**) plus their
+//                 transitive closure
 // --version       override the app version stamped into app/package.json
 
 const fs = require("node:fs");
@@ -23,7 +24,86 @@ const appDir = path.join(
   "harmony/web_engine/src/main/resources/resfile/resources/app",
 );
 const appJsonPath = path.join(repoRoot, "harmony/AppScope/app.json5");
-const nodeModulesListPath = path.join(repoRoot, "scripts/harmony/node-modules.txt");
+// Packages deliberately left out of the payload. Everything else is discovered by
+// scanning the main process for require()/import(), so this list only names what we
+// must not ship: modules that cannot load on HarmonyOS (desktop binaries, native
+// builds the port never reaches) and SDKs the agent drivers import lazily inside
+// try/catch, which would otherwise add hundreds of megabytes of x64 binaries.
+const SKIPPED_PACKAGES = new Set([
+  "node-pty",
+  "serialport",
+  "@serialport",
+  "@vscode/windows-process-tree",
+  "electron-updater",
+  "@withfig/autocomplete",
+  "@anthropic-ai/claude-agent-sdk",
+  "@cursor/sdk",
+  "@github/copilot-sdk",
+  "@mimo-ai/sdk",
+  "@openai/codex-sdk",
+  "@opencode-ai/sdk",
+  "@tencent-ai/agent-sdk",
+]);
+
+function isSkippedPackage(name) {
+  if (SKIPPED_PACKAGES.has(name)) return true;
+  for (const skipped of SKIPPED_PACKAGES) {
+    if (name.startsWith(`${skipped}/`)) return true;
+  }
+  return false;
+}
+
+function topLevelPackageName(specifier) {
+  const parts = specifier.split("/");
+  return specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+
+function collectSourceFiles(dir, out) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === "build") continue;
+      collectSourceFiles(path.join(dir, entry.name), out);
+    } else if (/\.(cjs|js|mjs)$/.test(entry.name) && !/\.test\./.test(entry.name)) {
+      out.push(path.join(dir, entry.name));
+    }
+  }
+  return out;
+}
+
+// Scan the shipped main-process code for every package it can reach. Dynamic
+// require(variable) calls do not occur outside tests, so this is exhaustive.
+function collectMainProcessRequires() {
+  const builtins = new Set(require("node:module").builtinModules);
+  const pattern = /(?:require\(\s*|import\(\s*)["']([^"']+)["']/g;
+  const names = new Set();
+  // electron/ is the main process itself; lib/, domain/ and infrastructure/ hold the
+  // shared .cjs helpers it requires, and those in turn require packages of their own.
+  const scanRoots = ["electron", "lib", "domain", "infrastructure"];
+  const files = [];
+  for (const root of scanRoots) {
+    collectSourceFiles(path.join(repoRoot, root), files);
+  }
+  for (const file of files) {
+    const source = fs.readFileSync(file, "utf8");
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const specifier = match[1];
+      if (!specifier || specifier.startsWith(".") || specifier.startsWith("/")) continue;
+      if (specifier.startsWith("node:") || builtins.has(specifier)) continue;
+      if (specifier === "electron") continue;
+      const name = topLevelPackageName(specifier);
+      if (isSkippedPackage(name)) continue;
+      names.add(name);
+    }
+  }
+  return names;
+}
 
 // Directories copied verbatim into the payload. `electron/` keeps the repo shape
 // so relative requires into lib/, domain/ and infrastructure/ keep working.
@@ -129,6 +209,7 @@ function collectNodeModuleNames(seedNames) {
     }
     for (const field of ["dependencies", "optionalDependencies"]) {
       for (const dependency of Object.keys(manifest[field] || {})) {
+        if (isSkippedPackage(dependency)) continue;
         if (names.has(dependency)) continue;
         if (!fs.existsSync(path.join(sourceRoot, dependency))) continue;
         names.add(dependency);
@@ -140,27 +221,15 @@ function collectNodeModuleNames(seedNames) {
 }
 
 function syncNodeModules() {
-  const seedNames = fs
-    .readFileSync(nodeModulesListPath, "utf8")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
-  // The repo manifest is authoritative for direct dependencies; the text list
-  // is a curated extra (packages the app requires indirectly at runtime).
-  let repoManifest = { dependencies: {} };
-  try {
-    repoManifest = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
-  } catch {
-    // fall back to the curated list alone
-  }
-  const seeds = new Set([...seedNames, ...Object.keys(repoManifest.dependencies || {})]);
-  // A direct dependency pulled in by an upstream merge may itself need packages
-  // that are not listed, so walk the production dependency graph as well.
-  const names = collectNodeModuleNames([...seeds]);
   const sourceRoot = path.join(repoRoot, "node_modules");
   const targetRoot = path.join(appDir, "node_modules");
+  const names = collectNodeModuleNames([...collectMainProcessRequires()]);
+  // Rebuild from scratch: a stale directory would otherwise keep packages that a
+  // previous (unpruned) run copied in.
+  fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.mkdirSync(targetRoot, { recursive: true });
   let copied = 0;
+  let bytes = 0;
   for (const name of names) {
     const source = path.join(sourceRoot, name);
     if (!fs.existsSync(source)) {
@@ -169,8 +238,37 @@ function syncNodeModules() {
     }
     fs.cpSync(source, path.join(targetRoot, name), { recursive: true, force: true });
     copied += 1;
+    bytes += directorySize(source);
   }
-  log(`refreshed ${copied}/${names.length} node_modules entries (including the dependency closure)`);
+  log(
+    `refreshed ${copied}/${names.length} node_modules entries (${(bytes / 1048576).toFixed(1)} MB, main-process requires + closure)`,
+  );
+}
+
+function directorySize(dir) {
+  let total = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (entry.isFile()) {
+        try {
+          total += fs.statSync(full).size;
+        } catch {
+          // ignore races on transient files
+        }
+      }
+    }
+  }
+  return total;
 }
 
 function main() {
