@@ -73,3 +73,35 @@ test("Grok card hides ACP toggle without runtime change handler", () => {
   assert.doesNotMatch(markup, /role="switch"/);
   assert.doesNotMatch(markup, /ai\.grok\.runtime\.acp\.title|Use Grok ACP \(agent stdio\)/);
 });
+
+test("DSH card surfaces the autonomy notice", () => {
+  const markup = renderToStaticMarkup(
+    <CopilotCliCard
+      pathInfo={{ path: "/usr/bin/dsh", version: "0.0.1", available: true }}
+      isResolvingPath={false}
+      customPath=""
+      onCustomPathChange={() => {}}
+      onRecheckPath={() => {}}
+      i18nPrefix="ai.dsh"
+    />,
+  );
+
+  assert.match(markup, /ai\.dsh\.autonomyNotice/);
+});
+
+test("other managed agent cards do not surface the DSH autonomy notice", () => {
+  for (const i18nPrefix of ["ai.copilot", "ai.mimo", "ai.grok"] as const) {
+    const markup = renderToStaticMarkup(
+      <CopilotCliCard
+        pathInfo={{ path: "/usr/bin/agent", version: "1.0.0", available: true }}
+        isResolvingPath={false}
+        customPath=""
+        onCustomPathChange={() => {}}
+        onRecheckPath={() => {}}
+        i18nPrefix={i18nPrefix}
+      />,
+    );
+
+    assert.doesNotMatch(markup, /ai\.dsh\./);
+  }
+});

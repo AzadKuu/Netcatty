@@ -1,0 +1,13 @@
+diff --git a/node_modules/@vscode/windows-process-tree/binding.gyp b/node_modules/@vscode/windows-process-tree/binding.gyp
+index 11a5e71..b10d3ec 100644
+--- a/node_modules/@vscode/windows-process-tree/binding.gyp
++++ b/node_modules/@vscode/windows-process-tree/binding.gyp
+@@ -17,7 +17,7 @@
+           "include_dirs": [],
+           "libraries": [ 'psapi.lib' ],
+           "msvs_configuration_attributes": {
+-            "SpectreMitigation": "Spectre"
++            "SpectreMitigation": "<!(node -p \"process.env.NETCATTY_NO_SPECTRE?'false':'Spectre'\")"
+           },
+           "msvs_settings": {
+             "VCCLCompilerTool": {

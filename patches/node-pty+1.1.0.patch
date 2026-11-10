@@ -1,17 +1,70 @@
+diff --git a/node_modules/node-pty/binding.gyp b/node_modules/node-pty/binding.gyp
+index 5f63978..3ff8a1e 100644
+--- a/node_modules/node-pty/binding.gyp
++++ b/node_modules/node-pty/binding.gyp
+@@ -6,7 +6,7 @@
+     'conditions': [
+       ['OS=="win"', {
+         'msvs_configuration_attributes': {
+-          'SpectreMitigation': 'Spectre'
++          'SpectreMitigation': '<!(node -p "process.env.NETCATTY_NO_SPECTRE?\'false\':\'Spectre\'")'
+         },
+         'msvs_settings': {
+             'VCCLCompilerTool': {
+diff --git a/node_modules/node-pty/deps/winpty/src/winpty.gyp b/node_modules/node-pty/deps/winpty/src/winpty.gyp
+index 1ac5758..512a3c0 100644
+--- a/node_modules/node-pty/deps/winpty/src/winpty.gyp
++++ b/node_modules/node-pty/deps/winpty/src/winpty.gyp
+@@ -41,7 +41,7 @@
+                 '-luser32',
+             ],
+             'msvs_configuration_attributes': {
+-                'SpectreMitigation': 'Spectre'
++                'SpectreMitigation': '<!(node -p "process.env.NETCATTY_NO_SPECTRE?\'false\':\'Spectre\'")'
+             },
+             'msvs_settings': {
+                 # Specify this setting here to override a setting from somewhere
+@@ -143,7 +143,7 @@
+                 '-luser32',
+             ],
+             'msvs_configuration_attributes': {
+-                'SpectreMitigation': 'Spectre'
++                'SpectreMitigation': '<!(node -p "process.env.NETCATTY_NO_SPECTRE?\'false\':\'Spectre\'")'
+             },
+             'msvs_settings': {
+                 # Specify this setting here to override a setting from somewhere
 diff --git a/node_modules/node-pty/src/win/conpty.cc b/node_modules/node-pty/src/win/conpty.cc
-index 7b286d3..5423c8e 100644
+index 7b286d3..8798913 100644
 --- a/node_modules/node-pty/src/win/conpty.cc
 +++ b/node_modules/node-pty/src/win/conpty.cc
-@@ -35 +35 @@ typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
+@@ -32,7 +32,7 @@
+ typedef VOID* HPCON;
+ typedef HRESULT (__stdcall *PFNCREATEPSEUDOCONSOLE)(COORD c, HANDLE hIn, HANDLE hOut, DWORD dwFlags, HPCON* phpcon);
+ typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
 -typedef HRESULT (__stdcall *PFNCLEARPSEUDOCONSOLE)(HPCON hpc);
 +typedef HRESULT (__stdcall *PFNCLEARPSEUDOCONSOLE)(HPCON hpc, BOOL keepCursorRow);
-@@ -526 +526 @@ static Napi::Value PtyClear(const Napi::CallbackInfo& info) {
+ typedef void (__stdcall *PFNCLOSEPSEUDOCONSOLE)(HPCON hpc);
+ typedef void (__stdcall *PFNRELEASEPSEUDOCONSOLE)(HPCON hpc);
+ 
+@@ -523,7 +523,7 @@ static Napi::Value PtyClear(const Napi::CallbackInfo& info) {
+       PFNCLEARPSEUDOCONSOLE const pfnClearPseudoConsole = (PFNCLEARPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ConptyClearPseudoConsole");
+       if (pfnClearPseudoConsole)
+       {
 -        pfnClearPseudoConsole(handle->hpc);
 +        pfnClearPseudoConsole(handle->hpc, TRUE);
+       }
+     }
+   }
 diff --git a/node_modules/node-pty/src/win/conpty.h b/node_modules/node-pty/src/win/conpty.h
 index 4cef31c..4f03a0c 100644
 --- a/node_modules/node-pty/src/win/conpty.h
 +++ b/node_modules/node-pty/src/win/conpty.h
-@@ -33 +33 @@ CONPTY_EXPORT HRESULT WINAPI ConptyResizePseudoConsole(HPCON hPC, COORD size);
+@@ -30,7 +30,7 @@ CONPTY_EXPORT HRESULT WINAPI ConptyCreatePseudoConsole(COORD size, HANDLE hInput
+ CONPTY_EXPORT HRESULT WINAPI ConptyCreatePseudoConsoleAsUser(HANDLE hToken, COORD size, HANDLE hInput, HANDLE hOutput, DWORD dwFlags, HPCON* phPC);
+ 
+ CONPTY_EXPORT HRESULT WINAPI ConptyResizePseudoConsole(HPCON hPC, COORD size);
 -CONPTY_EXPORT HRESULT WINAPI ConptyClearPseudoConsole(HPCON hPC);
 +CONPTY_EXPORT HRESULT WINAPI ConptyClearPseudoConsole(HPCON hPC, BOOL keepCursorRow);
+ CONPTY_EXPORT HRESULT WINAPI ConptyShowHidePseudoConsole(HPCON hPC, bool show);
+ CONPTY_EXPORT HRESULT WINAPI ConptyReparentPseudoConsole(HPCON hPC, HWND newParent);
+ CONPTY_EXPORT HRESULT WINAPI ConptyReleasePseudoConsole(HPCON hPC);

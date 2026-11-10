@@ -484,7 +484,16 @@ function assertSafeTempDir(tempDir, expectedIdentity) {
   if (expectedIdentity && (stat.dev !== expectedIdentity.dev || stat.ino !== expectedIdentity.ino)) {
     throw new Error("Netcatty temp directory identity changed during this process.");
   }
-  fs.chmodSync(tempDir, 0o700);
+  try {
+    fs.chmodSync(tempDir, 0o700);
+  } catch (error) {
+    // Windows maps chmod onto the read-only attribute and can reject it for a
+    // directory another process created with a different ACL, even though the
+    // path itself is a real directory owned by the current user. Failing the
+    // whole temp dir over that would stop the main window from opening, so only
+    // surface the error when it cannot be attributed to permissions.
+    if (error?.code !== "EPERM" && error?.code !== "EACCES" && error?.code !== "ENOTSUP") throw error;
+  }
   const expectedRealPath = path.join(fs.realpathSync(path.dirname(tempDir)), path.basename(tempDir));
   if (fs.realpathSync(tempDir) !== expectedRealPath) {
     throw new Error("Netcatty temp directory must not traverse symbolic links.");

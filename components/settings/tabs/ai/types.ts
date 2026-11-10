@@ -248,6 +248,12 @@ export const AGENT_DEFAULTS: Record<string, Omit<ExternalAgentConfig, "id" | "co
     icon: "mimo",
     sdkBackend: "mimo",
   },
+  dsh: {
+    name: "DSH",
+    args: [],
+    icon: "dsh",
+    sdkBackend: "dsh",
+  },
 };
 
 // ---------------------------------------------------------------------------

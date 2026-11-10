@@ -311,6 +311,19 @@ export const esAiMessages: Messages = {
   'ai.mimo.check': 'Verificar',
   'ai.mimo.resetPath': 'Restablecer',
 
+  // AI DSH (DeepSeek Harness — agente ACP de automatización)
+  'ai.dsh.title': 'DSH',
+  'ai.dsh.description': 'CLI de DeepSeek Harness (DSH) ejecutando su perfil ACP. Instala DSH, completa su propio inicio de sesión una vez y luego selecciónalo como agente de codificación externo.',
+  'ai.dsh.detecting': 'Detectando...',
+  'ai.dsh.detected': 'Detectado',
+  'ai.dsh.notFound': 'No encontrado',
+  'ai.dsh.path': 'Ruta:',
+  'ai.dsh.notFoundHint': 'No se pudo encontrar dsh en el PATH. Instala DSH o especifica la ruta del ejecutable a continuación; en Windows normalmente no está en el PATH.',
+  'ai.dsh.customPathPlaceholder': 'p. ej. C:\\Tools\\dsh\\dsh.cmd',
+  'ai.dsh.check': 'Verificar',
+  'ai.dsh.resetPath': 'Restablecer',
+  'ai.dsh.autonomyNotice': 'DSH es un agente ACP solo de automatización: nunca solicita permiso de herramientas a esta aplicación, por lo que los modos Observador y Confirmar no pueden bloquear sus acciones. Úsalo solo en espacios de trabajo donde sea aceptable la ejecución autónoma de comandos.',
+
   // AI Grok Build (in-app managed agent — distinct from External MCP client install)
   'ai.grok.title': 'Grok Build',
   'ai.grok.description': "La CLI de agente de codificación Grok Build de xAI. Instala la CLI de Grok, inicia sesión con `grok login` o define XAI_API_KEY, y luego selecciónala como agente externo.",

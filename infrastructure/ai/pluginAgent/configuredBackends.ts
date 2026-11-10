@@ -6,7 +6,7 @@ import { getExternalAgentSdkBackend } from '../managedAgents';
 import type { ExternalAgentConfig, ProviderConfig } from '../types';
 import { netcattyBridge } from '../../services/netcattyBridge';
 
-const externalKinds = ['claude', 'codex', 'copilot', 'cursor', 'codebuddy', 'opencode', 'grok', 'mimo'] as const;
+const externalKinds = ['claude', 'codex', 'copilot', 'cursor', 'codebuddy', 'opencode', 'grok', 'mimo', 'dsh'] as const;
 type Model = ReturnType<typeof getConfiguredCattyAgentModel>;
 
 // Match the existing Catty Agent's host-owned provider/model override settings.

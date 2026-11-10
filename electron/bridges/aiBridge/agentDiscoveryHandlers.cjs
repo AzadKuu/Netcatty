@@ -33,6 +33,40 @@ function isCursorSdkInstalled() {
   return false;
 }
 
+// The DSH CLI ships inside the DeepSeek Harness desktop app and is usually not
+// on PATH, so discovery falls back to the launcher the app installs.
+function resolveDshCliPath(shellEnv, resolveFromPath) {
+  const env = shellEnv || process.env;
+  const nodePath = require("node:path");
+  const nodeFs = require("node:fs");
+  const candidates = [];
+  if (typeof env.DSH_CLI_PATH === "string" && env.DSH_CLI_PATH.trim()) {
+    candidates.push(env.DSH_CLI_PATH.trim());
+  }
+  const harnessBin = (...segments) => nodePath.join(...segments, "dsh.cmd");
+  const localAppData = env.LOCALAPPDATA || env.APPDATA;
+  if (localAppData) {
+    candidates.push(harnessBin(localAppData, "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin"));
+  }
+  const home = env.HOME || env.USERPROFILE;
+  if (home) {
+    candidates.push(nodePath.join(home, ".local", "bin", "dsh"));
+    candidates.push(nodePath.join(home, ".dsh", "bin", "dsh"));
+    candidates.push(harnessBin(home, "AppData", "Local", "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin"));
+    candidates.push(nodePath.join(home, "Applications", "DeepSeek Harness.app", "Contents", "Resources", "runtime", "cli", "bin", "dsh"));
+  }
+  candidates.push("/usr/local/bin/dsh", "/opt/homebrew/bin/dsh", "/usr/bin/dsh");
+  for (const candidate of candidates) {
+    try {
+      if (candidate && nodeFs.existsSync(candidate)) return candidate;
+    } catch { /* keep looking */ }
+  }
+  if (typeof resolveFromPath === "function") {
+    return resolveFromPath("dsh", env);
+  }
+  return null;
+}
+
 async function probeCursorSdkAvailability(shellEnv, options = {}) {
   const platformPackageName = getCursorPlatformPackageName();
 
@@ -126,6 +160,8 @@ function registerAgentDiscoveryHandlers(ctx) {
         description: "xAI's Grok Build coding agent CLI", sdkBackend: "grok", args: [] },
       { command: "mimo", name: "MiMo Code", icon: "mimo",
         description: "Xiaomi's MiMo Code CLI, an OpenCode fork", sdkBackend: "mimo", args: [] },
+      { command: "dsh", name: "DeepSeek Harness", icon: "dsh",
+        description: "DeepSeek Harness agent over the Agent Client Protocol", sdkBackend: "dsh", args: [] },
     ];
 
     const shellEnv = await getShellEnv();
@@ -145,7 +181,9 @@ function registerAgentDiscoveryHandlers(ctx) {
         ? (cursorSdkStatus.cliLoginOk
           ? (cursorSdkStatus.cliBinPath || "cursor")
           : (cursorSdkStatus.sdkInstalled ? "cursor" : (cursorSdkStatus.cliBinPath || "cursor")))
-        : await resolveCliFromPathAsync(agent.command, shellEnv); // Layer-1: locate
+        : agent.command === "dsh"
+          ? await resolveDshCliPath(shellEnv, resolveCliFromPathAsync)
+          : await resolveCliFromPathAsync(agent.command, shellEnv); // Layer-1: locate
       if (!resolvedPath || seenPaths.has(resolvedPath)) continue;
 
       const probe = agent.command === "cursor"
@@ -180,6 +218,10 @@ function registerAgentDiscoveryHandlers(ctx) {
           auth = { authenticated: true, authSource: "mimo-config" };
         } else if (agent.command === "grok") {
           auth = probeGrokAuth({ env: shellEnv });
+        } else if (agent.command === "dsh") {
+          // Credentials live in the DeepSeek Harness profile; the ACP profile
+          // reports MISSING_CREDENTIAL on the first turn when none is set.
+          auth = { authenticated: false, authSource: null };
         }
       } catch { /* auth probe is best-effort */ }
 
@@ -527,4 +569,4 @@ function registerAgentDiscoveryHandlers(ctx) {
   }
 }
 
-module.exports = { registerAgentDiscoveryHandlers, computeCursorInstallState };
+module.exports = { registerAgentDiscoveryHandlers, computeCursorInstallState, resolveDshCliPath };

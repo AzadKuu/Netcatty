@@ -3,7 +3,7 @@ import { getCommandBasename, isPathLikeCommand } from './shared/pathLikeCommand'
 
 export { isPathLikeCommand, getCommandBasename };
 
-export type ManagedAgentKey = 'codex' | 'claude' | 'copilot' | 'cursor' | 'codebuddy' | 'opencode' | 'grok' | 'mimo';
+export type ManagedAgentKey = 'codex' | 'claude' | 'copilot' | 'cursor' | 'codebuddy' | 'opencode' | 'grok' | 'mimo' | 'dsh';
 
 const MANAGED_AGENT_META: Record<ManagedAgentKey, { commandNames: string[]; sdkBackend: string }> = {
   codex: { commandNames: ['codex'], sdkBackend: 'codex' },
@@ -14,6 +14,7 @@ const MANAGED_AGENT_META: Record<ManagedAgentKey, { commandNames: string[]; sdkB
   opencode: { commandNames: ['opencode'], sdkBackend: 'opencode' },
   grok: { commandNames: ['grok'], sdkBackend: 'grok' },
   mimo: { commandNames: ['mimo'], sdkBackend: 'mimo' },
+  dsh: { commandNames: ['dsh'], sdkBackend: 'dsh' },
 };
 
 function matchesPrimaryCliBasename(command: string | undefined, agentKey: ManagedAgentKey): boolean {
@@ -31,7 +32,8 @@ export function isSettingsManagedDiscoveredAgent(
     || agent.command === 'codebuddy'
     || agent.command === 'opencode'
     || agent.command === 'grok'
-    || agent.command === 'mimo';
+    || agent.command === 'mimo'
+    || agent.command === 'dsh';
 }
 
 export function matchesManagedAgentConfig(

@@ -385,7 +385,8 @@ export function shouldLoadSdkRuntimeModels(agent?: ExternalAgentConfig): boolean
     || sdkBackend === 'codebuddy'
     || sdkBackend === 'opencode'
     || sdkBackend === 'grok'
-    || sdkBackend === 'mimo';
+    || sdkBackend === 'mimo'
+    || sdkBackend === 'dsh';
 }
 
 // Alias ids the claude CLI itself still resolves: its alias table maps

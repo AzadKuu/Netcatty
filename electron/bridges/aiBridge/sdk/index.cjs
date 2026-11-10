@@ -19,6 +19,7 @@ const opencode = require("./opencodeDriver.cjs");
 const grok = require("./grokDriver.cjs");
 const grokAcp = require("./grokAcpDriver.cjs");
 const mimo = require("./mimoDriver.cjs");
+const dshAcp = require("./dshAcpDriver.cjs");
 const { codebuddySessionManager } = require("./codebuddySessionManager.cjs");
 
 function hasCodebuddyQueryOnlyOptions(options) {
@@ -474,7 +475,32 @@ const DRIVER_REGISTRY = {
         deadlineTs: ctx.catalogDeadlineTs,
       });
     },
+  },  dsh: {
+    async runTurn(ctx) {
+      return dshAcp.runDshAcpTurn({
+        prompt: ctx.prompt,
+        assertSessionValid: ctx.assertSessionValid,
+        cwd: ctx.cwd,
+        model: ctx.model,
+        env: ctx.env,
+        binPath: ctx.binPath,
+        permissionMode: ctx.permissionMode,
+        resumeSessionId: ctx.resumeSessionId,
+        emitter: ctx.emitter,
+        abortController: ctx.abortController,
+        signal: ctx.signal,
+      });
+    },
+    async listModels(ctx) {
+      return dshAcp.listDshAcpModels({
+        cwd: ctx.cwd,
+        env: ctx.env,
+        binPath: ctx.binPath,
+        signal: ctx.signal,
+      });
+    },
   },
+
 };
 function getDriver(backend) {
   const driver = DRIVER_REGISTRY[backend];

@@ -238,5 +238,6 @@ export function getInitialManagedAgentPaths(agents: ExternalAgentConfig[]) {
     opencode: getAutoManagedAgentStoredPath(agents, "opencode") ?? "",
     grok: getAutoManagedAgentStoredPath(agents, "grok") ?? "",
     mimo: getAutoManagedAgentStoredPath(agents, "mimo") ?? "",
+    dsh: getAutoManagedAgentStoredPath(agents, "dsh") ?? "",
   };
 }

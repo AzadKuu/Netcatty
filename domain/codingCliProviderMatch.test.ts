@@ -18,6 +18,12 @@ test('matchCodingCliProviderFromCommand resolves known CLIs', () => {
   assert.equal(matchCodingCliProviderFromCommand('factory')?.id, 'droid');
   assert.equal(matchCodingCliProviderFromCommand('grok')?.id, 'grok');
   assert.equal(matchCodingCliProviderFromCommand('C:\\\\Tools\\\\grok.exe')?.id, 'grok');
+  assert.equal(matchCodingCliProviderFromCommand('dsh')?.id, 'dsh');
+});
+
+test('dsh resolves its own icon key instead of the terminal fallback', () => {
+  assert.equal(matchCodingCliProviderFromCommand('dsh')?.iconKey, 'dsh');
+  assert.equal(matchCodingCliProviderFromTitle('DeepSeek Harness')?.id, 'dsh');
 });
 
 test('matchCodingCliProviderFromTitle detects Claude Code and Codex titles', () => {

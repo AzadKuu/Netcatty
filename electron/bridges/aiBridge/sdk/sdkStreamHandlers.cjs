@@ -36,7 +36,9 @@ const MODEL_LIST_TIMEOUT_MS = 10000;
 // dedicated `mimo serve` process for every catalog pull (unlike OpenCode's
 // pooled server), so its server start + provider query needs more than the
 // shared default.
-const MODEL_LIST_TIMEOUT_OVERRIDES_MS = { mimo: 30_000 };
+// dsh boots an Electron-as-node runtime behind a .cmd launcher and then opens
+// an ACP session just to read its model list, so a cold start can pass 10s.
+const MODEL_LIST_TIMEOUT_OVERRIDES_MS = { mimo: 30_000, dsh: 30_000 };
 const sdkModelCache = new Map();
 const sdkModelInFlight = new Map();
 const {

@@ -1,5 +1,5 @@
 import React from "react";
-import { RefreshCw, RotateCcw } from "lucide-react";
+import { RefreshCw, RotateCcw, ShieldAlert } from "lucide-react";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
 import { Switch } from "../../../ui/switch";
@@ -14,7 +14,7 @@ export const CopilotCliCard: React.FC<{
   onCustomPathChange: (path: string) => void;
   onRecheckPath: () => void;
   onResetPath?: () => void;
-  i18nPrefix?: "ai.copilot" | "ai.cursor" | "ai.opencode" | "ai.grok" | "ai.mimo";
+  i18nPrefix?: "ai.copilot" | "ai.cursor" | "ai.opencode" | "ai.grok" | "ai.mimo" | "ai.dsh";
   allowEmptyCheck?: boolean;
   showCustomPathInput?: boolean;
   /** Grok only: ACP (default) vs headless streaming-json. */
@@ -36,6 +36,9 @@ export const CopilotCliCard: React.FC<{
   const { t } = useI18n();
   const found = pathInfo?.available;
   const showGrokRuntime = i18nPrefix === "ai.grok" && typeof onGrokRuntimeChange === "function";
+  // DSH is an ACP automation agent: it never sends session/request_permission,
+  // so the global approval mode cannot gate its tool calls.
+  const showAutonomyNotice = i18nPrefix === "ai.dsh";
 
   const statusText = isResolvingPath
     ? t(`${i18nPrefix}.detecting`)
@@ -59,6 +62,15 @@ export const CopilotCliCard: React.FC<{
           {statusText}
         </div>
       </div>
+
+      {showAutonomyNotice && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+          <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
+          <p className="min-w-0 text-xs leading-5 text-amber-600 dark:text-amber-400">
+            {t("ai.dsh.autonomyNotice")}
+          </p>
+        </div>
+      )}
 
       {found && (
         <div className="flex items-center gap-2 text-xs min-w-0">

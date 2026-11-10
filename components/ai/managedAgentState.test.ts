@@ -362,6 +362,34 @@ test('buildManagedAgentState stores MIMOCODE_BIN for mimo', () => {
   });
 });
 
+test('buildManagedAgentState stores no env overrides for dsh', () => {
+  const state = buildManagedAgentState(
+    [],
+    'catty',
+    'dsh',
+    { path: '/opt/homebrew/bin/dsh', version: '0.0.1', available: true },
+  );
+
+  assert.equal(state.agents.length, 1);
+  assert.equal(state.agents[0].id, 'discovered_dsh');
+  assert.equal(state.agents[0].name, 'DSH');
+  assert.equal(state.agents[0].command, '/opt/homebrew/bin/dsh');
+  assert.equal(state.agents[0].sdkBackend, 'dsh');
+  assert.equal(state.agents[0].env, undefined);
+});
+
+test('getInitialManagedAgentPaths restores a manual dsh path', () => {
+  const state = buildManagedAgentState(
+    [],
+    'catty',
+    'dsh',
+    { path: '/opt/homebrew/bin/dsh', version: '0.0.1', available: true },
+    'manual',
+  );
+
+  assert.equal(getInitialManagedAgentPaths(state.agents).dsh, '/opt/homebrew/bin/dsh');
+});
+
 test('updateCodebuddyManagedEnv creates a disabled managed entry before CLI detection', () => {
   const state = updateCodebuddyManagedEnv([], 'internal', 'CODEBUDDY_API_KEY=secret');
 

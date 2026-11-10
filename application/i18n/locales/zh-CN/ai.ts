@@ -311,6 +311,19 @@ export const zhCNAiMessages: Messages = {
   'ai.mimo.check': '检查',
   'ai.mimo.resetPath': '重置',
 
+  // AI DSH（DeepSeek Harness，ACP 自动化 Agent）
+  'ai.dsh.title': 'DSH',
+  'ai.dsh.description': 'DeepSeek Harness（DSH）CLI，以 ACP 模式运行。安装 DSH 并用 `dsh` 完成一次登录后，即可作为外部编程 Agent 选择。',
+  'ai.dsh.detecting': '检测中...',
+  'ai.dsh.detected': '已检测到',
+  'ai.dsh.notFound': '未找到',
+  'ai.dsh.path': '路径：',
+  'ai.dsh.notFoundHint': '在 PATH 中未找到 dsh。请安装 DSH 或在下方指定可执行文件路径；Windows 下它通常不在 PATH 中。',
+  'ai.dsh.customPathPlaceholder': '例如 C:\\Tools\\dsh\\dsh.cmd',
+  'ai.dsh.check': '检查',
+  'ai.dsh.resetPath': '重置',
+  'ai.dsh.autonomyNotice': 'DSH 是纯自动化的 ACP Agent：它从不向本应用请求工具权限，因此观察模式和确认模式都无法拦截它的操作。请仅在可以接受自动执行命令的工作区中使用。',
+
   // AI Grok Build（应用内托管 Agent，与 External MCP「添加到 Grok」不同）
   'ai.grok.title': 'Grok Build',
   'ai.grok.description': 'xAI 的 Grok Build 编程 Agent CLI。安装 Grok CLI，使用 `grok login` 登录或设置 XAI_API_KEY 后，即可作为外部 Agent 选择。',
