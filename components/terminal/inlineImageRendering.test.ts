@@ -29,15 +29,21 @@ const readCallbackBody = (source: string, marker: string): string => {
 };
 
 test("the image addon is created from settings and only when inline images are on", () => {
-  assert.match(runtimeSource, /import \{ ImageAddon \} from "@xterm\/addon-image"/);
+  assert.match(runtimeSource, /import type \{ ImageAddon \} from "@xterm\/addon-image"/);
+  assert.doesNotMatch(
+    runtimeSource,
+    /^import \{ ImageAddon \} from "@xterm\/addon-image"/m,
+    "the addon package must not be imported eagerly: evaluating it needs WebAssembly",
+  );
+  assert.match(runtimeSource, /const InlineImageAddon = getInlineImageAddonCtor\(\);/);
   assert.match(
     runtimeSource,
-    /const inlineImageOptions = resolveTerminalInlineImageAddonOptions\(settings\);[\s\S]{0,400}?if \(inlineImageOptions\) \{[\s\S]{0,300}?new ImageAddon\(inlineImageOptions\)[\s\S]{0,120}?term\.loadAddon\(imageAddon\)/,
+    /const inlineImageOptions = resolveTerminalInlineImageAddonOptions\(settings\);[\s\S]{0,600}?if \(inlineImageOptions && InlineImageAddon\) \{[\s\S]{0,300}?new InlineImageAddon\(inlineImageOptions\)[\s\S]{0,120}?term\.loadAddon\(imageAddon\)/,
     "the addon must be constructed from resolved settings and skipped when they resolve to null",
   );
 
   const openIndex = runtimeSource.indexOf("term.open(ctx.container)");
-  const imageAddonIndex = runtimeSource.indexOf("new ImageAddon(inlineImageOptions)");
+  const imageAddonIndex = runtimeSource.indexOf("new InlineImageAddon(inlineImageOptions)");
   const webglIndex = runtimeSource.indexOf("const webglController = createWebglRendererController(");
 
   assert.ok(openIndex !== -1 && imageAddonIndex !== -1 && webglIndex !== -1);
@@ -49,6 +55,36 @@ test("the image addon is created from settings and only when inline images are o
     imageAddonIndex < webglIndex,
     "the addon must patch setRenderer before the WebGL renderer is created, so image layers survive renderer swaps",
   );
+});
+
+test("the addon loader stays off runtimes without WebAssembly", () => {
+  const loaderSource = readFileSync(
+    new URL("./runtime/inlineImageAddon.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    loaderSource,
+    /typeof WebAssembly !== "undefined"/,
+    "the loader must gate the dynamic import on WebAssembly being available",
+  );
+  assert.match(
+    loaderSource,
+    /loadPromise = import\("@xterm\/addon-image"\)/,
+    "the addon package must be loaded through a dynamic import",
+  );
+
+  for (const mountSource of [
+    readFileSync(new URL("./terminalRuntimeMount.ts", import.meta.url), "utf8"),
+    readFileSync(new URL("./useTerminalEffects.ts", import.meta.url), "utf8"),
+  ]) {
+    const loadIndex = mountSource.indexOf("await loadInlineImageAddon()");
+    const createIndex = mountSource.indexOf("createXTermRuntime({");
+    assert.ok(loadIndex !== -1, "terminal boot must await the addon loader");
+    assert.ok(
+      loadIndex < createIndex,
+      "the addon must be loaded before the runtime is created so it can patch the render service",
+    );
+  }
 });
 
 test("the image addon is disposed before the terminal that owns its layers", () => {
@@ -71,7 +107,7 @@ test("hasInlineImages reports live image storage instead of a sticky flag", () =
     /const hasInlineImages = \(\): boolean => \{[\s\S]{0,200}?imageAddon\.storageUsage > 0/,
     "a session must stop blocking hibernate once its image cache is emptied",
   );
-  assert.match(runtimeSource, /\n {4}hasInlineImages,\n/, "the runtime must expose hasInlineImages");
+  assert.match(runtimeSource, /\n {4}hasInlineImages,\r?\n/, "the runtime must expose hasInlineImages");
 });
 
 test("a session holding inline images degrades to soft-hide instead of full hibernate", () => {

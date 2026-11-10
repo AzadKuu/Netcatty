@@ -529,6 +529,7 @@ export const zhTWVaultMessages: Messages = {
   'terminal.dragDrop.notConnected': '無法拖放檔案 - 終端未連線',
   'terminal.dragDrop.errorTitle': '拖放錯誤',
   'terminal.dragDrop.errorMessage': '處理拖放檔案失敗',
+  'terminal.dragDrop.platformUnsupported': '目前平台無法讀取拖入檔案的內容。請在 SFTP 面板右鍵選擇「上傳檔案」來挑選要傳輸的檔案。',
   'terminal.dragDrop.destinationUnknown': '無法確定目前終端目錄。請啟用目錄追蹤，或先開啟 SFTP 選擇上傳目錄。',
   'terminal.dragDrop.uploadCancelled': '終端連線已變更或無法繼續重用，本次上傳已取消。請重新連線後再次拖放檔案。',
   'terminal.dragDrop.needsSudoElevation': '目前目錄登入使用者無法寫入。請在主機設定中開啟 Sudo 提權，或回到使用者目錄後再拖放。',

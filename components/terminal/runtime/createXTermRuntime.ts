@@ -1,6 +1,6 @@
 import { stringCellWidth } from "../autocomplete/terminalStringCellWidth";
 import { FitAddon } from "@xterm/addon-fit";
-import { ImageAddon } from "@xterm/addon-image";
+import type { ImageAddon } from "@xterm/addon-image";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
@@ -36,6 +36,7 @@ import {
   shouldScrollOnTerminalPaste,
 } from "../../../domain/terminalScroll";
 import { resolveTerminalInlineImageAddonOptions } from "../../../domain/terminalInlineImages";
+import { getInlineImageAddonCtor } from "./inlineImageAddon";
 import {
   resolveHostTerminalFontFamilyId,
   resolveHostTerminalFontSize,
@@ -678,10 +679,16 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   // once per terminal; changing them takes effect on the next terminal, exactly
   // like rendererType.
   const inlineImageOptions = resolveTerminalInlineImageAddonOptions(settings);
+  const InlineImageAddon = getInlineImageAddonCtor();
   let imageAddon: ImageAddon | null = null;
-  if (inlineImageOptions) {
+  if (inlineImageOptions && !InlineImageAddon) {
+    logger.warn(
+      "[XTerm] Inline image addon not loaded; inline images stay disabled for this terminal",
+    );
+  }
+  if (inlineImageOptions && InlineImageAddon) {
     try {
-      imageAddon = new ImageAddon(inlineImageOptions);
+      imageAddon = new InlineImageAddon(inlineImageOptions);
       term.loadAddon(imageAddon);
     } catch (err) {
       logger.warn("[XTerm] Inline image addon failed to load", err);

@@ -1,11 +1,12 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const harmonyCompat = require("./harmonyCompat.cjs");
 
 const OPEN_TERMINAL_PATH_CHANNEL = "netcatty:openTerminalPath";
 const OPEN_TERMINAL_PATH_ARG = "--open-terminal-path";
 
-function expandHomePath(targetPath, { osHomedir = os.homedir } = {}) {
+function expandHomePath(targetPath, { osHomedir = () => harmonyCompat.getSafeHomeDir() } = {}) {
   if (!targetPath) return targetPath;
   if (targetPath === "~") return osHomedir();
   if (targetPath.startsWith("~/")) return path.join(osHomedir(), targetPath.slice(2));

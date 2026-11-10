@@ -45,6 +45,12 @@ function isBenignStreamError(err) {
   return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
 }
 
+function isHarmonyWasmUnavailableError(err) {
+  if (!err) return false;
+  const msg = String(err.message || err);
+  return msg.includes("WebAssembly is not defined");
+}
+
 function classifyProcessError(err, options = {}) {
   const runtimeStarted = options.runtimeStarted === true;
 
@@ -52,6 +58,13 @@ function classifyProcessError(err, options = {}) {
     return {
       action: "ignore",
       reason: "benign stream teardown",
+    };
+  }
+
+  if (isHarmonyWasmUnavailableError(err)) {
+    return {
+      action: "suppress",
+      reason: "WebAssembly unavailable on HarmonyOS V8 (undici/llhttp lazy init)",
     };
   }
 

@@ -117,6 +117,7 @@ export const esTerminalMessages: Messages = {
   'terminal.dragDrop.notConnected': 'No se pueden soltar archivos: la terminal no está conectada',
   'terminal.dragDrop.errorTitle': 'Error al soltar',
   'terminal.dragDrop.errorMessage': 'No se pudieron procesar los archivos soltados',
+  'terminal.dragDrop.platformUnsupported': 'Esta plataforma no puede leer el contenido de los archivos soltados. Abra el panel SFTP y use "Subir archivos" para seleccionarlos.',
   'terminal.dragDrop.destinationUnknown': 'No se pudo determinar la carpeta actual del terminal. Active el seguimiento de directorios o abra SFTP y elija primero una carpeta de carga.',
   'terminal.dragDrop.uploadCancelled': 'La carga se canceló porque la conexión del terminal cambió o no se pudo reutilizar. Vuelva a soltar los archivos después de reconectar.',
   'terminal.dragDrop.needsSudoElevation': 'Esta carpeta no es escribible con el usuario de inicio de sesión. Active la elevación Sudo en la configuración del host, o vuelva al directorio de usuario y suelte de nuevo.',

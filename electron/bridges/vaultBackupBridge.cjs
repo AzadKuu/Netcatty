@@ -186,14 +186,46 @@ function isSafeStorageAvailable(safeStorage) {
   return Boolean(safeStorage?.isEncryptionAvailable?.());
 }
 
+// safeStorage encrypts through the OS keystore, and some backends refuse
+// payloads past a few hundred KiB. The HarmonyOS port throws
+// "Error while encrypting the text provided to safeStorage.encryptString."
+// from ~256 KiB up (128 KiB still encrypts), which broke every vault backup
+// big enough to hold a real host list. Splitting the plaintext into chunks
+// keeps the same encryption while staying inside those limits.
+const SAFE_STORAGE_CHUNK_CHARS = 64 * 1024;
+
+// Never split a surrogate pair across chunks: encryptString converts to UTF-8,
+// and a lone surrogate would be replaced instead of round-tripping.
+function nextChunkEnd(raw, start, maxChunkChars) {
+  let end = Math.min(raw.length, start + maxChunkChars);
+  if (end < raw.length) {
+    const code = raw.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+  }
+  return end;
+}
+
 function encodePayload(payload, safeStorage) {
   if (!isSafeStorageAvailable(safeStorage)) {
     throw new VaultBackupEncryptionUnavailableError();
   }
   const raw = JSON.stringify(payload);
+  if (raw.length <= SAFE_STORAGE_CHUNK_CHARS) {
+    return {
+      encoding: "safeStorage-v1",
+      data: safeStorage.encryptString(raw).toString("base64"),
+    };
+  }
+  const chunks = [];
+  let offset = 0;
+  while (offset < raw.length) {
+    const end = nextChunkEnd(raw, offset, SAFE_STORAGE_CHUNK_CHARS);
+    chunks.push(safeStorage.encryptString(raw.slice(offset, end)).toString("base64"));
+    offset = end;
+  }
   return {
-    encoding: "safeStorage-v1",
-    data: safeStorage.encryptString(raw).toString("base64"),
+    encoding: "safeStorage-chunked-v1",
+    data: chunks,
   };
 }
 
@@ -203,6 +235,19 @@ function decodePayload(record, safeStorage) {
       throw new VaultBackupEncryptionUnavailableError();
     }
     const decrypted = safeStorage.decryptString(Buffer.from(record.payloadData, "base64"));
+    return JSON.parse(decrypted);
+  }
+
+  if (record.payloadEncoding === "safeStorage-chunked-v1") {
+    if (!safeStorage?.decryptString || !isSafeStorageAvailable(safeStorage)) {
+      throw new VaultBackupEncryptionUnavailableError();
+    }
+    if (!Array.isArray(record.payloadData)) {
+      throw new Error("Invalid chunked vault backup payload");
+    }
+    const decrypted = record.payloadData
+      .map((chunk) => safeStorage.decryptString(Buffer.from(String(chunk), "base64")))
+      .join("");
     return JSON.parse(decrypted);
   }
 

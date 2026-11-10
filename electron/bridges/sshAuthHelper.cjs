@@ -8,6 +8,7 @@ const path = require("node:path");
 const os = require("node:os");
 const { createHash } = require("node:crypto");
 const { exec } = require("node:child_process");
+const harmonyCompat = require("../harmonyCompat.cjs");
 const { utils: sshUtils } = require("ssh2");
 const { prepareSystemSshAgent } = require("./systemSshAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
@@ -19,6 +20,11 @@ const {
   InvalidPrivateKeyError,
   hasPrivateKeyMaterial,
 } = require("./privateKeyNormalizer.cjs");
+
+let _appRef = null;
+function setAppRef(app) { _appRef = app; }
+function getHomeDir() { return harmonyCompat.getSafeHomeDir(_appRef); }
+function getSshDir() { return harmonyCompat.getSafeSshDir(_appRef); }
 
 // Default SSH key names in priority order
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
@@ -144,7 +150,7 @@ function isKeyEncrypted(keyContent) {
 
 function expandIdentityFilePath(keyPath) {
   return keyPath.startsWith("~/")
-    ? path.join(os.homedir(), keyPath.slice(2))
+    ? path.join(getHomeDir(), keyPath.slice(2))
     : keyPath;
 }
 
@@ -391,7 +397,7 @@ async function loadFirstIdentityFileForAuth({
  * @returns {Promise<{ privateKey: string, keyPath: string, keyName: string } | null>}
  */
 async function findDefaultPrivateKey() {
-  const sshDir = path.join(os.homedir(), ".ssh");
+  const sshDir = getSshDir();
   let allNames = [];
   try {
     const entries = await fs.promises.readdir(sshDir);
@@ -424,7 +430,7 @@ async function findDefaultPrivateKey() {
  */
 async function findAllDefaultPrivateKeys(options = {}) {
   const { includeEncrypted = false } = options;
-  const sshDir = path.join(os.homedir(), ".ssh");
+  const sshDir = getSshDir();
 
   let allNames = [];
   try {
@@ -769,7 +775,7 @@ function resolveIdentityAgentPath(rawPath, context = {}) {
   const proxyJump = context.proxyJump || "";
   const tokenValues = {
     "%": "%",
-    d: os.homedir(),
+    d: getHomeDir(),
     h: hostname,
     i: String(context.uid ?? (typeof process.getuid === "function" ? process.getuid() : "")),
     j: proxyJump,
@@ -786,7 +792,7 @@ function resolveIdentityAgentPath(rawPath, context = {}) {
     .digest("hex");
   const expanded = value
     .replace(/%([%CdhijkLlnpru])/g, (match, token) => tokenValues[token] ?? match)
-    .replace(/^~(?=$|[\\/])/, os.homedir())
+    .replace(/^~(?=$|[\\/])/, getHomeDir())
     .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => process.env[name] ?? "")
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => process.env[name] ?? "");
   return expanded || null;
@@ -848,7 +854,7 @@ async function getAvailableForwardingAgentSocket(identityAgent, injected = {}) {
   }
 
   const env = injected.localEnv || process.env;
-  const home = injected.homedir || os.homedir();
+  const home = injected.homedir || getHomeDir();
   const inheritedCandidates = [env.SSH_AUTH_SOCK, env.SSH_AUTH_SOCKET].filter(Boolean);
   const candidates = [...new Set([
     ...inheritedCandidates,
@@ -2078,6 +2084,7 @@ async function requestPassphrasesForEncryptedKeys(sender, hostname, options = {}
 }
 
 module.exports = {
+  setAppRef,
   PREFERRED_KEY_NAMES,
   SSH_KEY_PATTERN,
   orderSshIdentityNames,

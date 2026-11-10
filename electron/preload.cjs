@@ -1,6 +1,7 @@
 const { ipcRenderer, contextBridge, webUtils } = require("electron");
 const os = require("node:os");
 const { randomUUID } = require("node:crypto");
+const harmonyCompat = require("./harmonyCompat.cjs");
 const { SessionTombstones } = require("./preload/sessionTombstones.cjs");
 const { createPreloadApi } = require("./preload/api.cjs");
 const {
@@ -910,7 +911,7 @@ const existing = (typeof window !== "undefined" && window.netcatty) ? window.net
 
 function getAllowedRendererOrigins() {
   const origins = new Set(["app://netcatty"]);
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const devServerUrl = harmonyCompat.shouldUseDevServer() ? process.env.VITE_DEV_SERVER_URL : undefined;
   if (typeof devServerUrl === "string" && devServerUrl.length > 0) {
     try {
       const u = new URL(devServerUrl);
@@ -944,7 +945,29 @@ function isTrustedRendererLocation(allowedOrigins) {
 }
 
 const allowedOrigins = getAllowedRendererOrigins();
-if (isTrustedRendererLocation(allowedOrigins)) {
+if (harmonyCompat.isHarmony()) {
+  const harmonyApi = { ...api };
+  harmonyApi.getWindowsPtyInfo = () => null;
+  harmonyApi.getPathForFile = () => undefined;
+  // File-picker results are regular ArkWeb File objects, so staging through
+  // File.stream() works; only drag-and-drop hands us Files with no readable
+  // backend. Reject those explicitly instead of uploading a 0-byte file.
+  harmonyApi.stageUploadFile = async (file, transferId) => {
+    if (file && typeof file.slice === "function") {
+      try {
+        await file.slice(0, 1).arrayBuffer();
+      } catch {
+        throw new Error("Dropped file content is unavailable on HarmonyOS: use the SFTP \"Upload File(s)\" picker instead");
+      }
+    }
+    return api.stageUploadFile(file, transferId);
+  };
+  try {
+    contextBridge.exposeInMainWorld("netcatty", { ...existing, ...harmonyApi, ...figSpecApi });
+  } catch(e) {
+    console.warn("[Preload] HarmonyOS: failed to expose simplified API:", e.message);
+  }
+} else if (isTrustedRendererLocation(allowedOrigins)) {
   contextBridge.exposeInMainWorld("netcatty", { ...existing, ...api, ...figSpecApi });
 } else {
   // If a window navigates to an untrusted origin, do NOT expose the bridge.

@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const harmonyCompat = require("./harmonyCompat.cjs");
 
 const EXPLORER_CONTEXT_MENU_PREFERENCES_FILE = "explorer-context-menu-preferences.json";
 // Separate from the user preference: records that a no-verb default-off probe
@@ -22,6 +23,7 @@ const OPEN_TERMINAL_PATH_ARG = "--open-terminal-path";
 const SUPPRESSION_VALUE = "ProgrammaticAccessOnly";
 
 function isWindowsPlatform(platform = process.platform) {
+  if (harmonyCompat.isHarmony(platform)) return false;
   return platform === "win32";
 }
 

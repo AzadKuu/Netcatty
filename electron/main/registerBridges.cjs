@@ -1,5 +1,7 @@
 "use strict";
 
+const harmonyCompat = require("../harmonyCompat.cjs");
+
 let bridgesRegistered = false;
 let cloudSyncSessionPassword = null;
 const { readClipboardFiles, readClipboardImage, hasClipboardImage } = require("../bridges/clipboardFiles.cjs");
@@ -384,6 +386,7 @@ function createBridgeRegistrar(context) {
       MessageChannelMain: electronModule.MessageChannelMain,
     });
     terminalWorkerManager = isTerminalWorkerEnabled({ env: process.env }) && electronModule.utilityProcess
+      && harmonyCompat.isTerminalWorkerSupported()
       ? createTerminalWorkerManager({
           utilityProcess: electronModule.utilityProcess,
           electronModule,
@@ -639,7 +642,7 @@ function createBridgeRegistrar(context) {
           return { success: false, entries: [], error: "Invalid directory path" };
         }
         const resolvedPath = dirPath.startsWith("~")
-          ? dirPath.replace(/^~/, require("os").homedir())
+          ? dirPath.replace(/^~/, harmonyCompat.getSafeHomeDir())
           : dirPath;
         const normalizedPrefix = typeof filterPrefix === "string" ? filterPrefix.toLowerCase() : "";
         const maxEntries = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 200) : 100;
@@ -1070,7 +1073,7 @@ function createBridgeRegistrar(context) {
   
       const result = await dialog.showOpenDialog({
         title: title || "Select File",
-        defaultPath: defaultPath || os.homedir(),
+        defaultPath: defaultPath || harmonyCompat.getSafeHomeDir(),
         filters: filters || [{ name: "All Files", extensions: ["*"] }],
         properties: ["openFile", "showHiddenFiles"],
       });

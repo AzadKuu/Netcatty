@@ -2,6 +2,7 @@
 import { useRef } from 'react';
 import { publishPluginTerminalRuntimeLifecycleEvent } from '../../application/state/pluginTerminalRuntimeLifecycle';
 import { markTerminalCommandCompletionPending } from './runtime/promptLineBreak';
+import { loadInlineImageAddon } from './runtime/inlineImageAddon';
 import { resolveFontWeightBold } from '../../lib/fontWeightAvailability';
 import { bundledFamiliesInStack } from '../../lib/fontAvailability';
 import { isMacPlatform } from '../../lib/utils';
@@ -466,6 +467,11 @@ export function useTerminalEffects(ctx: TerminalEffectsContext) {
 
     const boot = async () => {
       try {
+        if (disposed || !containerRef.current) return;
+
+        // Load the inline-image addon (no-op on runtimes without WebAssembly) before
+        // the runtime opens the terminal so the addon can patch the render service.
+        await loadInlineImageAddon();
         if (disposed || !containerRef.current) return;
 
         const runtime = createXTermRuntime({

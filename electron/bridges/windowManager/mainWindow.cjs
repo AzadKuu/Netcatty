@@ -573,7 +573,6 @@ function createMainWindowApi(ctx) {
         }
       }
     
-      // Production mode - load via custom protocol.
       await win.loadURL(`app://netcatty/index.html${rendererHash}`);
       return win;
     }

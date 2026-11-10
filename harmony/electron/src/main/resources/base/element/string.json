@@ -1,0 +1,52 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Netcatty desktop workspace"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Netcatty SSH, SFTP and serial workspace"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Netcatty"
+    },
+    {
+      "name": "BrowserAbility_desc",
+      "value": "Netcatty browser window"
+    },
+    {
+      "name": "BrowserAbility_label",
+      "value": "Netcatty"
+    },
+    {
+      "name": "button_ok",
+      "value": "ok"
+    },
+    {
+      "name": "button_cancel",
+      "value": "cancel"
+    },
+    {
+      "name": "StatusBarEntryAbility_desc",
+      "value": "Netcatty status bar"
+    },
+    {
+      "name": "StatusBarEntryAbility_label",
+      "value": "Netcatty"
+    },
+    {
+      "name": "StatelessAbility_desc",
+      "value": "Netcatty background window"
+    },
+    {
+      "name": "StatelessAbility_label",
+      "value": "Netcatty"
+    },
+    {
+      "name": "OpenNewWindow_label",
+      "value": "OpenNewWindow"
+    }
+  ]
+}

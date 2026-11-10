@@ -73,6 +73,16 @@ export class ActiveTerminalCwdUnavailableError extends Error {
   }
 }
 
+export function isDroppedFileContentUnavailable(error: unknown): boolean {
+  if (!error) return false;
+  const name = (error as { name?: unknown }).name;
+  const message = error instanceof Error ? error.message : String(error);
+  return name === "NotFoundError"
+    || name === "NotReadableError"
+    || message.includes("could not be found at the time an operation was processed")
+    || message.includes("Dropped file content is unavailable");
+}
+
 export function resolveTerminalDropErrorMessage(
   error: unknown,
   t: UseTerminalDragDropOptions["t"],
@@ -85,6 +95,9 @@ export function resolveTerminalDropErrorMessage(
   }
   if (error instanceof Error && error.message === "No files to upload") {
     return t("terminal.dragDrop.noFiles");
+  }
+  if (isDroppedFileContentUnavailable(error)) {
+    return t("terminal.dragDrop.platformUnsupported");
   }
   return t("terminal.dragDrop.errorMessage");
 }

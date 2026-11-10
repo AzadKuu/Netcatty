@@ -8,6 +8,7 @@ const path = require("node:path");
 const os = require("node:os");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const harmonyCompat = require("../harmonyCompat.cjs");
 
 const execFileAsync = promisify(execFile);
 const MAX_LOCAL_TREE_DIRECTORIES = 50_000;
@@ -589,7 +590,7 @@ async function listLocalTree(event, payload) {
  * Get the home directory
  */
 async function getHomeDir() {
-  return os.homedir();
+  return harmonyCompat.getSafeHomeDir();
 }
 
 /**
@@ -606,7 +607,7 @@ async function getSystemInfo() {
  * Read system known_hosts file
  */
 async function readKnownHosts() {
-  const homeDir = os.homedir();
+  const homeDir = harmonyCompat.getSafeHomeDir();
   const knownHostsPaths = [];
 
   if (process.platform === "win32") {

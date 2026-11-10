@@ -9,8 +9,17 @@
 
 const fs = require("node:fs");
 const net = require("node:net");
-const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
-const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
+// The MCP SDK is an optional dependency at runtime: HarmonyOS payloads do not
+// ship it, and this file is only executed when an agent spawns the stdio server.
+// Keep the failure recoverable so the rest of the app is unaffected.
+let McpServer = null;
+let StdioServerTransport = null;
+try {
+  ({ McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js"));
+  ({ StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js"));
+} catch (error) {
+  console.warn("[netcatty-mcp] @modelcontextprotocol/sdk unavailable:", error?.message || error);
+}
 const { getCatalogToolDescription } = require("./catalogToolMetadata.cjs");
 const { registerMcpTools } = require("../capabilities/codegen/mcpToolRegistry.cjs");
 const { normalizeMcpJsonRpcMessage } = require("./normalizeMcpCallArguments.cjs");
@@ -196,6 +205,11 @@ function rpcCall(method, params) {
 }
 
 // ── MCP Server ──
+
+if (!McpServer) {
+  process.stderr.write("[netcatty-mcp] @modelcontextprotocol/sdk not available, exiting\n");
+  process.exit(1);
+}
 
 const server = new McpServer({
   name: "netcatty-remote-hosts",

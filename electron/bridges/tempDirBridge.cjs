@@ -9,6 +9,24 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
+const harmonyCompat = require("../harmonyCompat.cjs");
+
+// HarmonyOS resolves the home directory from the Electron app's paths, and this
+// bridge is loaded before `electron.app` is ready in some entry paths, so look the
+// app up lazily instead of capturing it at module load.
+function getElectronApp() {
+  try {
+    const electron = require("node:electron");
+    return electron?.app || null;
+  } catch {
+    try {
+      const electron = require("electron");
+      return electron?.app || null;
+    } catch {
+      return null;
+    }
+  }
+}
 
 // Keep the legacy name when the OS already provides a private per-user temp
 // root. Shared temp roots fall back to a stable directory under the user's home
@@ -277,7 +295,7 @@ async function hasValidToolOutputManifestSignature(manifest, signingKey) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function resolvePrivateTempDir(systemTempDir = os.tmpdir(), homeDir = os.homedir()) {
+function resolvePrivateTempDir(systemTempDir = os.tmpdir(), homeDir = harmonyCompat.getSafeHomeDir(getElectronApp())) {
   if (typeof process.getuid !== "function") {
     return path.join(systemTempDir, NETCATTY_TEMP_DIR_NAME);
   }

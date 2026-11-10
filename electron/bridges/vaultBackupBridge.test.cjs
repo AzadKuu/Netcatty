@@ -220,6 +220,89 @@ test("isEncryptionAvailable reports safeStorage state accurately", () => {
   }
 });
 
+test("large payloads are encrypted in chunks so size-limited backends still work", async () => {
+  const rootDir = createTempRoot();
+  // Mirrors the HarmonyOS port: encryptString throws above ~128 KiB, which is
+  // well under MAX_PAYLOAD_BYTES and easily reached by a real host list.
+  const encryptLimit = 128 * 1024;
+  let chunkCount = 0;
+  const safeStorage = {
+    isEncryptionAvailable() {
+      return true;
+    },
+    encryptString(value) {
+      if (value.length > encryptLimit) {
+        throw new Error(
+          "Error while encrypting the text provided to safeStorage.encryptString.",
+        );
+      }
+      chunkCount += 1;
+      return Buffer.from(`enc:${value}`, "utf8");
+    },
+    decryptString(buffer) {
+      const decoded = Buffer.from(buffer).toString("utf8");
+      if (!decoded.startsWith("enc:")) throw new Error("Bad payload");
+      return decoded.slice(4);
+    },
+  };
+  const service = createVaultBackupService({
+    app: {
+      getPath(key) {
+        if (key !== "userData") throw new Error(`Unexpected path key: ${key}`);
+        return rootDir;
+      },
+    },
+    safeStorage,
+    shell: { openPath: async () => "" },
+  });
+  const bigBlob = "x".repeat(300 * 1024);
+  const payload = samplePayload({ notes: bigBlob });
+
+  try {
+    const created = await service.createBackup({ payload, reason: "manual" });
+    assert.equal(created.created, true);
+    assert.ok(chunkCount > 1, "the payload must be split across several encryptString calls");
+
+    const backupDir = path.join(rootDir, BACKUP_DIR_NAME);
+    const file = fs
+      .readdirSync(backupDir)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(backupDir, name))[0];
+    const record = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(record.payloadEncoding, "safeStorage-chunked-v1");
+    assert.ok(Array.isArray(record.payloadData));
+    assert.ok(record.payloadData.length > 1);
+
+    const restored = await service.readBackup({ id: created.backup.id });
+    assert.equal(restored.payload.notes, bigBlob);
+    assert.equal(restored.payload.hosts[0].hostname, "prod");
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("small payloads keep the single-blob encoding", async () => {
+  const rootDir = createTempRoot();
+  const service = createService(rootDir);
+
+  try {
+    const created = await service.createBackup({ payload: samplePayload(), reason: "manual" });
+    const backupDir = path.join(rootDir, BACKUP_DIR_NAME);
+    const file = fs
+      .readdirSync(backupDir)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(backupDir, name))[0];
+    const record = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(record.payloadEncoding, "safeStorage-v1");
+    assert.equal(typeof record.payloadData, "string");
+
+    const restored = await service.readBackup({ id: created.backup.id });
+    assert.equal(restored.payload.hosts[0].hostname, "prod");
+  } finally {
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 // ============================================================================
 // Atomic writes and listBackups resilience
 // ============================================================================

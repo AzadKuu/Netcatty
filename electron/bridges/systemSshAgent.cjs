@@ -6,6 +6,7 @@ const path = require("node:path");
 const { createHash } = require("node:crypto");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
+const harmonyCompat = require("../harmonyCompat.cjs");
 const { utils } = require("ssh2");
 const { BaseAgent, createAgent } = require("ssh2/lib/agent.js");
 
@@ -31,7 +32,7 @@ function resolveIdentityPath(rawPath, context = {}) {
   const proxyJump = context.proxyJump || "";
   const tokenValues = {
     "%": "%",
-    d: os.homedir(),
+    d: harmonyCompat.getSafeHomeDir(),
     h: hostname,
     i: String(context.uid ?? (typeof process.getuid === "function" ? process.getuid() : "")),
     j: proxyJump,
@@ -48,7 +49,7 @@ function resolveIdentityPath(rawPath, context = {}) {
     .digest("hex");
   let resolved = rawPath.trim()
     .replace(/%([%CdhijkLlnpru])/g, (match, token) => tokenValues[token] ?? match)
-    .replace(/^~(?=$|[\\/])/, os.homedir())
+    .replace(/^~(?=$|[\\/])/, harmonyCompat.getSafeHomeDir())
     .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => env[name] ?? "")
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => env[name] ?? "");
   if (!path.isAbsolute(resolved) && resolved) {

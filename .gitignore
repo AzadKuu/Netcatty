@@ -66,6 +66,8 @@
 !electron/**
 !examples/
 !examples/**
+!harmony/
+!harmony/**
 !infrastructure/
 !infrastructure/**
 !lib/
@@ -173,3 +175,12 @@ build_with_vs2022.bat
 /resources/et/*/et.exe
 /resources/et/*/et-*-dlls/
 /resources/et/*/*.dll
+
+
+# HarmonyOS: build outputs, oh_modules and the packaged Electron payload are
+# covered by harmony/.gitignore. Only guard the local signing material here, which
+# lives in ~/.ohos/config on the build machine and must never be committed.
+/harmony/**/*.p12
+/harmony/**/*.p7b
+/harmony/**/*.cer
+/harmony/**/*.csr

@@ -3,6 +3,7 @@
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+const harmonyCompat = require("../harmonyCompat.cjs");
 
 const EXTERNAL_MCP_STATE_DIR_NAME = "external-mcp";
 const EXTERNAL_MCP_DISCOVERY_ENV_VAR = "NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE";
@@ -38,6 +39,9 @@ function getDefaultAppDataDirName(options = {}) {
 }
 
 function getPlatformUserDataRoot(appDataDirName) {
+  if (harmonyCompat.isHarmony()) {
+    return path.join(harmonyCompat.getSafeHomeDir(), appDataDirName);
+  }
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", appDataDirName);
   }

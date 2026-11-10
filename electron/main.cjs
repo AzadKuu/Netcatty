@@ -18,6 +18,41 @@ if (process.env.ELECTRON_RUN_AS_NODE) {
   delete process.env.ELECTRON_RUN_AS_NODE;
 }
 
+// Early file-based debug log. HarmonyOS does not forward main-process console
+// output to hilog, so diagnostics must be written to a file instead.
+const _earlyFs = require("node:fs");
+const _earlyPath = require("node:path");
+const _earlyOs = require("node:os");
+let _earlyLogPath = null;
+function _resolveEarlyLogPath() {
+  if (_earlyLogPath) return _earlyLogPath;
+  const candidates = [];
+  try {
+    const _earlyApp = require("electron").app;
+    if (_earlyApp && typeof _earlyApp.getPath === "function") {
+      candidates.push(_earlyPath.join(_earlyApp.getPath("userData"), "netcatty_debug.log"));
+    }
+  } catch {}
+  candidates.push("/data/storage/el2/base/files/netcatty_debug.log");
+  candidates.push(_earlyPath.join(_earlyOs.homedir(), "netcatty_debug.log"));
+  candidates.push("/data/storage/el2/base/files/chromium/netcatty_debug.log");
+  candidates.push("/tmp/netcatty_debug.log");
+  for (const p of candidates) {
+    try {
+      try { _earlyFs.mkdirSync(_earlyPath.dirname(p), { recursive: true }); } catch {}
+      _earlyFs.appendFileSync(p, "");
+      _earlyLogPath = p;
+      return p;
+    } catch {}
+  }
+  return null;
+}
+function _earlyDbgLog(...args) {
+  const msg = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`;
+  const p = _resolveEarlyLogPath();
+  if (p) { try { _earlyFs.appendFileSync(p, msg); } catch {} }
+}
+
 // Load crash log bridge early so process-level error handlers can use it
 const crashLogBridge = require("./bridges/crashLogBridge.cjs");
 const {
@@ -63,6 +98,7 @@ const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
 const { execFile } = require("node:child_process");
+const harmonyCompat = require("./harmonyCompat.cjs");
 const { getCliDiscoveryFilePath } = require("./cli/discoveryPath.cjs");
 const {
   SSH_DEEP_LINK_CHANNEL,
@@ -160,6 +196,7 @@ require("./bridges/boringSslDhCompat.cjs").installBoringSslDhCompat();
 
 // Import bridge modules
 const sshBridge = require("./bridges/sshBridge.cjs");
+const { setAppRef: setSshAuthHelperAppRef } = require("./bridges/sshAuthHelper.cjs");
 const sftpBridge = require("./bridges/sftpBridge.cjs");
 const localFsBridge = require("./bridges/localFsBridge.cjs");
 const transferBridge = require("./bridges/transferBridge.cjs");
@@ -254,8 +291,41 @@ app.on("web-contents-created", (_event, contents) => {
   });
 });
 
+// Platforms without DevTools access (HarmonyOS) need renderer warnings/errors mirrored
+// into the main-process log, otherwise a blank "could not load" panel leaves no trace.
+if (harmonyCompat.isHarmony() || process.env.NETCATTY_FORWARD_RENDERER_LOGS === "1") {
+  const describeConsoleMessage = (...args) => {
+    let level = args[0];
+    let message = args[1];
+    let line = args[2];
+    let sourceId = args[3];
+    const details = args[0];
+    if (details && typeof details === "object") {
+      level = details.level;
+      message = details.message;
+      line = details.lineNumber;
+      sourceId = details.sourceId;
+    }
+    const isError = level === 3 || level === "error";
+    const isWarning = level === 2 || level === "warning";
+    if (!isError && !isWarning) return null;
+    const location = sourceId ? ` (${sourceId}:${line})` : "";
+    return `[Renderer:${isError ? "error" : "warn"}] ${message}${location}`;
+  };
+  app.on("web-contents-created", (_event, contents) => {
+    if (contents.getType() === "devtools") return;
+    contents.on("console-message", (_event, ...args) => {
+      const line = describeConsoleMessage(...args);
+      if (line) console.log(line);
+    });
+    contents.on("preload-error", (_event, preloadPath, error) => {
+      console.log(`[Renderer:preload-error] ${preloadPath}: ${error?.message || error}`);
+    });
+  });
+}
+
 // Application configuration
-const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+const devServerUrl = harmonyCompat.shouldUseDevServer() ? process.env.VITE_DEV_SERVER_URL : undefined;
 // Never treat a packaged app as "dev" even if the user has VITE_DEV_SERVER_URL set globally.
 const isDev = !app.isPackaged && !!devServerUrl;
 const effectiveDevServerUrl = isDev ? devServerUrl : undefined;
@@ -270,6 +340,7 @@ if (portableData) {
 }
 const preload = path.join(__dirname, "preload.cjs");
 const isMac = process.platform === "darwin";
+const isHarmony = harmonyCompat.isHarmony();
 const appIconManager = require("./bridges/appIconManager.cjs");
 const appPath = path.join(__dirname, "..");
 appIconManager.initializeAppIconManager(appPath, {
@@ -466,7 +537,7 @@ function getAppLockReopenWindows() {
 // Shared state
 const sessions = new Map();
 const sftpClients = new Map();
-const keyRoot = path.join(os.homedir(), ".netcatty", "keys");
+const keyRoot = harmonyCompat.getSafeKeyRoot(app);
 const APP_LOCK_SETTINGS_FILE = "app-lock-settings.json";
 let cloudSyncSessionPassword = null;
 const CLOUD_SYNC_PASSWORD_FILE = "netcatty_cloud_sync_master_password_v1";
@@ -597,13 +668,17 @@ async function createWindow({ startHidden = false } = {}) {
 function waitForWindowToShow(win) {
   return new Promise((resolve, reject) => {
     if (!win || win.isDestroyed?.()) {
+      _earlyDbgLog("[Main] waitForWindowToShow rejected: window destroyed before first show");
       reject(new Error("Main window was destroyed before first show."));
       return;
     }
     if (win.isVisible?.()) {
+      _earlyDbgLog("[Main] waitForWindowToShow resolved immediately: isVisible() was already true");
       resolve();
       return;
     }
+
+    _earlyDbgLog("[Main] waitForWindowToShow waiting for show event");
 
     const cleanup = () => {
       try { win.removeListener("show", handleShow); } catch {}
@@ -612,14 +687,17 @@ function waitForWindowToShow(win) {
     };
 
     const handleShow = () => {
+      _earlyDbgLog("[Main] waitForWindowToShow resolved by show event");
       cleanup();
       resolve();
     };
     const handleClosed = () => {
+      _earlyDbgLog("[Main] waitForWindowToShow rejected: window closed before first show");
       cleanup();
       reject(new Error("Main window closed before first show."));
     };
     const handleGone = (_event, details) => {
+      _earlyDbgLog("[Main] waitForWindowToShow rejected: renderer gone", details?.reason || "unknown");
       cleanup();
       reject(new Error(`Renderer process exited before first show: ${details?.reason || "unknown"}`));
     };
@@ -659,7 +737,9 @@ async function createAndShowMainWindow() {
   mainWindowStartupPromise = (async () => {
     processErrorController.beginMainWindowStartup();
     try {
+      _earlyDbgLog("[Main] createWindow() starting");
       const win = await createWindow({ startHidden });
+      _earlyDbgLog("[Main] createWindow() succeeded, window created");
       // A hidden cold start never fires "show" — waiting for it would hang
       // startup forever, so only wait when the window is meant to appear.
       if (!startHidden) await waitForWindowToShow(win);
@@ -677,8 +757,10 @@ async function createAndShowMainWindow() {
       // non-network error as fatal and killing an otherwise healthy
       // tray-only session that never happened to show a window.
       processErrorController.completeMainWindowStartup({ windowShown: true });
+      _earlyDbgLog("[Main] MainWindow startup complete");
       return win;
     } catch (err) {
+      _earlyDbgLog("[Main] createWindow() FAILED:", err?.message || err, err?.stack || "");
       processErrorController.completeMainWindowStartup({ windowShown: false });
       throw err;
     } finally {
@@ -837,7 +919,7 @@ ipcMain?.handle?.("netcatty:explorerContextMenu:setEnabled", async (_event, payl
 
 ipcMain?.handle?.("netcatty:explorerContextMenu:getEnabled", async () => ({
   enabled: explorerContextMenuEnabled,
-  supported: process.platform === "win32",
+  supported: harmonyCompat.isExplorerContextMenuSupported(),
 }));
 
 if (ipcMain) registerAutoLaunchHandlers(ipcMain, { app });
@@ -1312,6 +1394,7 @@ if (!gotLock) {
 
   // Application lifecycle
   app.whenReady().then(async () => {
+    setSshAuthHelperAppRef(app);
     registerAppProtocol();
     const initialSshDeepLinkPreference = applyInitialSshDeepLinkPreference({
       enabled: sshDeepLinkEnabled,
@@ -1495,6 +1578,26 @@ if (!gotLock) {
       }
     });
 
+    // HarmonyOS: must create tray before window (per BiliMusic reference —
+    // OpenHarmony's Electron runtime requires the Tray native object to exist
+    // before BrowserWindow creation, otherwise window show / contextBridge
+    // operations can trigger a null-pointer crash in CrBrowserMain).
+    if (isHarmony) {
+      try {
+        const gsb = getGlobalShortcutBridge();
+        gsb.init({
+          electronModule,
+          getAppLockController: () => appLockController,
+          ensureMainWindow: createAndShowMainWindow,
+          getMainWindow: () => getWindowManager().getMainWindow?.(),
+        });
+        gsb.createTray();
+        _earlyDbgLog("[Main] HarmonyOS: tray created before window");
+      } catch (err) {
+        _earlyDbgLog("[Main] HarmonyOS: failed to create tray before window:", err?.message || err);
+      }
+    }
+
     // Create the main window
     void createAndShowMainWindow().then(async (win) => {
       // Empty cold-start queues would otherwise notify immediately (before the
@@ -1581,7 +1684,7 @@ if (!gotLock) {
   // reactivation — re-apply App Lock so a later reopen does not inherit an
   // unlocked runtime from the previous session in this process.
   app.on("window-all-closed", () => {
-    if (process.platform !== "darwin") {
+    if (harmonyCompat.shouldQuitOnWindowAllClosed()) {
       app.quit();
       return;
     }

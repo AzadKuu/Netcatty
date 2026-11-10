@@ -2,6 +2,7 @@
 
 const os = require("node:os");
 const path = require("node:path");
+const harmonyCompat = require("../harmonyCompat.cjs");
 const CLI_STATE_DIR_NAME = "netcatty-tool-cli";
 const TOOL_CLI_DISCOVERY_ENV_VAR = "NETCATTY_TOOL_CLI_DISCOVERY_FILE";
 const FALLBACK_APP_DATA_DIR_NAME = "netcatty";
@@ -33,6 +34,9 @@ function getDefaultAppDataDirName() {
 
 function getDefaultUserDataDir() {
   const appDataDirName = getDefaultAppDataDirName();
+  if (harmonyCompat.isHarmony()) {
+    return path.join(harmonyCompat.getSafeHomeDir(), appDataDirName);
+  }
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", appDataDirName);
   }

@@ -1,13 +1,46 @@
-const { createClient, AuthType } = require("webdav");
 const https = require("https");
-const { NodeHttpHandler } = require("@smithy/node-http-handler");
-const {
-  S3Client,
-  HeadObjectCommand,
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand,
-} = require("@aws-sdk/client-s3");
+// webdav ships as ESM ("type": "module"). Electron 34 / Node 20 cannot require()
+// an ES module, so load it lazily via dynamic import() and degrade gracefully if
+// the runtime cannot load it instead of failing the whole main process.
+let webdavModule = null;
+let webdavLoadError = null;
+let webdavLoadPromise = null;
+const loadWebdavModule = () => {
+  if (webdavModule) return Promise.resolve(webdavModule);
+  if (!webdavLoadPromise) {
+    webdavLoadPromise = import("webdav")
+      .then((mod) => {
+        webdavModule = mod;
+        return mod;
+      })
+      .catch((err) => {
+        webdavLoadError = err;
+        return null;
+      });
+  }
+  return webdavLoadPromise;
+};
+// Optional dependency: @aws-sdk/client-s3 + @smithy/node-http-handler back the
+// S3 sync target. They are stripped from the HarmonyOS build (size budget), so
+// load them defensively and degrade gracefully instead of failing module load.
+let NodeHttpHandler = null;
+let S3Client = null;
+let HeadObjectCommand = null;
+let PutObjectCommand = null;
+let GetObjectCommand = null;
+let DeleteObjectCommand = null;
+try {
+  ({ NodeHttpHandler } = require("@smithy/node-http-handler"));
+  ({
+    S3Client,
+    HeadObjectCommand,
+    PutObjectCommand,
+    GetObjectCommand,
+    DeleteObjectCommand,
+  } = require("@aws-sdk/client-s3"));
+} catch {
+  // S3 sync unavailable; WebDAV and other sync targets keep working.
+}
 const {
   resolveOutboundHttpAgent,
 } = require("./httpNetworkProxyAgent.cjs");
@@ -244,6 +277,13 @@ const buildBasicAuthHeader = (username, password) =>
 
 const buildWebdavClient = async (config) => {
   if (!config) throw new Error("Missing WebDAV config");
+  const webdav = await loadWebdavModule();
+  if (!webdav || typeof webdav.createClient !== "function") {
+    throw new Error(
+      `WebDAV client is unavailable on this runtime: ${webdavLoadError?.message || "failed to load webdav module"}`
+    );
+  }
+  const { createClient, AuthType } = webdav;
   const endpoint = normalizeEndpoint(config.endpoint);
   const extraOpts = {};
   const agent = await resolveCloudSyncTransportAgent(endpoint, Boolean(config.allowInsecure));
@@ -278,6 +318,11 @@ const buildWebdavClient = async (config) => {
 const getWebdavPath = () => ensureLeadingSlash(SYNC_FILE_NAME);
 
 const buildS3Client = async (config) => {
+  if (!S3Client) {
+    throw new Error(
+      "S3 sync is unavailable on this runtime: @aws-sdk/client-s3 is not installed"
+    );
+  }
   const clientOptions = {
     region: config.region,
     endpoint: normalizeEndpoint(config.endpoint),

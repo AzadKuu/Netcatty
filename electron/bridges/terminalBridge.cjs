@@ -11,16 +11,34 @@ const { execFile, execFileSync } = require("node:child_process");
 const path = require("node:path");
 const { promisify } = require("node:util");
 const { StringDecoder } = require("node:string_decoder");
-const { ensureNodePtySpawnHelperExecutable } = require("./nodePtySpawnHelperPermissions.cjs");
-const { createTerminalFlowPauseArbiter } = require("./terminalFlowPauseArbiter.cjs");
+const harmonyCompat = require("../harmonyCompat.cjs");
 
-ensureNodePtySpawnHelperExecutable();
+let pty = null;
+let SerialPort = null;
+let nodePtyAvailable = false;
+let serialPortAvailable = false;
 
-const terminalFlowPauseArbiter = createTerminalFlowPauseArbiter();
-const trackedFlowPauseSenders = new WeakSet();
-
-const pty = require("node-pty");
-const { SerialPort } = require("serialport");
+if (!harmonyCompat.isHarmony()) {
+  try {
+    const { ensureNodePtySpawnHelperExecutable } = require("./nodePtySpawnHelperPermissions.cjs");
+    ensureNodePtySpawnHelperExecutable();
+  } catch (err) {
+    console.warn("[TerminalBridge] node-pty helper setup failed:", err?.message || err);
+  }
+  try {
+    pty = require("node-pty");
+    nodePtyAvailable = true;
+  } catch (err) {
+    console.warn("[TerminalBridge] node-pty not available:", err?.message || err);
+  }
+  try {
+    const serialport = require("serialport");
+    SerialPort = serialport.SerialPort;
+    serialPortAvailable = true;
+  } catch (err) {
+    console.warn("[TerminalBridge] serialport not available:", err?.message || err);
+  }
+}
 const {
   configureTerminalSessionDataEmitter,
   emitTerminalSessionData,
@@ -881,6 +899,13 @@ const applyLocaleDefaults = (env) => {
  * Start a local terminal session
  */
 function startLocalSession(event, payload) {
+  if (!nodePtyAvailable) {
+    event.sender.send(`netcatty:terminal:error`, {
+      sessionId: payload?.sessionId || randomUUID(),
+      error: "Local terminal is not available on this platform",
+    });
+    return null;
+  }
   const sessionId = payload?.sessionId || randomUUID();
   const defaultShell = getDefaultLocalShell();
   // payload.shell may be a discovered shell ID (e.g., "wsl-ubuntu") — resolve it
@@ -1167,6 +1192,7 @@ const {
  * List available serial ports (hardware only)
  */
 async function listSerialPorts() {
+  if (!serialPortAvailable) return [];
   try {
     const ports = await SerialPort.list();
     return ports.map(port => ({
@@ -1189,6 +1215,13 @@ async function listSerialPorts() {
  * Note: SerialPort library can open PTY devices directly, they just won't appear in list()
  */
 async function startSerialSession(event, options) {
+  if (!serialPortAvailable) {
+    event.sender.send(`netcatty:terminal:error`, {
+      sessionId: options?.sessionId || randomUUID(),
+      error: "Serial port is not available on this platform",
+    });
+    return null;
+  }
   const sessionId = options.sessionId || randomUUID();
 
   const portPath = options.path;

@@ -24,6 +24,8 @@
     "clean:vite": "node scripts/clean-vite-cache.cjs",
     "dev:clean": "npm run clean:vite && npm run dev",
     "prebuild": "node scripts/copy-monaco.cjs",
+    "build:harmony": "npm run build:plugin-packages && vite build",
+    "postinstall:harmony": "node scripts/postinstall-harmony.cjs",
     "fetch:mosh": "node scripts/fetch-mosh-binaries.cjs",
     "fetch:mosh:dev": "node scripts/fetch-mosh-binaries.cjs --host --resolve-release",
     "fetch:et": "node scripts/fetch-et-binaries.cjs",

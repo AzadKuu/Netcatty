@@ -10,6 +10,7 @@ const { randomUUID } = require("node:crypto");
 const os = require("node:os");
 const crypto = require("node:crypto");
 const { exec } = require("node:child_process");
+const harmonyCompat = require("../harmonyCompat.cjs");
 require("./boringSslDhCompat.cjs").installBoringSslDhCompat();
 const { Client: SSHClient, utils: sshUtils } = require("ssh2");
 const { NetcattyAgent } = require("./netcattyAgent.cjs");
@@ -152,7 +153,7 @@ function isKeyEncrypted(keyContent) {
  * @returns {Promise<{ privateKey: string, keyPath: string, keyName: string } | null>}
  */
 async function findDefaultPrivateKey() {
-  const sshDir = path.join(os.homedir(), ".ssh");
+  const sshDir = getSshDir();
   // Scan ~/.ssh/ for all files matching id_* (same as Tabby/OpenSSH),
   // with preferred key types tried first
   let allNames = [];
@@ -200,7 +201,7 @@ async function findDefaultPrivateKey() {
  * @returns {Promise<Array<{ privateKey: string, keyPath: string, keyName: string }>>}
  */
 async function findAllDefaultPrivateKeys() {
-  const sshDir = path.join(os.homedir(), ".ssh");
+  const sshDir = getSshDir();
   let allNames = [];
   try {
     const entries = await fs.promises.readdir(sshDir);
@@ -293,7 +294,21 @@ const SSH_DEBUG_REDACTED_KEYS = new Set([
   "certificate",
 ]);
 let sshDebugLoggingEnabled = process.env.NETCATTY_SSH_DEBUG === "1";
-let sshDebugLogFilePath = tempDirBridge.getTempFilePath("netcatty-ssh.log");
+let sshDebugLogFilePath = null;
+
+// Resolve the debug log path on first use instead of at module load: on
+// HarmonyOS the app payload is mounted inside the HAP sandbox and the temp
+// directory is only resolvable once the Electron app is initialised.
+function ensureSshDebugLogFilePath() {
+  if (!sshDebugLogFilePath) {
+    try {
+      sshDebugLogFilePath = tempDirBridge.getTempFilePath("netcatty-ssh.log");
+    } catch {
+      sshDebugLogFilePath = "";
+    }
+  }
+  return sshDebugLogFilePath;
+}
 
 function sanitizeSshDebugValue(value, key = "") {
   if (SSH_DEBUG_REDACTED_KEYS.has(key)) return "[redacted]";
@@ -320,7 +335,7 @@ function isSshDebugLoggingEnabled() {
 }
 
 function getSshDebugLogFilePath() {
-  return sshDebugLogFilePath;
+  return ensureSshDebugLogFilePath();
 }
 
 function appendSshDiagnosticLog(msg, data, options = {}) {
@@ -330,7 +345,7 @@ function appendSshDiagnosticLog(msg, data, options = {}) {
   if (!enabled) return;
   const safeData = data ? sanitizeSshDebugValue(data) : undefined;
   const line = `[${new Date().toISOString()}] ${msg} ${safeData ? JSON.stringify(safeData) : ""}\n`;
-  try { fs.appendFileSync(sshDebugLogFilePath, line); } catch { }
+  try { fs.appendFileSync(ensureSshDebugLogFilePath(), line); } catch { }
   console.log("[SSH]", msg, safeData ? JSON.stringify(safeData, null, 2) : "");
 }
 
@@ -369,10 +384,11 @@ function logSshAlgorithms(label, algorithms, extra = {}, logger = log) {
 }
 
 async function getSshDebugLogInfo() {
+  const logPath = ensureSshDebugLogFilePath();
   let size = 0;
   let exists = false;
   try {
-    const stat = await fs.promises.stat(sshDebugLogFilePath);
+    const stat = await fs.promises.stat(logPath);
     exists = stat.isFile();
     size = stat.size;
   } catch {
@@ -380,7 +396,7 @@ async function getSshDebugLogInfo() {
   }
   return {
     enabled: isSshDebugLoggingEnabled(),
-    path: sshDebugLogFilePath,
+    path: logPath,
     exists,
     size,
   };
@@ -389,8 +405,9 @@ async function getSshDebugLogInfo() {
 async function openSshDebugLogDir() {
   if (!electronModule?.shell?.openPath) return { success: false, error: "shell unavailable" };
   try {
-    await fs.promises.mkdir(path.dirname(sshDebugLogFilePath), { recursive: true });
-    const error = await electronModule.shell.openPath(path.dirname(sshDebugLogFilePath));
+    const logPath = ensureSshDebugLogFilePath();
+    await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
+    const error = await electronModule.shell.openPath(path.dirname(logPath));
     return error ? { success: false, error } : { success: true };
   } catch (err) {
     return { success: false, error: err?.message || String(err) };
@@ -403,6 +420,10 @@ let electronModule = null;
 let terminalOutputChannel = null;
 let selectZmodemUploadFiles = null;
 let selectZmodemDownloadDirectory = null;
+
+function getSshDir() {
+  return harmonyCompat.getSafeSshDir(electronModule?.app);
+}
 
 // Authentication method cache - remembers successful auth methods per host
 // Key format: "username@hostname:port"
@@ -1534,7 +1555,7 @@ function registerHandlers(ipcMain, options = {}) {
     };
   });
   ipcMain.handle("netcatty:ssh:get-default-keys", async () => {
-    const sshDir = path.join(os.homedir(), ".ssh");
+    const sshDir = getSshDir();
     const keys = [];
     try {
       const entries = await fs.promises.readdir(sshDir);

@@ -29,6 +29,7 @@
 const { randomUUID, createHash } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
+const harmonyCompat = require("../harmonyCompat.cjs");
 const path = require("node:path");
 const { remoteAllowsIdleParkedShellReuse } = require("./sshIdleParkPolicy.cjs");
 
@@ -294,7 +295,7 @@ function secureDigest(value) {
 function expandIdentityFilePath(filePath) {
   if (typeof filePath !== "string" || !filePath.trim()) return "";
   return filePath.trim()
-    .replace(/^~(?=$|[\\/])/, os.homedir())
+    .replace(/^~(?=$|[\\/])/, harmonyCompat.getSafeHomeDir())
     .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => process.env[name] ?? "")
     .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => process.env[name] ?? "");
 }

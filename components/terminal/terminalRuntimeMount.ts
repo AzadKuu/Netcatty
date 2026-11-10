@@ -11,6 +11,7 @@ import {
   type CreateXTermRuntimeContext,
   type XTermRuntime,
 } from "./runtime/createXTermRuntime";
+import { loadInlineImageAddon } from "./runtime/inlineImageAddon";
 import {
   appendTerminalReplayData,
   applyHibernateWakeToTerminal,
@@ -142,6 +143,10 @@ export async function wakeTerminalFromHibernate(
 
   isBootActiveRef.current = true;
   lastFittedSizeRef.current = null;
+
+  // The inline-image addon must be in place before term.open() patches the renderer,
+  // so it is loaded (and skipped on runtimes without WebAssembly) up front.
+  await loadInlineImageAddon();
 
   const runtime = createXTermRuntime({
     ...runtimeContext,

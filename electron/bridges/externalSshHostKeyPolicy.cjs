@@ -34,6 +34,7 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const os = require("node:os");
 const { execFileSync } = require("node:child_process");
+const harmonyCompat = require("../harmonyCompat.cjs");
 
 const formatVaultKnownHostLine = (knownHost, { hostnameOverride, portOverride, bareHostField = false } = {}) => {
   const hostname = String(hostnameOverride || knownHost?.hostname || "").trim();
@@ -412,14 +413,14 @@ const getDefaultGlobalKnownHostsPaths = ({
 };
 
 const getDefaultUserKnownHostsPaths = ({
-  homedir = os.homedir(),
+  homedir = harmonyCompat.getSafeHomeDir(),
   pathModule = path,
 } = {}) => ([
   pathModule.join(homedir, ".ssh", "known_hosts"),
   pathModule.join(homedir, ".ssh", "known_hosts2"),
 ]);
 
-const expandKnownHostsPath = (rawPath, { homedir = os.homedir(), pathModule = path } = {}) => {
+const expandKnownHostsPath = (rawPath, { homedir = harmonyCompat.getSafeHomeDir(), pathModule = path } = {}) => {
   const text = String(rawPath || "").trim();
   if (!text) return "";
   if (text === "~") return homedir;
@@ -437,7 +438,7 @@ const expandKnownHostsPath = (rawPath, { homedir = os.homedir(), pathModule = pa
  */
 const splitKnownHostsPathList = (rest, {
   fs: fsApi = null,
-  homedir = os.homedir(),
+  homedir = harmonyCompat.getSafeHomeDir(),
   pathModule = path,
 } = {}) => {
   const raw = String(rest || "").trim();
@@ -553,7 +554,7 @@ const resolveEffectiveGlobalKnownHostsPaths = ({
   username,
   platform = process.platform,
   programData = process.env.ProgramData,
-  homedir = os.homedir(),
+  homedir = harmonyCompat.getSafeHomeDir(),
   pathModule = path,
   fs: fsApi = null,
   execFileSyncFn = execFileSync,
@@ -587,7 +588,7 @@ const resolveEffectiveUserKnownHostsPaths = ({
   port,
   username,
   platform = process.platform,
-  homedir = os.homedir(),
+  homedir = harmonyCompat.getSafeHomeDir(),
   pathModule = path,
   fs: fsApi = null,
   execFileSyncFn = execFileSync,
@@ -638,7 +639,7 @@ const buildAuthoritativeKnownHostsContent = ({
   username,
   platform = process.platform,
   programData = process.env.ProgramData,
-  homedir = os.homedir(),
+  homedir = harmonyCompat.getSafeHomeDir(),
   pathModule = path,
   globalPaths,
   userPaths,

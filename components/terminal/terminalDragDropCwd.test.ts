@@ -8,6 +8,7 @@ import {
   ActiveTerminalCwdUnavailableError,
   DEFAULT_RZ_MISSING_FALLBACK_TIMEOUT_MS,
   handleTerminalDropEntries,
+  isDroppedFileContentUnavailable,
   resolveTerminalDropErrorMessage,
 } from "./hooks/useTerminalDragDrop";
 import { resolvePreferredTerminalCwd } from "./sftpCwd";
@@ -59,6 +60,32 @@ test("terminal drag-drop asks to enable sudo when /root is not writable as the l
 
   assert.equal(message, "translated:terminal.dragDrop.needsSudoElevation");
   assert.deepEqual(requestedKeys, ["terminal.dragDrop.needsSudoElevation"]);
+});
+
+test("terminal drag-drop explains that unreadable dropped files need the picker", () => {
+  const requestedKeys: string[] = [];
+  const notFound = new Error("A requested file or directory could not be found at the time an operation was processed.");
+  notFound.name = "NotFoundError";
+  const message = resolveTerminalDropErrorMessage(notFound, (key) => {
+    requestedKeys.push(key);
+    return `translated:${key}`;
+  });
+
+  assert.equal(message, "translated:terminal.dragDrop.platformUnsupported");
+  assert.deepEqual(requestedKeys, ["terminal.dragDrop.platformUnsupported"]);
+});
+
+test("dropped file content detection ignores unrelated errors", () => {
+  assert.equal(isDroppedFileContentUnavailable(new Error("boom")), false);
+  const notReadable = new Error("permission denied");
+  notReadable.name = "NotReadableError";
+  assert.equal(isDroppedFileContentUnavailable(notReadable), true);
+  assert.equal(
+    isDroppedFileContentUnavailable(
+      new Error('Dropped file content is unavailable on HarmonyOS: use the SFTP "Upload File(s)" picker instead'),
+    ),
+    true,
+  );
 });
 
 test("remote SSH terminal drop triggers ZMODEM drag-drop upload", async () => {

@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const harmonyCompat = require("./harmonyCompat.cjs");
 const {
   parsePuttyCommandLine,
   redactPuttyCommandLinePasswords,
@@ -103,6 +104,7 @@ function registerProtocolClient({
   execPath = process.execPath,
   logWarn = console.warn,
 } = {}) {
+  if (harmonyCompat.isHarmony()) return false;
   if (!app || typeof app.setAsDefaultProtocolClient !== "function") return false;
   try {
     if (isDev && process.defaultApp && argv[1]) {
@@ -123,6 +125,7 @@ function removeProtocolClient({
   execPath = process.execPath,
   logWarn = console.warn,
 } = {}) {
+  if (harmonyCompat.isHarmony()) return false;
   if (!app || typeof app.removeAsDefaultProtocolClient !== "function") return false;
   try {
     if (isDev && process.defaultApp && argv[1]) {

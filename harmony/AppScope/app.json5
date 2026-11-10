@@ -1,0 +1,15 @@
+{
+  "app": {
+    "bundleName": "com.AzadKuu.NetCatty",
+    "vendor": "AzadKuu",
+    "versionCode": 1001083,
+    "versionName": "1.1.83",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name",
+    "configuration": "$profile:configuration",
+    "multiAppMode": {
+      "multiAppModeType": "multiInstance",
+      "maxCount": 1
+    }
+  }
+}

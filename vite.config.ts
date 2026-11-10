@@ -103,7 +103,10 @@ export default defineConfig(() => {
               'vendor-xterm': [
                 '@xterm/xterm',
                 '@xterm/addon-fit',
-                '@xterm/addon-image',
+                // @xterm/addon-image must NOT be pinned to this eagerly loaded chunk:
+                // the package instantiates a WebAssembly SIXEL decoder while it is
+                // evaluated, so it stays a dynamically imported chunk that runtimes
+                // without WebAssembly (HarmonyOS ArkWeb) never load.
                 '@xterm/addon-search',
                 '@xterm/addon-serialize',
                 '@xterm/addon-web-links',

@@ -5,6 +5,39 @@
 
 const path = require("node:path");
 const fs = require("node:fs");
+
+let _gsLogPath = null;
+function _resolveGsLogPath() {
+  if (_gsLogPath) return _gsLogPath;
+  const os = require("node:os");
+  const candidates = [];
+  try {
+    const app = require("electron").app;
+    if (app && typeof app.getPath === "function") {
+      candidates.push(path.join(app.getPath("userData"), "netcatty_debug.log"));
+    }
+  } catch {}
+  candidates.push("/data/storage/el2/base/files/netcatty_debug.log");
+  candidates.push(path.join(os.homedir(), "netcatty_debug.log"));
+  candidates.push("/data/storage/el2/base/files/chromium/netcatty_debug.log");
+  candidates.push("/tmp/netcatty_debug.log");
+  for (const p of candidates) {
+    try {
+      try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
+      fs.appendFileSync(p, "");
+      _gsLogPath = p;
+      return p;
+    } catch {}
+  }
+  return null;
+}
+function dbgLog(...args) {
+  const msg = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`;
+  const p = _resolveGsLogPath();
+  if (p) { try { fs.appendFileSync(p, msg); } catch {} }
+  console.log(...args);
+}
+
 const {
   TRAY_PANEL_WIDTH,
   TRAY_PANEL_HEIGHT,
@@ -396,7 +429,8 @@ async function connectToHostFromSystemMenu(hostId) {
 }
 
 function getTrayPanelUrl() {
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const harmonyCompat = require("../harmonyCompat.cjs");
+  const devServerUrl = harmonyCompat.shouldUseDevServer() ? process.env.VITE_DEV_SERVER_URL : undefined;
   if (devServerUrl) {
     return `${devServerUrl.replace(/\/$/, "")}/#/tray`;
   }
@@ -404,6 +438,14 @@ function getTrayPanelUrl() {
 }
 
 function ensureTrayPanelWindow() {
+  const harmonyCompat = require("../harmonyCompat.cjs");
+  if (harmonyCompat.isHarmony()) {
+    // HarmonyOS renders this transparent always-on-top popover as an opaque
+    // black overlay, and the frameless transparent host is unsupported there.
+    // Skip creating the panel entirely; the tray icon still opens the window.
+    dbgLog("[GlobalShortcut] ensureTrayPanelWindow skipped on HarmonyOS");
+    return null;
+  }
   const { BrowserWindow } = electronModule;
   if (trayPanelWindow && !trayPanelWindow.isDestroyed()) return trayPanelWindow;
 
@@ -503,6 +545,10 @@ function showTrayPanel(eventBounds) {
   if (!tray) return;
   const { screen } = electronModule;
   const win = ensureTrayPanelWindow();
+  if (!win) {
+    dbgLog("[GlobalShortcut] showTrayPanel skipped: panel window unsupported (win=null)");
+    return;
+  }
 
   const cursorPoint = readCursorPoint();
   const trayBounds = readTrayBounds();
@@ -854,6 +900,7 @@ function createTray() {
     return;
   }
 
+  dbgLog("[GlobalShortcut] createTray starting, platform=" + process.platform);
   try {
     // Load the tray icon
     let trayIcon;
@@ -880,8 +927,11 @@ function createTray() {
       }
     }
 
+    dbgLog("[GlobalShortcut] before new Tray(), hasIcon=" + Boolean(trayIcon));
     tray = new Tray(trayIcon || nativeImage.createEmpty());
+    dbgLog("[GlobalShortcut] after new Tray(), isDestroyed=" + (typeof tray.isDestroyed === "function" ? tray.isDestroyed() : "n/a"));
     tray.setToolTip("Netcatty");
+    dbgLog("[GlobalShortcut] tray.setToolTip done");
 
     // Build and set initial context menu
     updateTrayMenu();
@@ -909,9 +959,9 @@ function createTray() {
       });
     }
 
-    console.log("[GlobalShortcut] System tray created");
+    dbgLog("[GlobalShortcut] System tray created");
   } catch (err) {
-    console.error("[GlobalShortcut] Error creating tray:", err);
+    dbgLog("[GlobalShortcut] Error creating tray:", err?.message || err, err?.stack || "");
   }
 }
 
@@ -1084,7 +1134,16 @@ function updateDockMenu() {
  */
 function updateTrayMenu() {
   if (!tray) return;
+  dbgLog("[GlobalShortcut] updateTrayMenu enter, platform=" + process.platform);
   try {
+    if (require("../harmonyCompat.cjs").isHarmony()) {
+      // HarmonyOS: the status bar plugin has no right-click context menu, and the
+      // port's native Tray::SetContextMenu dereferences the menu unconditionally,
+      // so setContextMenu(null) segfaults the browser main thread (SIGSEGV @0x10).
+      // Never touch the context menu there.
+      dbgLog("[GlobalShortcut] updateTrayMenu skipped on HarmonyOS");
+      return;
+    }
     if (process.platform === "linux") {
       const { Menu } = electronModule;
       const menu = Menu.buildFromTemplate(buildTrayMenuTemplate());

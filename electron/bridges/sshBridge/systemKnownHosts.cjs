@@ -43,6 +43,7 @@
  */
 function createSystemKnownHostsApi(ctx) {
   const { fs, path, os, crypto, log } = ctx;
+  const harmonyCompat = require("../../harmonyCompat.cjs");
 
   const HASH_MARKER = "|1|";
 
@@ -211,7 +212,7 @@ function createSystemKnownHostsApi(ctx) {
   // The OpenSSH default trust files, mirroring localFsBridge.readKnownHosts so
   // the companion trusts exactly what the user's system ssh would.
   const getSystemKnownHostsPaths = () => {
-    const homeDir = os.homedir();
+    const homeDir = harmonyCompat.getSafeHomeDir();
     const paths = [path.join(homeDir, ".ssh", "known_hosts")];
     if (process.platform === "win32") {
       paths.push(

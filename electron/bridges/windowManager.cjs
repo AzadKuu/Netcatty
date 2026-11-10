@@ -8,6 +8,38 @@ const fs = require("node:fs");
 
 const { safeSend } = require("./ipcUtils.cjs");
 
+let _wmLogPath = null;
+function _resolveWmLogPath() {
+  if (_wmLogPath) return _wmLogPath;
+  const os = require("node:os");
+  const candidates = [];
+  try {
+    const app = require("electron").app;
+    if (app && typeof app.getPath === "function") {
+      candidates.push(path.join(app.getPath("userData"), "netcatty_debug.log"));
+    }
+  } catch {}
+  candidates.push("/data/storage/el2/base/files/netcatty_debug.log");
+  candidates.push(path.join(os.homedir(), "netcatty_debug.log"));
+  candidates.push("/data/storage/el2/base/files/chromium/netcatty_debug.log");
+  candidates.push("/tmp/netcatty_debug.log");
+  for (const p of candidates) {
+    try {
+      try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
+      fs.appendFileSync(p, "");
+      _wmLogPath = p;
+      return p;
+    } catch {}
+  }
+  return null;
+}
+function dbgLog(...args) {
+  const msg = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")}\n`;
+  const p = _resolveWmLogPath();
+  if (p) { try { fs.appendFileSync(p, msg); } catch {} }
+  console.log(...args);
+}
+
 const V8_CACHE_OPTIONS = "bypassHeatCheck";
 
 function getGlobalShortcutBridge() {
@@ -654,12 +686,16 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true,
   let rendererReady = false;
   let timer = null;
 
-  const showOnce = () => {
-    if (shown) return;
+  const showOnce = (reason = "unknown") => {
+    if (shown) {
+      dbgLog("[WindowManager] showOnce skipped (already shown) reason=" + reason);
+      return;
+    }
     shown = true;
     if (timer) clearTimeout(timer);
     timer = null;
     if (webContentsId) rendererReadyCallbacksByWebContentsId.delete(webContentsId);
+    dbgLog("[WindowManager] showOnce firing reason=" + reason + " startHidden=" + startHidden + " wcId=" + webContentsId);
     if (startHidden) {
       // Cold start via the OS login item ("--hidden"): stay hidden. The tray
       // icon is guaranteed (and pinned open regardless of close-to-tray)
@@ -672,24 +708,42 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true,
       } catch (err) {
         console.warn("[WindowManager] Failed to create tray for hidden launch:", err?.message || err);
       }
+      dbgLog("[WindowManager] showOnce startHidden -> window stays hidden");
       return;
     }
     try {
+      let isDestroyedBefore = null;
+      let visibleBefore = null;
+      try { isDestroyedBefore = win.isDestroyed(); } catch (e) { isDestroyedBefore = "err:" + (e?.message || e); }
+      try { visibleBefore = win.isVisible?.(); } catch (e) { visibleBefore = "err:" + (e?.message || e); }
+      dbgLog("[WindowManager] before win.show() isDestroyed=" + isDestroyedBefore + " isVisible=" + visibleBefore);
       if (!win.isDestroyed()) win.show();
-    } catch {
-      // ignore
+      let visibleAfter = null;
+      let isDestroyedAfter = null;
+      try { visibleAfter = win.isVisible?.(); } catch (e) { visibleAfter = "err:" + (e?.message || e); }
+      try { isDestroyedAfter = win.isDestroyed(); } catch (e) { isDestroyedAfter = "err:" + (e?.message || e); }
+      dbgLog("[WindowManager] after win.show() isVisible=" + visibleAfter + " isDestroyed=" + isDestroyedAfter);
+    } catch (err) {
+      dbgLog("[WindowManager] win.show() THREW:", err?.message || err, err?.stack || "");
     }
   };
 
   const tryShow = () => {
     if (shown) return;
-    if (!readyToShow) return;
-    if (waitForRendererReady && !rendererReady) return;
-    showOnce();
+    if (!readyToShow) {
+      dbgLog("[WindowManager] tryShow blocked: ready-to-show not fired yet");
+      return;
+    }
+    if (waitForRendererReady && !rendererReady) {
+      dbgLog("[WindowManager] tryShow blocked: renderer not ready yet");
+      return;
+    }
+    showOnce("tryShow");
   };
 
   const markRendererReady = () => {
     if (rendererReady) return;
+    dbgLog("[WindowManager] markRendererReady fired");
     rendererReady = true;
     tryShow();
   };
@@ -697,6 +751,7 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true,
   if (webContentsId) rendererReadyCallbacksByWebContentsId.set(webContentsId, markRendererReady);
 
   win.once("ready-to-show", () => {
+    dbgLog("[WindowManager] ready-to-show fired");
     readyToShow = true;
     tryShow();
   });
@@ -708,9 +763,23 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true,
 
   // Dev/edge-case fallback: don't keep the window hidden forever.
   if (Number(timeoutMs) > 0) {
-    timer = setTimeout(showOnce, timeoutMs);
+    dbgLog("[WindowManager] deferred show timeout armed timeoutMs=" + timeoutMs);
+    timer = setTimeout(() => showOnce("timeout"), timeoutMs);
   }
+  win.on("show", () => {
+    let visible = null;
+    let destroyed = null;
+    let bounds = null;
+    try { visible = win.isVisible?.(); } catch {}
+    try { destroyed = win.isDestroyed(); } catch {}
+    try { bounds = win.getBounds?.(); } catch {}
+    dbgLog("[WindowManager] WINDOW SHOW event isVisible=" + visible + " isDestroyed=" + destroyed + " bounds=" + JSON.stringify(bounds));
+  });
+  win.on("hide", () => {
+    dbgLog("[WindowManager] WINDOW HIDE event");
+  });
   win.on("closed", () => {
+    dbgLog("[WindowManager] WINDOW CLOSED event");
     if (timer) clearTimeout(timer);
     timer = null;
     if (webContentsId) rendererReadyCallbacksByWebContentsId.delete(webContentsId);

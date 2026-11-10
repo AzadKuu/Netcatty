@@ -1,11 +1,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const harmonyCompat = require("./harmonyCompat.cjs");
 
 function applyPortableDataDirectory({
   app,
   env = process.env,
   platform = process.platform,
 }) {
+  if (harmonyCompat.isHarmony(platform)) return null;
   if (platform !== "win32" || !app?.isPackaged) return null;
 
   const portableLauncherDirectory = typeof env?.PORTABLE_EXECUTABLE_DIR === "string"

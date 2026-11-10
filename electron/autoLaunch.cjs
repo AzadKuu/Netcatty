@@ -16,8 +16,11 @@
 
 const HIDDEN_LAUNCH_ARG = "--hidden";
 
+const harmonyCompat = require("./harmonyCompat.cjs");
+
 function isAutoLaunchSupported({ defaultApp = process.defaultApp, platform = process.platform } = {}) {
   if (defaultApp) return false;
+  if (harmonyCompat.isHarmony(platform)) return false;
   return platform === "darwin" || platform === "win32";
 }
 
