@@ -363,3 +363,7 @@ export const STORAGE_KEY_MONITOR_HIDDEN_COLUMNS = "netcatty_monitor_hidden_colum
 
 // Preferred application for saved terminal logs (independent of SFTP associations).
 export const STORAGE_KEY_SESSION_LOG_APPLICATION = "netcatty.sessionLogApplication";
+
+// Catty agent behaviour preset: "classic" (original prompt/tool set) or
+// "enhanced" (plan + self-check loop, retry-once policy).
+export const STORAGE_KEY_CATTY_AGENT_MODE = "netcatty_catty_agent_mode_v1";

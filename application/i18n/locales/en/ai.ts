@@ -345,6 +345,13 @@ export const enAiMessages: Messages = {
   'ai.grok.runtime.streamingJson.hint':
     'Using headless streaming-json (grok -p --output-format streaming-json). Project .grok/config.toml is used for MCP injection.',
 
+  // AI Catty behaviour preset
+  'ai.catty.mode.title': 'Catty enhanced mode',
+  'ai.catty.mode.description':
+    'Forces Catty to write a plan first (plan_update), self-check after each step, and retry a failed tool once with adjusted arguments. More reliable, but slower and uses more tokens. Turn off to restore the original behaviour.',
+  'ai.catty.mode.classic': 'Classic',
+  'ai.catty.mode.enhanced': 'Enhanced',
+
   // AI Default Agent
   'ai.defaultAgent': 'Default Agent',
   'ai.defaultAgent.description': 'Agent to use when starting a new AI session',

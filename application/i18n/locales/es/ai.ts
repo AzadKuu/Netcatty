@@ -345,6 +345,13 @@ export const esAiMessages: Messages = {
   'ai.grok.runtime.streamingJson.hint':
     'Usando streaming-json headless (grok -p --output-format streaming-json). El archivo .grok/config.toml del proyecto se usa para la inyección de MCP.',
 
+  // AI Catty behaviour preset
+  'ai.catty.mode.title': 'Modo mejorado de Catty',
+  'ai.catty.mode.description':
+    'Obliga a Catty a escribir primero un plan (plan_update), revisar cada paso y reintentar una vez la herramienta fallida con argumentos ajustados. Más fiable, pero más lento y consume más tokens. Desactívalo para volver al comportamiento original.',
+  'ai.catty.mode.classic': 'Clásico',
+  'ai.catty.mode.enhanced': 'Mejorado',
+
   // AI Default Agent
   'ai.defaultAgent': 'Agente predeterminado',
   'ai.defaultAgent.description': 'Agente que se usará al iniciar una nueva sesión de IA',

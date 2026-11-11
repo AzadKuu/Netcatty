@@ -3,6 +3,13 @@ const {
   windowsFramelessContentChromeOptions,
 } = require("./windowsWindowChrome.cjs");
 
+// HarmonyOS reports process.platform as "openharmony"; accept the aliases too so a
+// port that reports "harmony"/"ohos" keeps the same window-raising behaviour.
+const HARMONY_PLATFORMS = new Set(["harmony", "ohos", "openharmony"]);
+// setWindowTopmost() on HarmonyOS is asynchronous, so the flag has to stay on long
+// enough for the window server to raise the window before it is cleared again.
+const HARMONY_TOPMOST_HOLD_MS = 400;
+
 function createSettingsWindowApi(ctx) {
   // The extracted window helpers intentionally share the parent window-manager state.
   with (ctx) {
@@ -10,6 +17,7 @@ function createSettingsWindowApi(ctx) {
       if (!win || win.isDestroyed()) return false;
       const shouldShow = options.show === true;
       const platform = options.platform || process.platform;
+      const isHarmonyPlatform = HARMONY_PLATFORMS.has(platform);
     
       if (shouldShow) {
         try {
@@ -19,7 +27,7 @@ function createSettingsWindowApi(ctx) {
         }
       }
     
-      if (platform === "win32") {
+      if (platform === "win32" || isHarmonyPlatform) {
         try {
           win.setAlwaysOnTop(true);
         } catch {
@@ -29,7 +37,26 @@ function createSettingsWindowApi(ctx) {
           win.focus();
         } catch {
           // ignore
-        } finally {
+        }
+        try {
+          win.moveTop?.();
+        } catch {
+          // ignore
+        }
+        if (isHarmonyPlatform) {
+          // On HarmonyOS focus() maps to UIAbility.showAbility(), which does not raise an
+          // already-visible window above the main window. Keep the topmost flag on briefly
+          // so the window server moves it to the front, then drop it again.
+          const timer = setTimeout(() => {
+            if (win.isDestroyed()) return;
+            try {
+              win.setAlwaysOnTop(false);
+            } catch {
+              // ignore
+            }
+          }, HARMONY_TOPMOST_HOLD_MS);
+          if (typeof timer?.unref === "function") timer.unref();
+        } else {
           try {
             win.setAlwaysOnTop(false);
           } catch {

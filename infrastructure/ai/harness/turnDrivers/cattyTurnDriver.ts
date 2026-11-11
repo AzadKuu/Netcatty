@@ -8,6 +8,7 @@ import {
   resolveContextWindow,
 } from '../../contextCompaction';
 import { buildSystemPrompt } from '../../cattyAgent/systemPrompt';
+import { readCattyAgentMode } from '../../cattyAgent/cattyMode';
 import {
   isWebSearchReady,
   normalizeCommandTimeoutSeconds,
@@ -23,6 +24,7 @@ import {
 } from '../../cattyReasoning';
 import { createModelFromConfig } from '../../sdk/providers';
 import { createCattyToolsFromCatalog } from '../capabilityTools';
+import { createCattyPlanTool, decorateToolsWithRetryGuidance } from '../capabilityTools';
 import { createInitialCattyRuntimeContext } from '../cattyRuntimeContext';
 import { prepareStepContext, extractLatestUserGoal } from '../contextManager';
 import {
@@ -174,7 +176,31 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
     ctx.toolResultDedup,
     { agentKind: context.agentKind, allowedCapabilityIds: context.allowedCapabilityIds },
   );
-  const { tools } = toolsBundle;
+  // Enhanced mode is opt-in per install (Settings → AI): it adds the
+  // plan/self-check loop and turns tool failures into an explicit retry-once
+  // instruction instead of letting the model summarise after one error.
+  const agentMode = readCattyAgentMode();
+  const tools = agentMode === 'enhanced'
+    ? decorateToolsWithRetryGuidance({
+        ...toolsBundle.tools,
+        plan_update: createCattyPlanTool({
+          onPlanUpdate: (items) => {
+            ctx.emit({
+              id: `plan-update-${ctx.turnId}-${Date.now()}`,
+              type: 'plan_update',
+              sessionId,
+              chatSessionId: sessionId,
+              backend: 'catty',
+              timestamp: Date.now(),
+              turnId: ctx.turnId,
+              itemId: `plan-${ctx.turnId}`,
+              status: items.every((item) => item.completed) ? 'completed' : 'running',
+              items,
+            } as import('../types').AgentEvent);
+          },
+        }),
+      })
+    : toolsBundle.tools;
 
   const systemPrompt = buildSystemPrompt({
     scopeType: context.scopeType,
@@ -183,6 +209,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
     permissionMode: context.globalPermissionMode,
     webSearchEnabled: isWebSearchReady(context.webSearchConfig),
     userSkillsContext,
+    agentMode,
   });
 
   if (!context.activeProvider) {

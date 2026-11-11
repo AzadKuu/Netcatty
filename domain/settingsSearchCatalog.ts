@@ -752,6 +752,14 @@ export const SETTINGS_SEARCH_CATALOG: readonly SettingsSearchEntry[] = [
     descriptionKey: "ai.codebuddy.description",
   },
   {
+    id: "ai-catty-mode",
+    tab: "ai",
+    aiSubTab: "agents",
+    labelKey: "ai.catty.mode.title",
+    descriptionKey: "ai.catty.mode.description",
+    keywords: ["catty", "agent", "plan", "retry", "enhanced"],
+  },
+  {
     id: "ai-default-agent",
     tab: "ai",
     aiSubTab: "agents",

@@ -789,4 +789,109 @@ export function withCattyToolContext<T extends { execute: (...args: never[]) => 
   } as T;
 }
 
+export interface PlanStep {
+  text: string;
+  completed: boolean;
+}
+
+const RETRY_GUIDANCE = [
+  '',
+  '[tool failure] This call did not succeed. Do not end the task or summarize here:',
+  '1. Name the most likely cause from the error above.',
+  '2. Change one concrete thing (arguments, path, flags, or run a discovery command first) and retry once.',
+  '3. Only if it fails a second time, stop and report exactly what you tried and what you need.',
+].join('\n');
+
+function describeThrownError(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name;
+  if (typeof error === 'string') return error;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+/** Attach retry guidance to a tool result that reports a failure. */
+function applyRetryGuidance(result: unknown): unknown {
+  if (typeof result === 'string') {
+    return result.startsWith('[tool failure]') ? result : result;
+  }
+  if (result && typeof result === 'object' && 'error' in result) {
+    const record = result as Record<string, unknown>;
+    const error = record.error;
+    if (typeof error === 'string' && error.trim()) {
+      return { ...record, error: `${error}${RETRY_GUIDANCE}` };
+    }
+    return record;
+  }
+  return result;
+}
+
+/**
+ * Enhanced-mode wrapper: a thrown tool error becomes a model-visible failure
+ * notice with an explicit "retry once with a concrete change" instruction, and
+ * structured `{ error }` results get the same instruction appended.
+ */
+export function decorateToolsWithRetryGuidance<T extends Record<string, { execute?: unknown }>>(tools: T): T {
+  const decorated: Record<string, unknown> = {};
+  for (const [name, toolInstance] of Object.entries(tools)) {
+    const original = (toolInstance as { execute?: (...args: never[]) => unknown })?.execute;
+    if (typeof original !== 'function') {
+      decorated[name] = toolInstance;
+      continue;
+    }
+    decorated[name] = {
+      ...toolInstance,
+      execute: async (input: never, options: never) => {
+        try {
+          const result = await (original as (a: never, b: never) => unknown)(input, options);
+          return applyRetryGuidance(result);
+        } catch (error) {
+          return `[tool failure] ${describeThrownError(error)}${RETRY_GUIDANCE}`;
+        }
+      },
+    };
+  }
+  return decorated as T;
+}
+
+/**
+ * `plan_update` tool used by enhanced mode: the model publishes its step list
+ * and marks steps done, which the runtime persists into session state and the
+ * chat renders as a plan card.
+ */
+export function createCattyPlanTool(options: {
+  onPlanUpdate?: (items: PlanStep[]) => void;
+} = {}) {
+  const schema = z.object({
+    steps: z
+      .array(
+        z.object({
+          text: z.string().min(1).describe('One concrete, verifiable step.'),
+          completed: z.boolean().optional().describe('True once the step is verified done.'),
+        }),
+      )
+      .min(1)
+      .max(20)
+      .describe('The full, current step list (not a delta).'),
+  });
+
+  return tool({
+    description:
+      'Publish or update the task plan. Call this before the first action of any multi-step task, then again whenever a step completes or the plan changes. Always send the full list; completed steps stay in the list with completed=true.',
+    inputSchema: schema,
+    execute: async (args: { steps: Array<{ text: string; completed?: boolean }> }) => {
+      const items: PlanStep[] = args.steps.map((step) => ({
+        text: step.text.trim(),
+        completed: step.completed === true,
+      }));
+      options.onPlanUpdate?.(items);
+      const done = items.filter((item) => item.completed).length;
+      const lines = items.map((item) => `${item.completed ? '[x]' : '[ ]'} ${item.text}`);
+      return `Plan updated (${done}/${items.length} done):\n${lines.join('\n')}`;
+    },
+  });
+}
+
 export { tryFetchHostEnvironment };

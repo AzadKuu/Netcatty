@@ -336,6 +336,13 @@ export const zhTWAiMessages: Messages = {
   'ai.grok.runtime.streamingJson.hint':
     '目前為 headless streaming-json（grok -p --output-format streaming-json）。MCP 透過專案 .grok/config.toml 注入。',
 
+  // AI Catty behaviour preset
+  'ai.catty.mode.title': 'Catty 增強模式',
+  'ai.catty.mode.description':
+    '強制 Catty 先輸出計畫（plan_update），每一步自檢，工具失敗時先調整參數重試一次。回答更穩定，但更慢、消耗更多 token。關閉即恢復原版行為。',
+  'ai.catty.mode.classic': '原版',
+  'ai.catty.mode.enhanced': '增強',
+
   // AI Default Agent
   'ai.defaultAgent': '預設 Agent',
   'ai.defaultAgent.description': '建立新 AI 工作階段時使用的 Agent',

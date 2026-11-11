@@ -19,6 +19,11 @@ import type {
   WebSearchConfig,
 } from "../../../infrastructure/ai/types";
 import type { ManagedAgentKey } from "../../../infrastructure/ai/managedAgents";
+import {
+  readCattyAgentMode,
+  writeCattyAgentMode,
+  type CattyAgentMode,
+} from "../../../infrastructure/ai/cattyAgent/cattyMode";
 import type { Host } from "../../../domain/models";
 import { PROVIDER_PRESETS } from "../../../infrastructure/ai/types";
 import { useI18n } from "../../../application/i18n/I18nProvider";
@@ -55,6 +60,10 @@ import {
   buildDshAgentHostCommand,
   resolveDshAgentHostSelectValue,
 } from "./ai/dshAgentHostSelection";
+import {
+  cattyModeFromEnhancedToggle,
+  isCattyEnhancedMode,
+} from "./ai/cattyModeToggle";
 import { CodebuddyCard } from "./ai/CodebuddyCard";
 import { SafetySettings } from "./ai/SafetySettings";
 import { ExternalMcpCard } from "./ai/ExternalMcpCard";
@@ -893,6 +902,17 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     });
   }, [hosts, resolveAgentPath]);
 
+  // Classic vs enhanced Catty is a behaviour preset read once per turn by the
+  // harness, so the switch writes straight through and the next message picks
+  // it up without a restart.
+  const [cattyAgentMode, setCattyAgentMode] = useState<CattyAgentMode>(() => readCattyAgentMode());
+  const cattyEnhanced = isCattyEnhancedMode(cattyAgentMode);
+  const handleCattyModeChange = useCallback((enabled: boolean) => {
+    const mode = cattyModeFromEnhancedToggle(enabled);
+    writeCattyAgentMode(mode);
+    setCattyAgentMode(mode);
+  }, []);
+
   useEffect(() => {
     if (activeSubTab !== "agents") return;
     if (codexIntegrationLoadedRef.current) return;
@@ -1332,6 +1352,23 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               agentHostValue={dshAgentHostValue}
               onAgentHostChange={handleDshAgentHostChange}
             />
+          </SettingsSection>
+
+          <SettingsSection anchorId="ai-catty-mode" title={t('ai.catty.mode.title')}>
+            <SettingCard>
+              <SettingRow description={t('ai.catty.mode.description')}>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-muted-foreground">
+                    {cattyEnhanced ? t('ai.catty.mode.enhanced') : t('ai.catty.mode.classic')}
+                  </span>
+                  <Toggle
+                    checked={cattyEnhanced}
+                    onChange={handleCattyModeChange}
+                    ariaLabel={t('ai.catty.mode.title')}
+                  />
+                </div>
+              </SettingRow>
+            </SettingCard>
           </SettingsSection>
 
           {agentOptions.length > 1 ? (
