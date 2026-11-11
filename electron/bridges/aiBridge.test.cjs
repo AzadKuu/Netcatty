@@ -1921,3 +1921,31 @@ test('custom provider headers are decrypted before HTTP and override auth case-i
     restore();
   }
 });
+
+test("remote agent context drops local CLI paths and carries the terminal snapshot", () => {
+  const bridge = require("./aiBridge.cjs");
+  const context = bridge.buildExternalAgentSystemContext({
+    mode: "skills",
+    chatSessionId: "chat-1",
+    defaultTargetSession: { sessionId: "term-1", hostname: "192.168.2.129", connected: true },
+    userSkillsContext: undefined,
+    terminalContext: "root@web:~# systemctl status nginx",
+    remoteAgentHost: "ssh://shawn@mc.example.com",
+  });
+  // The agent runs on another machine: no local Netcatty CLI paths may leak in.
+  assert.ok(!context.includes("netcatty-tool-cli session"));
+  assert.ok(context.includes("mc.example.com"));
+  assert.ok(context.includes("systemctl status nginx"));
+});
+
+test("local agent context keeps the CLI instructions and has no terminal snapshot", () => {
+  const bridge = require("./aiBridge.cjs");
+  const context = bridge.buildExternalAgentSystemContext({
+    mode: "skills",
+    chatSessionId: "chat-1",
+    defaultTargetSession: { sessionId: "term-1", hostname: "192.168.2.129", connected: true },
+    userSkillsContext: undefined,
+  });
+  assert.ok(context.includes("Netcatty CLI"));
+  assert.ok(!context.includes("[Terminal context:"));
+});

@@ -132,8 +132,31 @@ function getSkillsCliInvocation() {
   };
 }
 
-function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSession, userSkillsContext }) {
+function buildExternalAgentSystemContext({
+  mode,
+  chatSessionId,
+  defaultTargetSession,
+  userSkillsContext,
+  terminalContext,
+  remoteAgentHost,
+}) {
   const userSkillsPreamble = userSkillsContext ? `${userSkillsContext}\n\n` : "";
+  const terminalContextSection = terminalContext
+    ? `\n\n[Terminal context: you cannot read this terminal yourself because you run elsewhere, so the host captured it for you. It is a snapshot of the target session at the moment this turn started; it may be stale by now and it is not a substitute for running commands. ${terminalContext}]`
+    : "";
+  if (remoteAgentHost) {
+    // The agent executes on another machine, so every local Netcatty path in the
+    // usual instructions is unreachable and must not be suggested.
+    return (
+      `${userSkillsPreamble}` +
+      `[Context: You are the AI agent inside Netcatty, a multi-session terminal manager, but you run on \`${remoteAgentHost}\`. ` +
+      `The Netcatty CLI, its launcher, the Netcatty skill file and the "netcatty-remote-hosts" MCP server live on the user's own machine and are NOT available where you execute commands. ` +
+      `Do not try to invoke \`netcatty-tool-cli\`, do not hunt for those paths, and do not report their absence as a problem: it is expected. ` +
+      `Your shell belongs to \`${remoteAgentHost}\`. Use it only for what the user asks about that machine (builds, files, services there). ` +
+      `To inspect the user's terminal session you must rely on the terminal snapshot the host supplies in this prompt; if the snapshot is insufficient, say what you need instead of guessing.]` +
+      terminalContextSection
+    );
+  }
   if (mode === "skills") {
     const { commandPrefix: cliCommandPrefix, launcherPath, usesLauncher } = getSkillsCliInvocation();
     const skillHint = existsSync(NETCATTY_TOOL_SKILL_PATH)
@@ -198,7 +221,8 @@ function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSes
       `Do not spend time narrating intent before every CLI call for routine read-only checks. Execute the minimal command sequence and then report the result. ` +
       `Only after that confirmation step should you call \`${cliCommandPrefix} exec --session <id> --json -- <command>\` for command execution. ` +
       `If the user stops the run or asks to abort outstanding Netcatty work, use \`${cliCommandPrefix} cancel --json\`, and use \`resume\` to re-enable execs for that scope if needed. ` +
-      `For serial/raw sessions and network device sessions (deviceType: network), commands are sent as-is without shell wrapping and exit codes are unavailable. Use vendor CLI commands directly.]`
+      `For serial/raw sessions and network device sessions (deviceType: network), commands are sent as-is without shell wrapping and exit codes are unavailable. Use vendor CLI commands directly.]` +
+      terminalContextSection
     );
   }
 
@@ -212,16 +236,25 @@ function buildExternalAgentSystemContext({ mode, chatSessionId, defaultTargetSes
     `Use terminal_execute only for commands likely to finish within about 60 seconds. ` +
     `For long-running commands such as builds, scans, follow/log streaming, watch commands, or anything likely to exceed 60 seconds on PTY-backed shell sessions, use terminal_start, then terminal_poll until completed is true. Reuse the returned nextOffset for the next poll. If terminal_poll reports outputTruncated=true, only the retained tail starting at outputBaseOffset is still available. Do not poll aggressively: wait at least about 30 seconds between polls, and increase the interval further when there is no new output, to avoid wasting tokens. As soon as completed is true, stop polling and analyze the result immediately. ` +
     `Use terminal_stop if you need to interrupt a started long-running command. Note: terminal_start requires a PTY-backed session; for sessions that only support exec-channel execution (no writable PTY), use terminal_execute instead. ` +
-    `For serial/raw sessions and network device sessions (deviceType: network), commands are sent as-is without shell wrapping and exit codes are unavailable. Use vendor CLI commands directly.]`,
+    `For serial/raw sessions and network device sessions (deviceType: network), commands are sent as-is without shell wrapping and exit codes are unavailable. Use vendor CLI commands directly.]` +
+    terminalContextSection,
   );
 }
 
-function buildExternalAgentContextualPrompt({ mode, prompt, chatSessionId, defaultTargetSession, userSkillsContext }) {
+function buildExternalAgentContextualPrompt({
+  mode,
+  prompt,
+  chatSessionId,
+  defaultTargetSession,
+  userSkillsContext,
+  terminalContext,
+}) {
   const systemContext = buildExternalAgentSystemContext({
     mode,
     chatSessionId,
     defaultTargetSession,
     userSkillsContext,
+    terminalContext,
   });
   return `${systemContext}\n\n${prompt}`;
 }
@@ -1008,6 +1041,9 @@ function registerHandlers(ipcMain, options = {}) {
   // Terminal sessions own the ssh2 clients that SSH-hosted CLI agents (dsh
   // `ssh:` mode) run over; injected from registerBridges.cjs.
   context.sessions = options.sessions || null;
+  // Needed to snapshot a terminal's scrollback for agents that cannot read the
+  // session themselves (an agent running on a remote SSH host).
+  context.terminalWorkerManager = options.terminalWorkerManager || null;
   Object.assign(context, createAgentCliHelpers(context));
   registeredContext = context;
 

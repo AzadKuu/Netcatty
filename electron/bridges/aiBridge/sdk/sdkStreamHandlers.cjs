@@ -265,6 +265,37 @@ function buildAgentTransport({ sessions, agentSshSession, targetSessionId }) {
   };
 }
 
+/**
+ * A terminal's scrollback lives in the renderer that hosts it, so an agent
+ * running elsewhere (an SSH-hosted CLI like `dsh ssh://…`) cannot read it the
+ * way a local agent reads the Netcatty CLI. Snapshot the visible buffer here and
+ * hand it to the model as prompt context instead.
+ */
+const TERMINAL_CONTEXT_MAX_LINES = 120;
+const TERMINAL_CONTEXT_MAX_CHARS = 8000;
+
+async function readTargetTerminalContext({ sessionId, session, terminalWorkerManager }) {
+  if (!sessionId || !terminalWorkerManager) return "";
+  try {
+    const { requestMainInitiatedSnapshot } = require("../../terminalBridge.cjs");
+    const { stripAnsi } = require("../../ai/shellUtils.cjs");
+    const result = await requestMainInitiatedSnapshot(sessionId, terminalWorkerManager);
+    if (!result?.success || !result.snapshot) return "";
+    const lines = stripAnsi(result.snapshot)
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .slice(-TERMINAL_CONTEXT_MAX_LINES);
+    if (lines.length === 0) return "";
+    const text = lines.join("\n");
+    const head = `Session ${sessionId}${session?.hostname ? ` (${session.hostname})` : ""} currently shows its last ${lines.length} non-empty lines:\n`;
+    return head + (text.length > TERMINAL_CONTEXT_MAX_CHARS ? text.slice(-TERMINAL_CONTEXT_MAX_CHARS) : text);
+  } catch (err) {
+    console.log("[ai] terminal context unavailable:", err?.message || String(err));
+    return "";
+  }
+}
+
 async function fetchSdkModelCatalog({
   backendKey,
   codexRuntime,
@@ -1002,11 +1033,27 @@ function registerSdkStreamHandlers(ctx) {
             : "";
           mcpServerBridge.updateAttachmentMetadata?.(stagedAttachments, chatSessionId);
 
+          // An agent pinned to an SSH host cannot run the Netcatty CLI (it is a
+          // local binary), so give it the target terminal's visible output as
+          // prompt context instead of leaving it blind.
+          const pinnedSshAgent = typeof agentCommand === "string" && agentCommand.trim().toLowerCase().startsWith("ssh://");
+          const terminalContext = pinnedSshAgent
+            ? await readTargetTerminalContext({
+              sessionId: typeof defaultTargetSession === "string"
+                ? defaultTargetSession
+                : defaultTargetSession?.sessionId,
+              session: typeof defaultTargetSession === "string"
+                ? ctx.sessions?.get?.(defaultTargetSession)
+                : defaultTargetSession,
+              terminalWorkerManager: ctx.terminalWorkerManager,
+            })
+            : "";
           const systemContext = buildExternalAgentSystemContext({
             mode: effectiveMode,
             chatSessionId,
             defaultTargetSession,
             userSkillsContext,
+            terminalContext,
           });
           const contextualPrompt = buildExternalAgentContextualPrompt({
             mode: effectiveMode,
@@ -1014,6 +1061,7 @@ function registerSdkStreamHandlers(ctx) {
             chatSessionId,
             defaultTargetSession,
             userSkillsContext,
+            terminalContext,
           });
 
           const driver = getDriver(backendKey);

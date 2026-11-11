@@ -204,6 +204,46 @@ function isAuthorizedAttachIpc(event, payload, sessionId) {
   );
 }
 
+/**
+ * Snapshot a session's scrollback on behalf of another main-process consumer
+ * (the AI bridges). Unlike the attach-popup path there is no renderer request
+ * to authorize: the caller is main, and the target renderer is resolved from
+ * the session's own home web contents.
+ */
+function requestMainInitiatedSnapshot(sessionId, terminalWorkerManager = null) {
+  if (typeof sessionId !== "string" || !sessionId) {
+    return Promise.resolve({ success: false, snapshot: "", error: "Missing sessionId" });
+  }
+  const homeId = resolveSessionHomeWebContentsId(sessionId, terminalWorkerManager);
+  if (typeof homeId !== "number" || !electronModule?.webContents?.fromId) {
+    return Promise.resolve({ success: false, snapshot: "", error: "Home renderer not found" });
+  }
+  let home;
+  try {
+    home = electronModule.webContents.fromId(homeId);
+  } catch {
+    home = null;
+  }
+  if (!home || home.isDestroyed?.()) {
+    return Promise.resolve({ success: false, snapshot: "", error: "Home renderer destroyed" });
+  }
+  const requestId = randomUUID();
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      pendingTerminalSnapshots.delete(requestId);
+      resolve({ success: false, snapshot: "", error: "timeout" });
+    }, TERMINAL_SNAPSHOT_TIMEOUT_MS);
+    pendingTerminalSnapshots.set(requestId, { resolve, timeout, webContentsId: home.id });
+    try {
+      home.send("netcatty:terminal:snapshot-request", { sessionId, requestId });
+    } catch (err) {
+      clearTimeout(timeout);
+      pendingTerminalSnapshots.delete(requestId);
+      resolve({ success: false, snapshot: "", error: err?.message || String(err) });
+    }
+  });
+}
+
 function resolveSessionHomeWebContentsId(sessionId, terminalWorkerManager = null) {
   if (!sessionId) return null;
   if (terminalWorkerManager?.getSessionWebContentsId) {
@@ -2917,6 +2957,7 @@ module.exports = {
   setSessionEncoding,
   resizeSession,
   clearSessionPtyBuffer,
+  requestMainInitiatedSnapshot,
   setSessionFlowPaused,
   ackSessionFlow,
   closeSession,
