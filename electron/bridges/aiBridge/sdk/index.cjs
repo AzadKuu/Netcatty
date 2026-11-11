@@ -489,6 +489,13 @@ const DRIVER_REGISTRY = {
         emitter: ctx.emitter,
         abortController: ctx.abortController,
         signal: ctx.signal,
+        // Local spawn override (tests) plus the SSH transport for `ssh:` bin
+        // paths: the turn context is the only place with access to the
+        // terminal session registry, so it resolves the ssh2 client.
+        spawnImpl: ctx.spawnImpl,
+        sshClient: ctx.sshClient,
+        getSession: ctx.getSession,
+        targetSessionId: ctx.targetSessionId,
       });
     },
     async listModels(ctx) {
@@ -497,6 +504,9 @@ const DRIVER_REGISTRY = {
         env: ctx.env,
         binPath: ctx.binPath,
         signal: ctx.signal,
+        sshClient: ctx.sshClient,
+        getSession: ctx.getSession,
+        targetSessionId: ctx.targetSessionId,
       });
     },
   },

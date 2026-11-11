@@ -57,6 +57,14 @@ function _earlyDbgLog(...args) {
   if (p) { try { _earlyFs.appendFileSync(p, msg); } catch {} }
 }
 
+function safeUserDataPath() {
+  try {
+    return require("electron").app.getPath("userData");
+  } catch {
+    return "(unavailable)";
+  }
+}
+
 // Load crash log bridge early so process-level error handlers can use it
 const crashLogBridge = require("./bridges/crashLogBridge.cjs");
 const {
@@ -1309,16 +1317,31 @@ function hasUsableWindow() {
 function showStartupError(err) {
   const title = "Netcatty";
   const code = err && typeof err === "object" ? err.code : null;
-  const message =
+  const headline =
     code === "ENOENT"
       ? "Renderer files are missing. Please reinstall or rebuild Netcatty."
       : "Failed to load the UI. Please relaunch Netcatty.";
+  // The generic headline used to be the only thing a user could report back.
+  // Keep the friendly text first, then the underlying reason, so a screenshot
+  // of this dialog is enough to diagnose the failure.
+  const detail = describeStartupErrorDetail(err);
+  const message = detail ? `${headline}\n\nReason: ${detail}` : headline;
 
+  _earlyDbgLog("[Main] Startup error dialog:", detail || "(no detail)");
   try {
     electronModule.dialog?.showErrorBox?.(title, message);
   } catch {
     // ignore
   }
+}
+
+function describeStartupErrorDetail(err) {
+  if (!err) return "";
+  const code = typeof err === "object" && err.code ? String(err.code) : "";
+  const rawMessage = typeof err === "object" ? err.message : String(err);
+  const combined = [code, rawMessage].filter(Boolean).join(": ").replace(/\s+/g, " ").trim();
+  if (!combined) return "";
+  return combined.length > 300 ? `${combined.slice(0, 300)}…` : combined;
 }
 
 // Ensure single-instance behavior — must run before app.whenReady() so
@@ -1334,6 +1357,10 @@ const gotLock = app.requestSingleInstanceLock({ rawLaunchArgv: rawLaunchArgvForH
 // snapshot so a primary instance does not retain the launch password forever.
 rawLaunchArgvForHandoff.length = 0;
 if (!gotLock) {
+  // A silent quit here looks exactly like "double-clicking does nothing": the
+  // lock can fail either because another instance owns it or because the
+  // profile directory refused the lock file. Leave a trace for both cases.
+  _earlyDbgLog("[Main] single-instance lock not acquired; quitting", `userData=${safeUserDataPath()}`);
   app.quit();
 } else {
   app.on("open-url", (event, rawUrl) => {

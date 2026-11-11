@@ -47,6 +47,14 @@
     {
       "name": "OpenNewWindow_label",
       "value": "OpenNewWindow"
+    },
+    {
+      "name": "reason_download_directory",
+      "value": "Netcatty needs the Downloads folder to save the files you transfer from remote hosts."
+    },
+    {
+      "name": "reason_documents_directory",
+      "value": "Netcatty needs the Documents folder so command line tools installed there can be run by the AI agent."
     }
   ]
 }

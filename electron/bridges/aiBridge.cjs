@@ -1003,8 +1003,11 @@ function createHandlerContext(ipcMain) {
   };
 }
 
-function registerHandlers(ipcMain) {
+function registerHandlers(ipcMain, options = {}) {
   const context = createHandlerContext(ipcMain);
+  // Terminal sessions own the ssh2 clients that SSH-hosted CLI agents (dsh
+  // `ssh:` mode) run over; injected from registerBridges.cjs.
+  context.sessions = options.sessions || null;
   Object.assign(context, createAgentCliHelpers(context));
   registeredContext = context;
 

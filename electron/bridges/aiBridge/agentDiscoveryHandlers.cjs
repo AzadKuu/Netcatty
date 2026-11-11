@@ -270,7 +270,19 @@ function registerAgentDiscoveryHandlers(ctx) {
       invalidateShellEnvCache();
     }
     const shellEnv = await getShellEnv();
-    const hasCustomPath = command !== "cursor" && Boolean(String(customPath || "").trim());
+    const customPathText = String(customPath || "").trim();
+    // SSH-hosted command (`ssh:dsh`): nothing local to probe. The agent runs on
+    // the remote host of the chat's target SSH session, so treat it as resolved.
+    if (customPathText.startsWith("ssh:")) {
+      return {
+        path: customPathText,
+        binPath: customPathText,
+        version: "remote (ssh)",
+        available: true,
+        installed: true,
+      };
+    }
+    const hasCustomPath = command !== "cursor" && Boolean(customPathText);
 
     let resolvedPath;
     if (hasCustomPath) {

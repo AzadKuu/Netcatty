@@ -22,6 +22,9 @@ const INIT_TIMEOUT_MS = 30_000;
 const MODEL_TIMEOUT_MS = 60_000;
 const CANCEL_GRACE_MS = 1_500;
 const MODEL_CONFIG_ID = "model";
+// `ssh:` prefix on the configured command means "run dsh on the remote host of
+// the chat's target terminal session" (HarmonyOS cannot exec user files).
+const SSH_DSH_PREFIX = "ssh:";
 
 function createDshLineReader(onLine, maxChars = MAX_LINE_CHARS) {
   let buffer = "";
@@ -65,25 +68,10 @@ function formatAcpError(error) {
 }
 
 /**
- * One ACP connection over a `dsh --profile acp` child process.
- * Returns null when the runtime cannot start the agent at all.
+ * One ACP connection over any duplex child-like transport (`stdin` writable,
+ * `stdout`/`stderr` emitting "data", `on("exit"|"error")`, `kill`).
  */
-function openDshAcpConnection({ binPath, cwd, env, spawnImpl = spawn, onNotification, onRequest }) {
-  const spec = buildDshSpawnSpec(binPath, DSH_ACP_ARGS);
-  let child;
-  try {
-    child = spawnImpl(spec.command, spec.args, {
-      shell: spec.shell,
-      cwd: cwd || undefined,
-      env: env || process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-  } catch {
-    return null;
-  }
-  if (!child || !child.stdin || !child.stdout) return null;
-
+function createAcpConnection(child, { onNotification, onRequest }) {
   let closed = false;
   let exited = false;
   let exitInfo = null;
@@ -275,6 +263,160 @@ function openDshAcpConnection({ binPath, cwd, env, spawnImpl = spawn, onNotifica
   };
 }
 
+/**
+ * One ACP connection over a `dsh --profile acp` child process.
+ * Returns null when the runtime cannot start the agent at all.
+ */
+function openDshAcpConnection({ binPath, cwd, env, spawnImpl = spawn, onNotification, onRequest }) {
+  const spec = buildDshSpawnSpec(binPath, DSH_ACP_ARGS);
+  let child;
+  try {
+    child = spawnImpl(spec.command, spec.args, {
+      shell: spec.shell,
+      cwd: cwd || undefined,
+      env: env || process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  if (!child || !child.stdin || !child.stdout) return null;
+  return createAcpConnection(child, { onNotification, onRequest });
+}
+
+/**
+ * Adapt an ssh2 `exec` channel into the child-process shape ACP needs, so the
+ * agent can run on a remote host (HarmonyOS forbids exec'ing anything outside
+ * the system partition, so remote execution is the only way to host a CLI
+ * agent there). Killing the channel leaves the shared SSH connection intact.
+ */
+function createSshAcpChild(stream) {
+  const { EventEmitter } = require("node:events");
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const lifecycle = new EventEmitter();
+  let closed = false;
+  stream.on("data", (chunk) => stdout.emit("data", chunk));
+  if (stream.stderr) stream.stderr.on("data", (chunk) => stderr.emit("data", chunk));
+  stream.on("error", (error) => lifecycle.emit("error", error));
+  stream.on("close", () => {
+    closed = true;
+    lifecycle.emit("exit", null, null);
+  });
+  return {
+    stdin: {
+      get destroyed() {
+        return closed;
+      },
+      write(chunk) {
+        if (closed) return false;
+        try {
+          stream.write(chunk);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      end() {
+        if (closed) return;
+        try {
+          stream.end();
+        } catch {}
+      },
+    },
+    stdout,
+    stderr,
+    on(event, handler) {
+      lifecycle.on(event, handler);
+    },
+    kill() {
+      closed = true;
+      try {
+        stream.close();
+      } catch {}
+    },
+  };
+}
+
+/** `ssh:dsh` / `ssh:dsh --profile acp` / `ssh:` -> remote command line. */
+function parseSshDshCommand(binPath) {
+  const raw = typeof binPath === "string" ? binPath.trim() : "";
+  if (!raw.startsWith(SSH_DSH_PREFIX)) return null;
+  const rest = raw.slice(SSH_DSH_PREFIX.length).trim();
+  if (!rest) return `${DEFAULT_DSH_COMMAND} ${DSH_ACP_ARGS.join(" ")}`;
+  return rest.includes("--profile") ? rest : `${rest} ${DSH_ACP_ARGS.join(" ")}`;
+}
+
+function resolveSshClientForTurn(ctx) {
+  // The turn context hands the transport down directly (resolved where the
+  // session registry is in scope); the lookup below is a fallback for callers
+  // that only pass ids.
+  if (ctx.sshClient) return ctx.sshClient;
+  const session = typeof ctx.getSession === "function" && ctx.targetSessionId
+    ? ctx.getSession(ctx.targetSessionId)
+    : null;
+  if (!session || !(session.sshClient || session.conn)) {
+    console.log(
+      "[dshAcp] ssh session resolve failed:",
+      JSON.stringify({
+        hasSshClient: Boolean(ctx.sshClient),
+        hasGetSession: typeof ctx.getSession,
+        targetSessionId: ctx.targetSessionId || null,
+        hasSession: Boolean(session),
+        sessionKeys: session ? Object.keys(session).slice(0, 12) : [],
+      }),
+    );
+  }
+  return (session && (session.sshClient || session.conn)) || null;
+}
+
+// Non-interactive SSH exec does not read the login profile, so user-space Node
+// installs (nvm-style dirs, npm global bins, harmonybrew) are usually missing
+// from PATH; prepend the common ones.
+const SSH_PATH_PREFIX =
+  'export PATH="$HOME/.npm-global/bin:$HOME/.local/node24/bin:$HOME/.local/nodejs/bin:$HOME/.local/bin:$HOME/bin:$PATH"; ';
+
+async function openSshDshAcpConnection({ sshClient, command, onNotification, onRequest }) {
+  const remoteCommand = `${SSH_PATH_PREFIX}exec ${command}`;
+  const stream = await new Promise((resolve, reject) => {
+    try {
+      sshClient.exec(remoteCommand, (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+  if (!stream) throw new Error("deepseek-harness (dsh): the SSH channel could not be opened");
+  return createAcpConnection(createSshAcpChild(stream), { onNotification, onRequest });
+}
+
+/**
+ * Local spawn, or a remote run over the chat's target SSH session when the
+ * configured command is prefixed with `ssh:`.
+ */
+async function openAcpConnectionForContext(ctx, handlers) {
+  const remoteCommand = parseSshDshCommand(ctx.binPath);
+  if (!remoteCommand) {
+    return openDshAcpConnection({
+      binPath: ctx.binPath,
+      cwd: ctx.cwd,
+      env: ctx.env,
+      spawnImpl: ctx.spawnImpl,
+      ...handlers,
+    });
+  }
+  const sshClient = resolveSshClientForTurn(ctx);
+  if (!sshClient) {
+    throw new Error(
+      "deepseek-harness (dsh) is configured to run over SSH, but the chat's target session is not a live SSH session. Open a terminal to the host and select it as the chat target session.",
+    );
+  }
+  return openSshDshAcpConnection({ sshClient, command: remoteCommand, ...handlers });
+}
+
 function normalizeAcpModelValue(value) {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -365,10 +507,7 @@ async function runDshAcpTurn(ctx) {
   let reasoningChars = 0;
   const toolTitles = new Map();
 
-  const connection = openDshAcpConnection({
-    binPath: ctx.binPath,
-    cwd: ctx.cwd,
-    env: ctx.env,
+  const connection = await openAcpConnectionForContext(ctx, {
     onNotification: (params) => {
       const update = params && typeof params.update === "object" ? params.update : params;
       if (!update || typeof update !== "object") return;
@@ -502,11 +641,12 @@ async function runDshAcpTurn(ctx) {
 }
 
 async function listDshAcpModels(ctx) {
-  const connection = openDshAcpConnection({
-    binPath: ctx.binPath,
-    cwd: ctx.cwd,
-    env: ctx.env,
-  });
+  let connection;
+  try {
+    connection = await openAcpConnectionForContext(ctx, {});
+  } catch {
+    return null;
+  }
   if (!connection) return null;
   try {
     await connection.request(
@@ -533,10 +673,13 @@ async function listDshAcpModels(ctx) {
 module.exports = {
   DSH_ACP_ARGS,
   DEFAULT_DSH_COMMAND,
+  SSH_DSH_PREFIX,
   buildDshSpawnSpec,
+  createSshAcpChild,
   flattenAcpModelOptions,
   listDshAcpModels,
   openDshAcpConnection,
+  parseSshDshCommand,
   readModelConfigOption,
   runDshAcpTurn,
 };

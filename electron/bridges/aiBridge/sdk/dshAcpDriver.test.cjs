@@ -156,3 +156,72 @@ test("readModelConfigOption only matches the model config id", () => {
   assert.equal(driver.readModelConfigOption([{ id: "other" }]), null);
   assert.equal(driver.readModelConfigOption(null), null);
 });
+
+test("parseSshDshCommand keeps remote command lines and appends the acp profile", () => {
+  assert.equal(driver.parseSshDshCommand("ssh:"), "dsh --profile acp");
+  assert.equal(driver.parseSshDshCommand("ssh:dsh"), "dsh --profile acp");
+  assert.equal(driver.parseSshDshCommand("ssh:/opt/dsh/bin/dsh"), "/opt/dsh/bin/dsh --profile acp");
+  assert.equal(
+    driver.parseSshDshCommand("ssh:dsh --profile acp --log-level debug"),
+    "dsh --profile acp --log-level debug",
+  );
+  assert.equal(driver.parseSshDshCommand("dsh"), null);
+  assert.equal(driver.parseSshDshCommand(""), null);
+});
+
+test("createSshAcpChild bridges an ssh exec channel to the ACP plumbing", async () => {
+  const { EventEmitter } = require("node:events");
+  const channel = new EventEmitter();
+  channel.stderr = new EventEmitter();
+  channel.written = [];
+  channel.write = (chunk) => channel.written.push(chunk.toString());
+  channel.closed = false;
+  channel.close = () => { channel.closed = true; channel.emit("close"); };
+
+  const child = driver.createSshAcpChild(channel);
+  const lines = [];
+  child.stdout.on("data", (chunk) => lines.push(chunk.toString()));
+  const exits = [];
+  child.on("exit", (code, signal) => exits.push([code, signal]));
+
+  assert.equal(child.stdin.write('{"jsonrpc":"2.0"}\n'), true);
+  channel.emit("data", Buffer.from('{"jsonrpc":"2.0","id":1}\n'));
+  channel.stderr.emit("data", Buffer.from("diag line"));
+
+  assert.deepEqual(channel.written, ['{"jsonrpc":"2.0"}\n']);
+  assert.deepEqual(lines, ['{"jsonrpc":"2.0","id":1}\n']);
+
+  child.stdin.end();
+  assert.equal(channel.closed, false, "end must not close the shared channel");
+
+  child.kill();
+  assert.equal(channel.closed, true);
+  assert.deepEqual(exits, [[null, null]]);
+  assert.equal(child.stdin.write("x"), false);
+});
+
+test("runDshAcpTurn refuses ssh mode without a live SSH target session", async () => {
+  const events = [];
+  const emitter = {
+    emitEvent: (event) => events.push(event),
+    text: () => {},
+    reasoning: () => {},
+    reasoningEnd: () => {},
+    toolCall: () => {},
+    toolResult: () => {},
+    usage: () => {},
+    warning: () => {},
+    sessionId: () => {},
+  };
+  await assert.rejects(
+    driver.runDshAcpTurn({
+      emitter,
+      binPath: "ssh:dsh",
+      prompt: "hi",
+      cwd: "/",
+      getSession: () => ({ sshClient: null }),
+      targetSessionId: "term-1",
+    }),
+    /target session is not a live SSH session/,
+  );
+});

@@ -451,6 +451,11 @@ function resolveRealCliPath(cliPath, realpath = realpathSync) {
 
 function normalizeConfiguredCommandPath(command, normalizeCliPathForPlatform) {
   const raw = String(command || "").trim();
+  // SSH-hosted command (`ssh:dsh`): there is nothing local to resolve; the
+  // driver turns it into an exec channel on the target SSH session.
+  if (raw.startsWith("ssh:")) {
+    return raw;
+  }
   const pathLike = raw.includes("/") || raw.includes("\\") || /^[a-z]:/i.test(raw);
   if (!raw || !pathLike) {
     return null;
@@ -490,6 +495,8 @@ function resolveSdkBackendBinPath({
 }) {
   const configuredPath = normalizeConfiguredCommandPath(configuredCommand, normalizeCliPathForPlatform);
   if (configuredPath) {
+    // Remote-host command: pass through untouched for the driver's SSH transport.
+    if (configuredPath.startsWith("ssh:")) return configuredPath;
     return resolveConfiguredSdkPath({
       backendKey,
       configuredPath,
@@ -1044,6 +1051,15 @@ function registerSdkStreamHandlers(ctx) {
             protectedHistorySeed = protectedText[2];
             for (const { target, field, index } of agentFields) target[field] = protectedText[index];
           }
+          // The renderer hands down a session HINT (an object carrying sessionId,
+          // hostname, ...), while callers such as the catty dialog pass a bare
+          // session id. Accept both so the registry lookup below works for the
+          // real UI path, not only for manual probes.
+          const targetTerminalSessionId = typeof defaultTargetSession === "string"
+            ? defaultTargetSession
+            : (defaultTargetSession && typeof defaultTargetSession === "object"
+              ? defaultTargetSession.sessionId
+              : undefined);
           const commonTurnContext = {
             requestId,
             chatSessionId,
@@ -1066,6 +1082,27 @@ function registerSdkStreamHandlers(ctx) {
             grokRuntime: backendKey === "grok" ? grokRuntime : undefined,
             historySeed: backendKey === "grok" ? protectedHistorySeed : undefined,
             getTempDir: () => tempDirBridge.getTempDir(),
+            // SSH-hosted agents (dsh `ssh:` mode) reuse the terminal session's
+            // ssh2 connection instead of spawning anything on this machine.
+            // Resolve it here, where the session registry is definitely in
+            // scope, and hand the transport down directly.
+            sshClient: (() => {
+              try {
+                const getSession = ctx.sessions && typeof ctx.sessions.get === "function"
+                  ? (sessionId) => ctx.sessions.get(sessionId)
+                  : null;
+                const session = getSession && targetTerminalSessionId
+                  ? getSession(targetTerminalSessionId)
+                  : null;
+                return (session && (session.sshClient || session.conn)) || null;
+              } catch {
+                return null;
+              }
+            })(),
+            getSession: typeof ctx.sessions?.get === "function"
+              ? (sessionId) => ctx.sessions.get(sessionId)
+              : undefined,
+            targetSessionId: targetTerminalSessionId,
             injectedMcpServers,
             claudeSettings,
             toolIntegrationMode: effectiveMode,

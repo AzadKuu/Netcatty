@@ -555,7 +555,7 @@ function createBridgeRegistrar(context) {
     registerTotpHandlers(ipcMain, electronModule);
     autoUpdateBridge.init(deps);
     autoUpdateBridge.registerHandlers(ipcMain);
-    aiBridge.registerHandlers(ipcMain);
+    aiBridge.registerHandlers(ipcMain, { sessions });
     httpNetworkProxyBridge.registerHandlers(ipcMain, electronModule);
     crashLogBridge.registerHandlers(ipcMain);
     const aiSessionsBackupBridge = require("../bridges/aiSessionsBackupBridge.cjs");
