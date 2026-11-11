@@ -14,6 +14,7 @@ import type { CattyReasoningProviderOptions } from '../../cattyReasoning';
 import { resolveProviderEndpoint } from '../../sdk/providers';
 import type { CattyToolsBundle } from '../capabilityTools';
 import { buildCattyToolApproval } from '../cattyToolApproval';
+import { buildTurnStopNotice } from './turnStopNotice';
 import type { CattyRuntimeContext } from '../cattyRuntimeContext';
 import { buildCattyStreamTimeouts } from '../streamTimeouts';
 import { createCattyPromptCache } from '../cattyPromptCache';
@@ -593,6 +594,25 @@ export async function processCattyStream(input: ProcessCattyStreamInput): Promis
         totalTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
         estimated: false,
       },
+    }));
+  }
+
+  // The agent loop can end without any error while the task is still open: the
+  // step budget (maxIterations) runs out, or the model hits its output cap.
+  // Both used to look like a normal finish, so say it out loud instead.
+  const completedSteps = await Promise.resolve(result.steps)
+    .then((steps) => steps.length)
+    .catch(() => 0);
+  const stopNotice = buildTurnStopNotice({
+    completedSteps,
+    maxIterations,
+    finishReason: finalStep?.finishReason,
+    language: typeof navigator !== "undefined" ? navigator.language : undefined,
+  });
+  if (stopNotice) {
+    ui.updateMessageById(streamSessionId, activeMsgId, message => ({
+      ...message,
+      content: message.content ? `${message.content}${stopNotice}` : stopNotice.trim(),
     }));
   }
 
