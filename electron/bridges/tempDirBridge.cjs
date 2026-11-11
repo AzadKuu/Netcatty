@@ -449,27 +449,53 @@ function getTempDir() {
   }
   
   const netcattyTempDir = customTempDir || resolvePrivateTempDir();
-  
-  try {
-    if (!fs.existsSync(netcattyTempDir)) {
-      fs.mkdirSync(netcattyTempDir, { recursive: true, mode: 0o700 });
-      console.log(`[TempDir] Created Netcatty temp directory: ${netcattyTempDir}`);
-    }
-    if (customTempDir) {
-      const validated = validateTempRoot(customTempDir);
+
+  // A temp dir we cannot create or validate must never take the whole app down:
+  // createWindow() depends on it, so failing here surfaces as "Failed to load
+  // the UI." with no usable explanation. Try the configured/OS location first,
+  // then an app-owned fallback inside userData, which is always writable by the
+  // user running Netcatty.
+  const candidates = customTempDir
+    ? [customTempDir, path.join(resolveFallbackTempBase(), "Netcatty")]
+    : [netcattyTempDir, path.join(resolveFallbackTempBase(), "Netcatty")];
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) {
+        fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+        console.log(`[TempDir] Created Netcatty temp directory: ${candidate}`);
+      }
+      const validated = customTempDir && candidate === customTempDir
+        ? validateTempRoot(candidate)
+        : (() => {
+            const stat = assertSafeTempDir(candidate);
+            return { dir: candidate, identity: { dev: stat.dev, ino: stat.ino } };
+          })();
       cachedTempDir = validated.dir;
       cachedTempDirIdentity = validated.identity;
       return validated.dir;
+    } catch (err) {
+      failures.push(`${candidate}: ${err?.message || err}`);
+      console.error(`[TempDir] Cannot use temp directory ${candidate}:`, err?.message || err);
     }
-    const safeStat = assertSafeTempDir(netcattyTempDir);
-    cachedTempDir = netcattyTempDir;
-    cachedTempDirIdentity = { dev: safeStat.dev, ino: safeStat.ino };
-    return netcattyTempDir;
-  } catch (err) {
-    console.error(`[TempDir] Failed to create temp directory:`, err.message);
-    throw err;
   }
+
+  console.error(`[TempDir] Failed to create temp directory: ${failures.join(" | ")}`);
+  throw new Error(`Netcatty could not prepare a private temp directory (${failures.join(" | ")})`);
 }
+
+/** App-owned directory that stays writable even when the OS temp dir is locked down. */
+function resolveFallbackTempBase() {
+  try {
+    const userData = getElectronApp()?.getPath?.("userData");
+    if (userData) return userData;
+  } catch {
+    // userData is unavailable very early in startup: fall through.
+  }
+  // Last resort: stay next to the private temp root instead of the OS temp dir.
+  return path.dirname(resolvePrivateTempDir());
+}
+
 
 function getTempDirRebindGeneration() {
   return tempDirRebindGeneration;
