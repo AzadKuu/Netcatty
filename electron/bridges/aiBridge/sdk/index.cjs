@@ -495,6 +495,8 @@ const DRIVER_REGISTRY = {
         spawnImpl: ctx.spawnImpl,
         sshClient: ctx.sshClient,
         getSession: ctx.getSession,
+        listSessions: ctx.listSessions,
+        agentSshSession: ctx.agentSshSession,
         targetSessionId: ctx.targetSessionId,
       });
     },
@@ -506,6 +508,8 @@ const DRIVER_REGISTRY = {
         signal: ctx.signal,
         sshClient: ctx.sshClient,
         getSession: ctx.getSession,
+        listSessions: ctx.listSessions,
+        agentSshSession: ctx.agentSshSession,
         targetSessionId: ctx.targetSessionId,
       });
     },

@@ -225,3 +225,33 @@ test("runDshAcpTurn refuses ssh mode without a live SSH target session", async (
     /target session is not a live SSH session/,
   );
 });
+
+test("resolveSshClientForTurn prefers the pinned agent host over the chat's session", () => {
+  const wrong = { conn: { id: "wrong-host-conn" }, hostname: "192.168.2.129" };
+  const right = { conn: { id: "agent-host-conn" }, hostname: "mc.shawnli.online" };
+  const sessions = new Map([
+    ["term-wrong", wrong],
+    ["term-agent", right],
+  ]);
+  const client = driver.resolveSshClientForTurn({
+    binPath: "ssh://shawn@mc.shawnli.online",
+    // The chat's transport must not stand in for the pinned host.
+    sshClient: wrong.conn,
+    getSession: (id) => sessions.get(id),
+    listSessions: () => Array.from(sessions.values()),
+    targetSessionId: "term-wrong",
+  });
+  assert.deepEqual(client, right.conn);
+});
+
+test("resolveSshClientForTurn keeps the chat's session when no host is pinned", () => {
+  const chat = { conn: { id: "chat-conn" }, hostname: "192.168.2.129" };
+  const sessions = new Map([["term-1", chat]]);
+  const client = driver.resolveSshClientForTurn({
+    binPath: "ssh:dsh",
+    getSession: (id) => sessions.get(id),
+    listSessions: () => Array.from(sessions.values()),
+    targetSessionId: "term-1",
+  });
+  assert.deepEqual(client, chat.conn);
+});

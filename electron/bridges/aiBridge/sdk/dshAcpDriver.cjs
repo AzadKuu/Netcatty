@@ -343,32 +343,104 @@ function createSshAcpChild(stream) {
 function parseSshDshCommand(binPath) {
   const raw = typeof binPath === "string" ? binPath.trim() : "";
   if (!raw.startsWith(SSH_DSH_PREFIX)) return null;
-  const rest = raw.slice(SSH_DSH_PREFIX.length).trim();
+  let rest = raw.slice(SSH_DSH_PREFIX.length).trim();
+  // `ssh://user@host[:port][/path/to/dsh]` pins one agent host for every chat,
+  // so DSH can be installed once and used from any session.
+  const pinned = parseSshAgentHost(raw);
+  if (pinned) {
+    const path = pinned.path || DEFAULT_DSH_COMMAND;
+    rest = path;
+  }
   if (!rest) return `${DEFAULT_DSH_COMMAND} ${DSH_ACP_ARGS.join(" ")}`;
   return rest.includes("--profile") ? rest : `${rest} ${DSH_ACP_ARGS.join(" ")}`;
 }
 
-function resolveSshClientForTurn(ctx) {
-  // The turn context hands the transport down directly (resolved where the
-  // session registry is in scope); the lookup below is a fallback for callers
-  // that only pass ids.
-  if (ctx.sshClient) return ctx.sshClient;
-  const session = typeof ctx.getSession === "function" && ctx.targetSessionId
-    ? ctx.getSession(ctx.targetSessionId)
-    : null;
-  if (!session || !(session.sshClient || session.conn)) {
-    console.log(
-      "[dshAcp] ssh session resolve failed:",
-      JSON.stringify({
-        hasSshClient: Boolean(ctx.sshClient),
-        hasGetSession: typeof ctx.getSession,
-        targetSessionId: ctx.targetSessionId || null,
-        hasSession: Boolean(session),
-        sessionKeys: session ? Object.keys(session).slice(0, 12) : [],
-      }),
-    );
+/**
+ * `ssh://user@host:port/path/to/dsh` -> `{ user, host, port, path }`.
+ * Returns null for the session-bound `ssh:<command>` form.
+ */
+function parseSshAgentHost(binPath) {
+  const raw = typeof binPath === "string" ? binPath.trim() : "";
+  if (!raw.startsWith(`${SSH_DSH_PREFIX}//`)) return null;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
   }
-  return (session && (session.sshClient || session.conn)) || null;
+  if (!url.hostname) return null;
+  const pathname = decodeURIComponent(url.pathname || "");
+  return {
+    user: url.username ? decodeURIComponent(url.username) : undefined,
+    host: url.hostname,
+    port: url.port ? Number(url.port) : undefined,
+    path: pathname && pathname !== "/" ? pathname.replace(/^\/+/, "/") : undefined,
+  };
+}
+
+function sessionMatchesAgentHost(session, agentHost) {
+  if (!session || !agentHost) return false;
+  const sessionHost = String(session.hostname || session.host || "").toLowerCase();
+  if (!sessionHost || sessionHost !== agentHost.host.toLowerCase()) return false;
+  if (agentHost.user) {
+    const sessionUser = String(session.username || "");
+    if (sessionUser && sessionUser !== agentHost.user) return false;
+  }
+  if (agentHost.port) {
+    const sessionPort = Number(session.port || 22);
+    if (sessionPort && sessionPort !== agentHost.port) return false;
+  }
+  return true;
+}
+
+function resolveSshClientForTurn(ctx) {
+  const lookup = typeof ctx.getSession === "function" ? ctx.getSession : null;
+  const readClient = (session) => (session && (session.sshClient || session.conn)) || null;
+  // A pinned `ssh://user@host` is authoritative: neither the transport handed in
+  // for the chat's own session nor that session's connection may stand in for
+  // it, or the turn would run dsh on whichever host the chat happens to use.
+  const agentHost = parseSshAgentHost(ctx.binPath);
+  if (agentHost) {
+    const explicit = lookup && ctx.agentSshSession ? lookup(ctx.agentSshSession) : null;
+    if (readClient(explicit)) return readClient(explicit);
+    // The host may already be connected by an ordinary terminal tab; reuse it
+    // instead of opening a second connection.
+    if (ctx.listSessions) {
+      for (const candidate of ctx.listSessions()) {
+        if (!sessionMatchesAgentHost(candidate, agentHost)) continue;
+        if (readClient(candidate)) return readClient(candidate);
+      }
+    }
+    const targeted = lookup && ctx.targetSessionId ? lookup(ctx.targetSessionId) : null;
+    if (sessionMatchesAgentHost(targeted, agentHost) && readClient(targeted)) return readClient(targeted);
+    // Last resort for callers that hand a transport in without a registry.
+    if (ctx.sshClient) return ctx.sshClient;
+  } else {
+    // The turn context hands the transport down directly (resolved where the
+    // session registry is in scope); the lookup below is a fallback for callers
+    // that only pass ids.
+    if (ctx.sshClient) return ctx.sshClient;
+    const pinned = lookup && ctx.agentSshSession ? lookup(ctx.agentSshSession) : null;
+    if (readClient(pinned)) return readClient(pinned);
+    const session = lookup && ctx.targetSessionId ? lookup(ctx.targetSessionId) : null;
+    if (readClient(session)) return readClient(session);
+  }
+  console.log(
+    "[dshAcp] ssh session resolve failed:",
+    JSON.stringify({
+      hasSshClient: Boolean(ctx.sshClient),
+      hasGetSession: typeof ctx.getSession,
+      targetSessionId: ctx.targetSessionId || null,
+      agentSshSession: ctx.agentSshSession || null,
+      agentHost: agentHost || null,
+      hasSession: Boolean(lookup && ctx.targetSessionId ? lookup(ctx.targetSessionId) : null),
+      sessionKeys: (() => {
+        const s = lookup && ctx.targetSessionId ? lookup(ctx.targetSessionId) : null;
+        return s ? Object.keys(s).slice(0, 12) : [];
+      })(),
+    }),
+  );
+  return null;
 }
 
 // Non-interactive SSH exec does not read the login profile, so user-space Node
@@ -410,8 +482,14 @@ async function openAcpConnectionForContext(ctx, handlers) {
   }
   const sshClient = resolveSshClientForTurn(ctx);
   if (!sshClient) {
+    const agentHost = parseSshAgentHost(ctx.binPath);
+    const target = agentHost
+      ? `${agentHost.user ? `${agentHost.user}@` : ""}${agentHost.host}${agentHost.port ? `:${agentHost.port}` : ""}`
+      : null;
     throw new Error(
-      "deepseek-harness (dsh) is configured to run over SSH, but the chat's target session is not a live SSH session. Open a terminal to the host and select it as the chat target session.",
+      target
+        ? `deepseek-harness (dsh) runs on ${target}, but Netcatty has no live SSH connection to it. Open a terminal to that host once (or pick a different agent host in Settings → AI) and try again.`
+        : "deepseek-harness (dsh) is configured to run over SSH, but the chat's target session is not a live SSH session. Open a terminal to the host and select it as the chat target session.",
     );
   }
   return openSshDshAcpConnection({ sshClient, command: remoteCommand, ...handlers });
@@ -679,7 +757,9 @@ module.exports = {
   flattenAcpModelOptions,
   listDshAcpModels,
   openDshAcpConnection,
+  parseSshAgentHost,
   parseSshDshCommand,
   readModelConfigOption,
+  resolveSshClientForTurn,
   runDshAcpTurn,
 };

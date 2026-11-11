@@ -18,6 +18,7 @@ import { encodeSdkSessionIdentity } from './harness/sdkSessionIdentity';
 import { mapSdkStreamEventToAgentEvents } from './harness/agentEventAdapter';
 import { globalTraceStore } from './harness/traceStore';
 import { decryptField } from '../persistence/secureFieldAdapter';
+import { ensureDshAgentSshSession, type StartSshSessionBridge } from './dshAgentHost';
 
 export interface DefaultTargetSessionHint {
   sessionId: string;
@@ -72,6 +73,7 @@ interface SdkAgentBridge {
     codexRuntime?: 'sdk' | 'app-server',
     permissionMode?: AIPermissionMode,
     codebuddyOptions?: ExternalAgentConfig['codebuddyOptions'],
+    agentSshSession?: string,
   ): Promise<{ ok: boolean; error?: unknown }>;
   aiSdkAgentSteer?(
     requestId: string,
@@ -347,6 +349,24 @@ export async function runSdkAgentTurn(
     cleanupFns.push(() => signal.removeEventListener('abort', onAbort));
   }
 
+  // A pinned `ssh://user@host` agent command runs on that host instead of
+  // whatever terminal session this chat is bound to, so one installation can
+  // serve every chat. Only DSH supports the remote transport today.
+  let agentSshSession: string | undefined;
+  if (sdkBackend === 'dsh' && agentCommand && agentCommand.trim().toLowerCase().startsWith('ssh://')) {
+    try {
+      agentSshSession = await ensureDshAgentSshSession({
+        command: agentCommand,
+        bridge: sdkBridge as unknown as StartSshSessionBridge,
+        createSessionId: () => `dsh-agent-${chatSessionId}`,
+      });
+    } catch {
+      // Falling through is friendlier here: the driver's own error names the
+      // pinned host, which tells the user more than a failed start.
+      agentSshSession = undefined;
+    }
+  }
+
   // Start the SDK stream in the main process
   void sdkBridge.aiSdkAgentStream(
     requestId,
@@ -367,6 +387,7 @@ export async function runSdkAgentTurn(
     sdkBackend === 'codex' ? (config.codexRuntime ?? 'sdk') : undefined,
     permissionMode,
     sdkBackend === 'codebuddy' ? getCodebuddySdkOptions(config) : undefined,
+    agentSshSession,
   ).then((result) => {
     if (result?.ok === false) {
       settle(() => {

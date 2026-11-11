@@ -232,6 +232,39 @@ function remapLastKnownCurrentModelId(lastKnown) {
  * catalog — otherwise the picker stays pinned to build-time curated presets
  * and cannot follow the installed CLI (#3496).
  */
+/**
+ * Session registry access for drivers that run a remote agent over SSH.
+ * `agentSshSession` is a session the renderer prepared for a pinned agent host;
+ * `targetSessionId` is the chat's target terminal session.
+ */
+function buildAgentTransport({ sessions, agentSshSession, targetSessionId }) {
+  const getSession = sessions && typeof sessions.get === "function"
+    ? (sessionId) => sessions.get(sessionId)
+    : undefined;
+  const listSessions = sessions && typeof sessions.values === "function"
+    ? () => Array.from(sessions.values())
+    : undefined;
+  const readClient = (sessionId) => {
+    if (!getSession || !sessionId) return null;
+    try {
+      const session = getSession(sessionId);
+      return (session && (session.sshClient || session.conn)) || null;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    // Only the agent's own session is promoted to a direct transport: when the
+    // command pins an `ssh://` host the driver must reject the chat's session
+    // instead of silently running the agent on the wrong machine.
+    sshClient: readClient(agentSshSession),
+    getSession,
+    listSessions,
+    agentSshSession,
+    targetSessionId,
+  };
+}
+
 async function fetchSdkModelCatalog({
   backendKey,
   codexRuntime,
@@ -243,6 +276,7 @@ async function fetchSdkModelCatalog({
   cursorCliBinPath,
   codexAppServerRuntime: appServerRuntime,
   catalogDeadlineTs,
+  transport,
 }) {
   let raw;
   if (codexRuntime === "app-server") {
@@ -258,6 +292,8 @@ async function fetchSdkModelCatalog({
       catalogDeadlineTs,
       cursorAuthMode: backendKey === "cursor" ? cursorAuthMode : undefined,
       cursorCliBinPath: backendKey === "cursor" ? cursorCliBinPath : undefined,
+      // Remote-agent transports (dsh over SSH) need the live session registry.
+      ...(transport || {}),
     });
     const sdkCatalog = normalizeSdkListModelsResult(raw);
     if (backendKey === "codex" && sdkCatalog.models.length === 0 && !sdkCatalog.currentModelId) {
@@ -745,6 +781,7 @@ function registerSdkStreamHandlers(ctx) {
           requestId, chatSessionId, sdkBackend, prompt, cwd,
           model, existingSessionId, toolIntegrationMode,
           defaultTargetSession, userSkillsContext, agentEnv: requestedAgentEnv, agentCommand,
+          agentSshSession,
           codexRuntime: requestedCodexRuntime, permissionMode,
           // SDK 0.3.258 advanced options (passed from renderer via sdkAgentAdapter)
           effort, maxTurns, maxBudgetUsd, fallbackModel,
@@ -1060,6 +1097,11 @@ function registerSdkStreamHandlers(ctx) {
             : (defaultTargetSession && typeof defaultTargetSession === "object"
               ? defaultTargetSession.sessionId
               : undefined);
+          const agentTransport = buildAgentTransport({
+            sessions: ctx.sessions,
+            agentSshSession,
+            targetSessionId: targetTerminalSessionId,
+          });
           const commonTurnContext = {
             requestId,
             chatSessionId,
@@ -1086,22 +1128,10 @@ function registerSdkStreamHandlers(ctx) {
             // ssh2 connection instead of spawning anything on this machine.
             // Resolve it here, where the session registry is definitely in
             // scope, and hand the transport down directly.
-            sshClient: (() => {
-              try {
-                const getSession = ctx.sessions && typeof ctx.sessions.get === "function"
-                  ? (sessionId) => ctx.sessions.get(sessionId)
-                  : null;
-                const session = getSession && targetTerminalSessionId
-                  ? getSession(targetTerminalSessionId)
-                  : null;
-                return (session && (session.sshClient || session.conn)) || null;
-              } catch {
-                return null;
-              }
-            })(),
-            getSession: typeof ctx.sessions?.get === "function"
-              ? (sessionId) => ctx.sessions.get(sessionId)
-              : undefined,
+            sshClient: agentTransport.sshClient,
+            getSession: agentTransport.getSession,
+            listSessions: agentTransport.listSessions,
+            agentSshSession,
             targetSessionId: targetTerminalSessionId,
             injectedMcpServers,
             claudeSettings,
@@ -1161,7 +1191,10 @@ function registerSdkStreamHandlers(ctx) {
 
     ipcMain.handle("netcatty:ai:sdk-agent:list-models", async (event, payload) => {
       if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
-      const { sdkBackend, agentEnv: requestedAgentEnv, agentCommand, codexRuntime: requestedCodexRuntime } = payload || {};
+      const {
+        sdkBackend, agentEnv: requestedAgentEnv, agentCommand,
+        codexRuntime: requestedCodexRuntime, agentSshSession,
+      } = payload || {};
       // Manual refresh (retry banner / picker refresh button) must always go
       // live; automatic loads follow the LKG-first policy below.
       const force = payload?.force === true;
@@ -1297,6 +1330,11 @@ function registerSdkStreamHandlers(ctx) {
                 cursorAuthMode: backendKey === "cursor" ? cursorAuthMode : undefined,
                 cursorCliBinPath: backendKey === "cursor" ? cursorCliBinPath : undefined,
                 codexAppServerRuntime,
+                transport: buildAgentTransport({
+                  sessions: ctx.sessions,
+                  agentSshSession,
+                  targetSessionId: agentSshSession,
+                }),
               }),
               catalogBudgetMs,
               abortController,
