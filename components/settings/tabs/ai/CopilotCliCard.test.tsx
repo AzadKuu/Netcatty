@@ -105,3 +105,64 @@ test("other managed agent cards do not surface the DSH autonomy notice", () => {
     assert.doesNotMatch(markup, /ai\.dsh\./);
   }
 });
+
+test("DSH card renders the agent host selector when hosts are offered", () => {
+  const markup = renderToStaticMarkup(
+    <CopilotCliCard
+      pathInfo={{ path: null, version: null, available: false }}
+      isResolvingPath={false}
+      customPath=""
+      onCustomPathChange={() => {}}
+      onRecheckPath={() => {}}
+      i18nPrefix="ai.dsh"
+      agentHostOptions={[
+        { value: "", label: "local-option" },
+        { value: "host-1", label: "build box (root@10.0.0.5)" },
+      ]}
+      agentHostValue=""
+      onAgentHostChange={() => {}}
+    />,
+  );
+
+  assert.match(markup, /ai\.dsh\.agentHostLabel/);
+  assert.match(markup, /ai\.dsh\.agentHostHint/);
+  assert.match(markup, /role="combobox"/);
+});
+
+test("agent host selector renders only for the DSH card", () => {
+  const hosts = [
+    { value: "", label: "local-option" },
+    { value: "host-1", label: "build box (root@10.0.0.5)" },
+  ];
+
+  const dshWithoutHosts = renderToStaticMarkup(
+    <CopilotCliCard
+      pathInfo={{ path: null, version: null, available: false }}
+      isResolvingPath={false}
+      customPath=""
+      onCustomPathChange={() => {}}
+      onRecheckPath={() => {}}
+      i18nPrefix="ai.dsh"
+    />,
+  );
+  assert.doesNotMatch(dshWithoutHosts, /ai\.dsh\.agentHostLabel/);
+
+  for (const i18nPrefix of ["ai.copilot", "ai.mimo", "ai.grok"] as const) {
+    const markup = renderToStaticMarkup(
+      <CopilotCliCard
+        pathInfo={{ path: null, version: null, available: false }}
+        isResolvingPath={false}
+        customPath=""
+        onCustomPathChange={() => {}}
+        onRecheckPath={() => {}}
+        i18nPrefix={i18nPrefix}
+        agentHostOptions={hosts}
+        agentHostValue=""
+        onAgentHostChange={() => {}}
+      />,
+    );
+
+    assert.doesNotMatch(markup, /ai\.dsh\.agentHostLabel/);
+    assert.doesNotMatch(markup, /role="combobox"/);
+  }
+});

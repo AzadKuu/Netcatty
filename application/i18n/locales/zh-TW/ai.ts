@@ -314,6 +314,9 @@ export const zhTWAiMessages: Messages = {
   'ai.dsh.check': '檢查',
   'ai.dsh.resetPath': '重設',
   'ai.dsh.autonomyNotice': 'DSH 是純自動化的 ACP Agent：它從不向本應用請求工具權限，因此觀察模式和確認模式都無法攔截它的操作。請僅在可以接受自動執行命令的工作區中使用。',
+  'ai.dsh.agentHostLabel': 'Agent 主機',
+  'ai.dsh.agentHostLocal': '本機（跟隨工作階段連線）',
+  'ai.dsh.agentHostHint': '選擇一台已安裝 DSH 的機器，之後所有工作階段都重用這份安裝；選擇本機則走工作階段自身的連線或本機的 DSH。',
 
   // AI Grok Build（應用內託管 Agent，與 External MCP「新增到 Grok」不同）
   'ai.grok.title': 'Grok Build',

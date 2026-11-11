@@ -323,6 +323,9 @@ export const zhCNAiMessages: Messages = {
   'ai.dsh.check': '检查',
   'ai.dsh.resetPath': '重置',
   'ai.dsh.autonomyNotice': 'DSH 是纯自动化的 ACP Agent：它从不向本应用请求工具权限，因此观察模式和确认模式都无法拦截它的操作。请仅在可以接受自动执行命令的工作区中使用。',
+  'ai.dsh.agentHostLabel': 'Agent 主机',
+  'ai.dsh.agentHostLocal': '本机（跟随会话连接）',
+  'ai.dsh.agentHostHint': '选择一台已安装 DSH 的机器，之后所有会话都复用这一份安装；选择本机则走会话自身的连接或本机的 DSH。',
 
   // AI Grok Build（应用内托管 Agent，与 External MCP「添加到 Grok」不同）
   'ai.grok.title': 'Grok Build',

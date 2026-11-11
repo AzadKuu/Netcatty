@@ -19,6 +19,7 @@ import type {
   WebSearchConfig,
 } from "../../../infrastructure/ai/types";
 import type { ManagedAgentKey } from "../../../infrastructure/ai/managedAgents";
+import type { Host } from "../../../domain/models";
 import { PROVIDER_PRESETS } from "../../../infrastructure/ai/types";
 import { useI18n } from "../../../application/i18n/I18nProvider";
 import { Button } from "../../ui/button";
@@ -48,6 +49,12 @@ import { AddProviderDropdown } from "./ai/AddProviderDropdown";
 import { CodexConnectionCard } from "./ai/CodexConnectionCard";
 import { ClaudeCodeCard } from "./ai/ClaudeCodeCard";
 import { CopilotCliCard } from "./ai/CopilotCliCard";
+import {
+  DSH_LOCAL_AGENT_HOST_VALUE,
+  DSH_UNMATCHED_AGENT_HOST_VALUE,
+  buildDshAgentHostCommand,
+  resolveDshAgentHostSelectValue,
+} from "./ai/dshAgentHostSelection";
 import { CodebuddyCard } from "./ai/CodebuddyCard";
 import { SafetySettings } from "./ai/SafetySettings";
 import { ExternalMcpCard } from "./ai/ExternalMcpCard";
@@ -171,6 +178,8 @@ interface SettingsAITabProps {
   setQuickMessages: (value: AIQuickMessage[] | ((prev: AIQuickMessage[]) => AIQuickMessage[])) => void;
   showTerminalSelectionAIAction: boolean;
   setShowTerminalSelectionAIAction: (value: boolean | ((prev: boolean) => boolean)) => void;
+  /** Vault hosts: one DSH install on a host serves every chat session. */
+  hosts?: Host[];
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +219,7 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   setQuickMessages,
   showTerminalSelectionAIAction,
   setShowTerminalSelectionAIAction,
+  hosts = [],
 }) => {
   const {
     permissionGrants,
@@ -844,6 +854,45 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
     }
   }, [cursorApiKeyEncrypted, resolveAgentPath, refreshCodexIntegration]);
 
+  // DSH can run on a remote machine: the agent-host picker writes an
+  // `ssh://[user@]host[:port]` pin into the existing custom-path field, so the
+  // rest of the check/reset state machine stays untouched.
+  const dshAgentHostOptions = useMemo(() => {
+    const options = [{ value: DSH_LOCAL_AGENT_HOST_VALUE, label: t("ai.dsh.agentHostLocal") }];
+    for (const host of hosts) {
+      const command = buildDshAgentHostCommand(host);
+      if (!command) continue;
+      options.push({
+        value: host.id,
+        label: `${host.label || host.hostname} (${command.slice("ssh://".length)})`,
+      });
+    }
+    const pin = dshCustomPath.trim();
+    if (resolveDshAgentHostSelectValue(hosts, pin) === DSH_UNMATCHED_AGENT_HOST_VALUE) {
+      options.push({ value: DSH_UNMATCHED_AGENT_HOST_VALUE, label: pin });
+    }
+    return options;
+  }, [hosts, dshCustomPath, t]);
+
+  const dshAgentHostValue = useMemo(
+    () => resolveDshAgentHostSelectValue(hosts, dshCustomPath),
+    [hosts, dshCustomPath],
+  );
+
+  const handleDshAgentHostChange = useCallback((hostId: string) => {
+    if (hostId === DSH_UNMATCHED_AGENT_HOST_VALUE) return;
+    const host = hostId && hostId !== DSH_LOCAL_AGENT_HOST_VALUE
+      ? hosts.find((item) => item.id === hostId)
+      : undefined;
+    const command = host ? buildDshAgentHostCommand(host) : "";
+    if (host && !command) return;
+    setDshCustomPath(command);
+    void resolveAgentPath("dsh", command, {
+      refreshShellEnv: true,
+      commandSource: command ? "manual" : "auto",
+    });
+  }, [hosts, resolveAgentPath]);
+
   useEffect(() => {
     if (activeSubTab !== "agents") return;
     if (codexIntegrationLoadedRef.current) return;
@@ -1279,6 +1328,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
               onRecheckPath={() => void handleCheckCustomPath("dsh")}
               onResetPath={() => void handleResetCustomPath("dsh")}
               i18nPrefix="ai.dsh"
+              agentHostOptions={dshAgentHostOptions}
+              agentHostValue={dshAgentHostValue}
+              onAgentHostChange={handleDshAgentHostChange}
             />
           </SettingsSection>
 

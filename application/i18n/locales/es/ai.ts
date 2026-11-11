@@ -323,6 +323,9 @@ export const esAiMessages: Messages = {
   'ai.dsh.check': 'Verificar',
   'ai.dsh.resetPath': 'Restablecer',
   'ai.dsh.autonomyNotice': 'DSH es un agente ACP solo de automatización: nunca solicita permiso de herramientas a esta aplicación, por lo que los modos Observador y Confirmar no pueden bloquear sus acciones. Úsalo solo en espacios de trabajo donde sea aceptable la ejecución autónoma de comandos.',
+  'ai.dsh.agentHostLabel': 'Host del agente',
+  'ai.dsh.agentHostLocal': 'Local (sesión del chat)',
+  'ai.dsh.agentHostHint': 'Elige una máquina que tenga DSH instalado y todas las conversaciones reutilizarán esa única instalación. Con Local, DSH se ejecuta mediante la conexión del propio chat o en este equipo.',
 
   // AI Grok Build (in-app managed agent — distinct from External MCP client install)
   'ai.grok.title': 'Grok Build',

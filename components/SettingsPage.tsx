@@ -219,6 +219,8 @@ const SettingsTerminalTabContainer = React.memo<TerminalTabSettingsProps>(functi
 
 const SettingsAITabContainer: React.FC = () => {
     const aiState = useAISettingsState();
+    // Read-only vault view: the DSH card offers pinned agent hosts.
+    const { hosts } = useVaultState({ syncConnectionLogTerminalData: false });
 
     return (
         <AITabErrorBoundary>
@@ -255,6 +257,7 @@ const SettingsAITabContainer: React.FC = () => {
                 setQuickMessages={aiState.setQuickMessages}
                 showTerminalSelectionAIAction={aiState.showTerminalSelectionAIAction}
                 setShowTerminalSelectionAIAction={aiState.setShowTerminalSelectionAIAction}
+                hosts={hosts}
             />
         </AITabErrorBoundary>
     );

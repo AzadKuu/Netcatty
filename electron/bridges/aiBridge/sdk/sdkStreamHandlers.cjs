@@ -275,7 +275,9 @@ const TERMINAL_CONTEXT_MAX_LINES = 120;
 const TERMINAL_CONTEXT_MAX_CHARS = 8000;
 
 async function readTargetTerminalContext({ sessionId, session, terminalWorkerManager }) {
-  if (!sessionId || !terminalWorkerManager) return "";
+  // A null worker is normal: sessions then live in the main process (HarmonyOS
+  // disables the terminal worker entirely) and the snapshot still works.
+  if (!sessionId) return "";
   try {
     const { requestMainInitiatedSnapshot } = require("../../terminalBridge.cjs");
     const { stripAnsi } = require("../../ai/shellUtils.cjs");

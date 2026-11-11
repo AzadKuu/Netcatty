@@ -3,6 +3,7 @@ import { RefreshCw, RotateCcw, ShieldAlert } from "lucide-react";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
 import { Switch } from "../../../ui/switch";
+import { Select } from "../../settings-ui";
 import { cn } from "../../../../lib/utils";
 import type { GrokRuntime } from "../../../../infrastructure/ai/types";
 import type { AgentPathInfo } from "./types";
@@ -17,6 +18,10 @@ export const CopilotCliCard: React.FC<{
   i18nPrefix?: "ai.copilot" | "ai.cursor" | "ai.opencode" | "ai.grok" | "ai.mimo" | "ai.dsh";
   allowEmptyCheck?: boolean;
   showCustomPathInput?: boolean;
+  /** DSH only: pick a host that runs dsh instead of typing an ssh:// pin. */
+  agentHostOptions?: { value: string; label: string }[];
+  agentHostValue?: string;
+  onAgentHostChange?: (value: string) => void;
   /** Grok only: ACP (default) vs headless streaming-json. */
   grokRuntime?: GrokRuntime;
   onGrokRuntimeChange?: (runtime: GrokRuntime) => void;
@@ -30,6 +35,9 @@ export const CopilotCliCard: React.FC<{
   i18nPrefix = "ai.copilot",
   allowEmptyCheck = false,
   showCustomPathInput = true,
+  agentHostOptions,
+  agentHostValue,
+  onAgentHostChange,
   grokRuntime = "acp",
   onGrokRuntimeChange,
 }) => {
@@ -39,6 +47,9 @@ export const CopilotCliCard: React.FC<{
   // DSH is an ACP automation agent: it never sends session/request_permission,
   // so the global approval mode cannot gate its tool calls.
   const showAutonomyNotice = i18nPrefix === "ai.dsh";
+  const showAgentHostSelector = showAutonomyNotice
+    && Array.isArray(agentHostOptions)
+    && agentHostOptions.length > 0;
 
   const statusText = isResolvingPath
     ? t(`${i18nPrefix}.detecting`)
@@ -68,6 +79,24 @@ export const CopilotCliCard: React.FC<{
           <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
           <p className="min-w-0 text-xs leading-5 text-amber-600 dark:text-amber-400">
             {t("ai.dsh.autonomyNotice")}
+          </p>
+        </div>
+      )}
+
+      {showAgentHostSelector && agentHostOptions && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-sm font-medium">{t("ai.dsh.agentHostLabel")}</span>
+            <Select
+              value={agentHostValue ?? ""}
+              options={agentHostOptions}
+              onChange={(value) => onAgentHostChange?.(value)}
+              disabled={isResolvingPath}
+              className="w-full"
+            />
+          </div>
+          <p className="text-xs text-muted-foreground leading-5">
+            {t("ai.dsh.agentHostHint")}
           </p>
         </div>
       )}
